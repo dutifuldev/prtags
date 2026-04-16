@@ -317,6 +317,15 @@ For each target, `ghanno` should derive one embedding input text from:
 
 - all field values whose definitions are marked `is_vectorized`
 
+The standard production model should be:
+
+- one configured default embedding provider and model at a time
+- one explicit model identifier stored on every embedding row
+- one rebuild whenever the vectorized source text changes
+- one rebuild whenever the configured default model version changes
+
+The code should not try to infer whether an embedding is current from the vector alone. It should compare the embedding row against the canonical source state and the currently configured model identifier.
+
 Suggested columns:
 
 - `id`
@@ -329,6 +338,12 @@ Suggested columns:
 - `embedding`
 - `source_updated_at`
 - `indexed_at`
+
+The `embedding_model` value should be explicit and versioned, for example:
+
+- `text-embedding-3-large@2026-04`
+
+That gives the system a stable way to decide whether older rows are still current after a model rollout.
 
 Important indexes:
 
@@ -345,6 +360,13 @@ The clean production shape is:
 2. the write path marks the affected target as needing search rebuild
 3. background workers rebuild search documents and embeddings
 4. rebuild state is tracked explicitly
+
+For embeddings specifically, the rebuild triggers should be:
+
+- a write to any field whose definition is marked `is_vectorized`
+- a change to field definitions that changes which fields are vectorized
+- a configured default embedding-model change
+- an explicit repo-level rebuild request
 
 Suggested rebuild-state tables:
 
@@ -365,7 +387,25 @@ Each queued job should carry:
 - lease owner
 - heartbeat
 
+Embedding rebuilds should happen in the background, not inline on normal writes or reads. Canonical writes should stay cheap, and vector queries should only read from the finished `embeddings` table.
+
 This is the same operational shape that worked well in `ghreplica`: explicit leases, heartbeats, and resumable derived work.
+
+## Freshness Semantics
+
+Search and embedding freshness should be explicit.
+
+For embeddings, the clean status model is:
+
+- `current`
+  - built from the current canonical vectorized text
+  - built with the currently configured embedding model identifier
+- `stale`
+  - exists, but either the source text changed or the configured model changed
+- `missing`
+  - no embedding row exists for the target and configured model
+
+This should be exposed at least at repo level and ideally also at target level for debugging and rebuild inspection.
 
 ## Query Paths
 
@@ -421,6 +461,8 @@ The production API should be split cleanly.
 - import a field-definition manifest
 - export a field-definition manifest
 
+Manifest import should be additive and updating by default. It may create new fields and update allowed properties on existing ones, but it should not silently rename, archive, or delete fields. Destructive lifecycle operations should remain explicit API or CLI actions.
+
 ### Group Management
 
 - create a group
@@ -470,37 +512,126 @@ Suggested shape:
 
 A production system should not rely only on last-write-wins state.
 
-The durable model should also record change history for:
+The best shape is:
+
+- current-state tables for normal reads
+- one append-only `events` table for immutable history
+- one `event_refs` table for additional objects involved in each event
+
+This is better than full event-sourcing for the first real implementation because reads stay simple and fast, but the system still gets auditability, debugging value, rebuild support, and room for undo or replay later.
+
+The event log should cover:
 
 - field-definition changes
-- group creation and membership changes
+- group creation and updates
+- group membership changes
+- group link changes
 - annotation value changes
 
-Suggested audit table:
+### `events`
 
-- `events`
+Suggested columns:
 
-Each event should record:
+- `id`
+- `repository_owner`
+- `repository_name`
+- `aggregate_type`
+- `aggregate_key`
+- `sequence_no`
+- `event_type`
+- `actor_type`
+- `actor_id`
+- `request_id`
+- `idempotency_key`
+- `schema_version`
+- `payload_json`
+- `metadata_json`
+- `occurred_at`
 
-- actor
-- action type
-- target type
-- target identity
-- before state where practical
-- after state where practical
-- created at
+Each event should have one primary subject:
 
-The canonical tables remain the current state, and `events` provides history.
+- `aggregate_type`
+- `aggregate_key`
+
+and a per-aggregate `sequence_no` so the history for each object is ordered cleanly.
+
+### `event_refs`
+
+Suggested columns:
+
+- `event_id`
+- `ref_role`
+- `ref_type`
+- `ref_key`
+
+This lets one event point at other involved objects without turning `payload_json` into an unstructured mess.
+
+Examples:
+
+- setting PR intent
+  - aggregate = the PR
+  - ref = the field definition
+- adding a PR to a group
+  - aggregate = the group
+  - ref = the PR member
+- linking one group to another
+  - aggregate = the source group
+  - ref = the destination group
+
+The canonical tables remain the current state, and `events` plus `event_refs` provide immutable history.
 
 ## Permissions
 
-The initial implementation may start simple, but the long-term design should leave room for repository-scoped permissions.
+The permissions model should be derived from GitHub repository permissions, not from a separate local membership model.
 
-At minimum, the model should make it possible later to answer:
+The correct default rule is:
 
-- who can define fields for this repo
-- who can edit annotations
-- who can create or modify groups
+- a user may modify `ghanno` data for a repo only if they currently have GitHub write access to that repo
+
+For `ghanno`, that means:
+
+- authenticate users with GitHub
+- treat the GitHub user identity as the actor identity
+- check the user’s permission on the target repository for mutating actions
+- allow writes for GitHub permission levels equivalent to `write`, `maintain`, or `admin`
+
+This should be repository-scoped. `ghanno` should not try to model organization membership rules on its own.
+
+### Permission Source Of Truth
+
+GitHub should remain the source of truth for repository permissions.
+
+`ghanno` should not maintain a separate long-lived synchronization of repo membership. Instead, it should:
+
+- cache permission checks for a short TTL
+- re-check GitHub on writes when the cache is missing or expired
+
+That means if someone loses repo write access on GitHub, `ghanno` will stop allowing writes once the cached permission result expires.
+
+### Permission Cache
+
+The implementation may keep a small permission cache for efficiency.
+
+Suggested cached fields:
+
+- GitHub user identity
+- repository identity
+- resolved repo permission
+- checked_at
+- expires_at
+
+This cache is an optimization only. It is not the source of truth.
+
+### Read Behavior
+
+The write-authorization rule should be pinned down now.
+
+Read behavior can remain simpler at first. The default product choice may be:
+
+- public reads for data that is already being exposed publicly through `ghreplica`
+- write access restricted by GitHub repo permission
+
+If read restrictions become necessary later, they should follow the same GitHub-derived identity model.
 
 The schema should carry `created_by` and `updated_by` fields consistently even before full authorization exists.
 
@@ -560,6 +691,8 @@ Build:
 - `group_links`
 - `field_definitions`
 - `field_values`
+- `events`
+- `event_refs`
 
 Ship:
 
@@ -567,6 +700,7 @@ Ship:
 - group CRUD
 - annotation CRUD
 - exact filter queries
+- immutable audit history for every canonical write
 
 ### Phase 2: Derived Full-Text Search
 
@@ -587,6 +721,7 @@ Build:
 - `embeddings`
 - embedding rebuild pipeline
 - model/version tracking
+- embedding freshness/status reporting
 - vector search endpoints
 
 Ship:
@@ -609,11 +744,8 @@ Ship:
 
 The core implementation direction is clear, but a few policy details still need explicit decisions:
 
-- whether group and annotation updates are only current-state writes or also event-sourced
-- how manifest imports handle destructive changes
 - whether projected GitHub fields are in scope for phase 1 or phase 4
-- which embedding model and vector extension to standardize on first
-- what freshness guarantees search and embeddings should expose to operators
+- which vector extension and distance metric to standardize on first
 
 These are important, but they do not block implementation of the durable core model.
 

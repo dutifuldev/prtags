@@ -176,6 +176,68 @@ Suggested columns:
 
 The point is to store typed values, not arbitrary blobs, so filtering and indexing stay straightforward.
 
+### `events`
+
+This table should record the immutable audit history for the curation layer.
+
+The best model is not full event-sourcing. `ghanno` should keep normal current-state tables like `groups`, `group_members`, `group_links`, and `field_values` for fast reads, and also append one durable event row for each meaningful change.
+
+Suggested columns:
+
+- `id`
+- `repository_owner`
+- `repository_name`
+- `aggregate_type`
+  - `group`
+  - `pull_request`
+  - `issue`
+  - `field_definition`
+- `aggregate_key`
+- `sequence_no`
+- `event_type`
+- `actor_type`
+- `actor_id`
+- `request_id`
+- `idempotency_key`
+- `schema_version`
+- `payload_json`
+- `metadata_json`
+- `occurred_at`
+
+The important idea is that every event has one primary subject:
+
+- `aggregate_type`
+- `aggregate_key`
+
+and an ordered sequence number within that aggregate.
+
+That gives each object a stable history without making normal reads depend on replaying events.
+
+### `event_refs`
+
+This table should hold additional related objects for an event.
+
+Suggested columns:
+
+- `event_id`
+- `ref_role`
+- `ref_type`
+- `ref_key`
+
+This is what keeps the event model general without forcing every event into one awkward payload shape.
+
+Examples:
+
+- setting a PR annotation
+  - aggregate = the PR
+  - ref = the field definition
+- adding a PR to a group
+  - aggregate = the group
+  - ref = the PR member
+- linking two groups
+  - aggregate = the source group
+  - ref = the destination group
+
 ## Why One Generic Group Model Is Better
 
 The elegant part of this design is that there is only one group concept. `ghanno` does not need a separate PR-group subsystem and a separate issue-group subsystem. Instead, the same group model works for both, and `kind` keeps the rules understandable.
@@ -218,6 +280,8 @@ The thinnest useful version of `ghanno` should start with:
 - `group_links`
 - `field_definitions`
 - `field_values`
+- `events`
+- `event_refs`
 
 That is enough to support:
 
@@ -225,5 +289,6 @@ That is enough to support:
 - creating issue groups
 - linking PR groups to issue groups
 - attaching repo-defined metadata like `intent` or `quality`
+- recording an immutable history for those changes
 
 That should be the foundation before adding embeddings, vector search, or richer projections.

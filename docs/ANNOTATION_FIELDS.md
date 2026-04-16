@@ -89,6 +89,28 @@ The clean operator flow is:
 
 If manifest support is added, it should just be another way to feed step 1.
 
+## Manifest Import Policy
+
+Manifest import should be explicit and safe by default.
+
+The correct default behavior is:
+
+- create new fields that do not exist yet
+- update allowed properties on existing fields
+- do not silently delete fields
+- do not silently rename fields
+
+In other words, manifest import should be additive and updating, not destructive.
+
+If a field disappears from a manifest, `ghanno` should not assume that means the field should be deleted. If a field name changes, `ghanno` should not assume that means a rename. Those lifecycle operations should be explicit API or CLI actions.
+
+The clean production split is:
+
+- manifest import for safe creation and non-destructive updates
+- explicit commands for archive, rename, or delete
+
+That keeps operator behavior predictable and avoids accidental data loss.
+
 ## Example Manifest
 
 This is the kind of YAML manifest that `ghanno` should be able to import:
