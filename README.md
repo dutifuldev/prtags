@@ -145,7 +145,7 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 This split is important operationally too. `PRtags` owns its own database, jobs, search documents, and embeddings. It should not share a database with `ghreplica`, and it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
 
-For group reads, `PRtags` enriches member references on the server side. It calls `ghreplica`'s batch object-read extension internally, resolves the referenced PRs and issues in one request, and returns a small `object_summary` for each member rather than making the CLI orchestrate multiple services. The CLI keeps calling only `PRtags`.
+For group reads, `PRtags` enriches member references on the server side. It calls `ghreplica`'s batch object-read extension internally, resolves the referenced PRs and issues in one request, and returns a small `object_summary` for each member together with `object_summary_freshness` metadata. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
 
 ## Authentication
 

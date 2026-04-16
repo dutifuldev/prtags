@@ -87,10 +87,17 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	filtered := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/targets?target_type=pull_request&field=quality&value=high", nil, http.StatusOK)
 	require.Contains(t, filtered, `"target_type":"pull_request"`)
 
+	listedGroups := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/groups", nil, http.StatusOK)
+	require.Contains(t, listedGroups, `"member_count":1`)
+	require.Contains(t, listedGroups, `"member_counts":{"pull_request":1}`)
+
 	group := postJSON(t, server.Echo(), http.MethodGet, fmt.Sprintf("/v1/groups/%s", groupID), nil, http.StatusOK)
 	require.Contains(t, group, `"Auth reliability"`)
 	require.Contains(t, group, fmt.Sprintf(`"id":"%s"`, groupID))
 	require.Contains(t, group, `"object_summary"`)
+	require.Contains(t, group, `"object_summary_freshness"`)
+	require.Contains(t, group, `"state":"current"`)
+	require.Contains(t, group, `"source":"ghreplica_batch"`)
 	require.Contains(t, group, `"Retry ACP turns safely (batched)"`)
 	require.Contains(t, group, `"https://github.com/acme/widgets/pull/22"`)
 
