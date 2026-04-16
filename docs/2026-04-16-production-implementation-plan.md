@@ -8,7 +8,7 @@ status: proposed
 
 This document turns the current `prtags` design into a concrete implementation plan for a production-ready system.
 
-The main goal is to build a customizable annotation layer on top of `ghreplica` without polluting the mirrored GitHub model. `prtags` should store only references to GitHub-native objects plus human-added structure such as groups, links, field definitions, field values, search documents, and embeddings.
+The main goal is to build a customizable annotation layer on top of `ghreplica` without polluting the mirrored GitHub model. `prtags` should store only references to GitHub-native objects plus human-added structure such as groups, field definitions, field values, search documents, and embeddings.
 
 ## Goals
 
@@ -16,7 +16,6 @@ The main goal is to build a customizable annotation layer on top of `ghreplica` 
 
 - groups of pull requests
 - groups of issues
-- links between groups
 - custom metadata on pull requests, issues, and groups
 - efficient exact filtering over typed metadata
 - efficient full-text search over selected metadata fields
@@ -42,6 +41,7 @@ The implementation should follow these rules:
 3. Search behavior is driven by field capabilities, not hardcoded field names.
 4. Exact filters, full-text search, and vector search each get their own optimized storage path.
 5. `ghreplica` remains the source of truth for mirrored GitHub content.
+6. Shared group membership is the main association model for related PRs and issues.
 
 ## Implementation Stack
 
@@ -75,7 +75,6 @@ These tables are the real source of truth for `prtags`:
 
 - `groups`
 - `group_members`
-- `group_links`
 - `field_definitions`
 - `field_values`
 
@@ -83,7 +82,6 @@ This layer stores:
 
 - object references
 - user-created groups
-- relationships between groups
 - repo-defined annotation schemas
 - typed annotation values
 
@@ -146,6 +144,7 @@ Like the FTS layer, this is derived data and should be rebuildable from the cano
 Suggested columns:
 
 - `id`
+- `public_id`
 - `github_repository_id`
 - `repository_owner`
 - `repository_name`
@@ -162,8 +161,11 @@ Suggested columns:
 
 Important indexes:
 
+- unique `(public_id)`
 - `(github_repository_id, kind, status)`
 - `(github_repository_id, updated_at desc)`
+
+`public_id` should follow the group public-ID rules in [PUBLIC_IDS.md](./PUBLIC_IDS.md), not expose the bare numeric primary key.
 
 ### `group_members`
 
@@ -188,25 +190,6 @@ Important constraints and indexes:
 - unique `(group_id, object_type, object_number)`
 - index `(github_repository_id, object_type, object_number)`
 - foreign key from `group_id` to `groups(id)`
-
-### `group_links`
-
-`group_links` should hold relationships between groups.
-
-Suggested columns:
-
-- `id`
-- `from_group_id`
-- `to_group_id`
-- `relationship_type`
-- `created_by`
-- `created_at`
-
-Important constraints and indexes:
-
-- unique `(from_group_id, to_group_id, relationship_type)`
-- index `(from_group_id)`
-- index `(to_group_id)`
 
 ### `field_definitions`
 
@@ -499,7 +482,7 @@ The production write model should be:
 - `GET` for reads
 - `POST` for creation
 - `PATCH` for partial updates to existing resources
-- explicit action endpoints for membership and link operations
+- explicit action endpoints for membership operations
 
 That means the API should prefer shapes like:
 
@@ -507,8 +490,6 @@ That means the API should prefer shapes like:
 - `PATCH /groups/{id}`
 - `POST /groups/{id}/members`
 - `DELETE /groups/{id}/members/{member_id}`
-- `POST /groups/{id}/links`
-- `DELETE /groups/{id}/links/{link_id}`
 
 Every mutating request should support an `Idempotency-Key`.
 
@@ -589,8 +570,6 @@ For renames:
 - fetch one group
 - add a member to a group
 - remove a member from a group
-- link one group to another
-- unlink groups
 
 ### Annotation Management
 
@@ -619,7 +598,6 @@ Suggested shape:
 - `prtags group create`
 - `prtags group add-pr`
 - `prtags group add-issue`
-- `prtags group link`
 - `prtags pr set`
 - `prtags issue set`
 - `prtags group set`
@@ -643,7 +621,6 @@ The event log should cover:
 - field-definition changes
 - group creation and updates
 - group membership changes
-- group link changes
 - annotation value changes
 
 ### Event Vocabulary
@@ -656,8 +633,6 @@ The core event types should be:
 - `group.updated`
 - `group.member_added`
 - `group.member_removed`
-- `group.link_created`
-- `group.link_removed`
 - `field_definition.created`
 - `field_definition.updated`
 - `field_definition.archived`
@@ -713,9 +688,6 @@ Examples:
 - adding a PR to a group
   - aggregate = the group
   - ref = the PR member
-- linking one group to another
-  - aggregate = the source group
-  - ref = the destination group
 
 The canonical tables remain the current state, and `events` plus `event_refs` provide immutable history.
 
@@ -992,7 +964,6 @@ They should cover:
 
 - group creation and updates
 - member add and remove
-- link create and remove
 - field-definition creation, update, archive, and manifest import
 - field-value set and clear
 - event creation and per-aggregate sequencing
@@ -1132,7 +1103,6 @@ Build:
 
 - `groups`
 - `group_members`
-- `group_links`
 - `field_definitions`
 - `field_values`
 - `events`

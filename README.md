@@ -4,12 +4,12 @@
 
 `PRtags` is meant to sit next to `ghreplica`, not replace it. `ghreplica` stays responsible for mirroring GitHub objects and serving Git-backed change and search truth, while `PRtags` stores human-added structure such as groups, typed annotations, intent, quality judgments, and other repo-specific metadata.
 
-The project is intentionally opinionated about boundaries. GitHub-native content like PR titles, issue bodies, reviews, and comments should continue to come from `ghreplica`. `PRtags` should only add curation data on top: group membership, links between groups, field definitions, field values, and derived indexes for text and similarity search over those annotations.
+The project is intentionally opinionated about boundaries. GitHub-native content like PR titles, issue bodies, reviews, and comments should continue to come from `ghreplica`. `PRtags` should only add curation data on top: group membership, field definitions, field values, and derived indexes for text and similarity search over those annotations.
 
 On top of that core curation model, `PRtags` already adds a few practical capabilities:
 
 - repo-defined typed metadata fields for pull requests, issues, and groups
-- user-created groups with explicit membership and links
+- user-created groups with explicit membership
 - exact filtering over typed annotation values
 - full-text search over fields marked searchable
 - similarity search over fields marked vectorized
@@ -21,7 +21,7 @@ Current public instance:
 
 ## Why
 
-Teams usually end up wanting more structure than GitHub gives them by default. They want to group related PRs, connect those PR groups to issue groups, tag work with intent or quality signals, and later search across that extra metadata. If every downstream tool invents its own sidecar tables and naming conventions for that, the result is fragmented and hard to trust.
+Teams usually end up wanting more structure than GitHub gives them by default. They want to group related PRs and issues, tag work with intent or quality signals, and later search across that extra metadata. If every downstream tool invents its own sidecar tables and naming conventions for that, the result is fragmented and hard to trust.
 
 `PRtags` exists to make that curation layer explicit. It gives deployers a place to define annotation fields at runtime, lets users attach those fields to PRs, issues, and groups, and keeps the extra metadata separate from the mirrored GitHub source of truth. The goal is not to copy GitHub into a second system. The goal is to build a stable layer of human-added structure on top of the mirror.
 
@@ -32,11 +32,11 @@ Teams usually end up wanting more structure than GitHub gives them by default. T
 - `/v1/repos/:owner/:repo/...`
   - repo-scoped operations such as field definitions, repo group creation/listing, PR and issue annotations, target filtering, and search
 - `/v1/groups/:id/...`
-  - group-specific reads and writes such as group updates, membership, links, and group annotations
+  - group-specific reads and writes such as group updates, membership, and group annotations
 
 This API is intentionally not GitHub-compatible. Unlike `ghreplica`, `PRtags` is not mirroring GitHub-native resources. It is exposing product-specific curation data. All JSON responses use JSend envelopes so clients can treat success, validation failures, and server errors consistently.
 
-In practice, the current product already covers a meaningful first slice: field-definition CRUD, manifest import and export, group CRUD, group membership and links, annotations on PRs, issues, and groups, exact filtering on typed annotation values, full-text search over searchable fields, and similarity search over vectorized fields.
+In practice, the current product already covers a meaningful first slice: field-definition CRUD, manifest import and export, group CRUD, group membership, annotations on PRs, issues, and groups, exact filtering on typed annotation values, full-text search over searchable fields, and similarity search over vectorized fields.
 
 ## Quick Examples
 

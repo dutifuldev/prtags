@@ -6,7 +6,6 @@ The core idea is to support:
 
 - groups of pull requests
 - groups of issues
-- links between groups
 - annotations on individual pull requests and issues
 
 ## Design Rules
@@ -15,7 +14,7 @@ The model should follow a few simple rules.
 
 First, `prtags` should not duplicate full PR or issue content. It should store references to mirrored GitHub objects and keep only the metadata that belongs to the curation layer.
 
-Second, membership and relationship should be separate concepts. A group contains members. A group may also be related to another group. Those are not the same thing and should not be represented by the same table.
+Second, shared group membership should be the association model. If a pull request and an issue belong together, they should be in the same group. `prtags` should not add a separate group-to-group relationship system unless a later product requirement clearly needs it.
 
 Third, the model should allow stricter group kinds now without blocking more flexible mixed groups later.
 
@@ -64,6 +63,7 @@ This is the main container table.
 Suggested columns:
 
 - `id`
+- `public_id`
 - `github_repository_id`
 - `repository_owner`
 - `repository_name`
@@ -80,6 +80,8 @@ Suggested columns:
 - `updated_at`
 
 `kind` keeps the semantics clear. A `pull_request` group should only contain PRs. An `issue` group should only contain issues. A `mixed` group can be introduced later if needed without redesigning the whole model.
+
+The public group identity should not be the bare numeric database ID. Groups should have a separate public ID that follows the rules in [PUBLIC_IDS.md](./PUBLIC_IDS.md).
 
 ### `group_members`
 
@@ -98,32 +100,6 @@ Suggested columns:
 - `added_at`
 
 This table answers the question: “which mirrored GitHub objects are inside this group?”
-
-### `group_links`
-
-This table represents relationships between groups.
-
-Suggested columns:
-
-- `id`
-- `from_group_id`
-- `to_group_id`
-- `relationship_type`
-  - `implements`
-  - `tracks`
-  - `duplicates`
-  - `related`
-  - `blocked_by`
-- `created_by`
-- `created_at`
-
-This table answers the question: “how does one group relate to another group?”
-
-That is the clean way to model:
-
-- a PR group connected to an issue group
-- one issue group duplicating another
-- two PR groups solving related parts of the same problem
 
 ### `field_definitions`
 
@@ -197,7 +173,7 @@ The point is to store typed values, not arbitrary blobs, so filtering and indexi
 
 This table should record the immutable audit history for the curation layer.
 
-The best model is not full event-sourcing. `prtags` should keep normal current-state tables like `groups`, `group_members`, `group_links`, and `field_values` for fast reads, and also append one durable event row for each meaningful change.
+The best model is not full event-sourcing. `prtags` should keep normal current-state tables like `groups`, `group_members`, and `field_values` for fast reads, and also append one durable event row for each meaningful change.
 
 Suggested columns:
 
@@ -252,10 +228,6 @@ Examples:
 - adding a PR to a group
   - aggregate = the group
   - ref = the PR member
-- linking two groups
-  - aggregate = the source group
-  - ref = the destination group
-
 ## Why One Generic Group Model Is Better
 
 The elegant part of this design is that there is only one group concept. `prtags` does not need a separate PR-group subsystem and a separate issue-group subsystem. Instead, the same group model works for both, and `kind` keeps the rules understandable.
@@ -264,7 +236,7 @@ That means:
 
 - PR groups and issue groups look structurally the same
 - membership stays simple
-- group-to-group links stay generic
+- shared membership is the association layer
 - future mixed groups remain possible
 
 ## Query Model
@@ -276,7 +248,6 @@ The important queries are:
 - list groups for a repo
 - fetch one group with its members
 - list all groups containing a given PR or issue
-- list links from one group to related groups
 - filter PRs, issues, or groups by custom metadata fields
 
 If vector search is added later, it should be a derived layer over selected annotation fields such as intent, notes, or summaries. That should be stored separately from the core curation model so the base CRUD layer remains simple and predictable.
@@ -295,7 +266,6 @@ The thinnest useful version of `prtags` should start with:
 
 - `groups`
 - `group_members`
-- `group_links`
 - `field_definitions`
 - `field_values`
 - `events`
@@ -305,7 +275,7 @@ That is enough to support:
 
 - creating PR groups
 - creating issue groups
-- linking PR groups to issue groups
+- putting PRs and issues that belong together in the same group
 - attaching repo-defined metadata like `intent` or `quality`
 - recording an immutable history for those changes
 
