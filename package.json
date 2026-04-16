@@ -1,0 +1,11 @@
+{
+  "name": "ghanno",
+  "private": true,
+  "devDependencies": {
+    "@simpledoc/simpledoc": "^0.1.6"
+  },
+  "scripts": {
+    "docs:check": "simpledoc check",
+    "docs:migrate": "simpledoc migrate"
+  }
+}
