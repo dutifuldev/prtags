@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS index_jobs;
+DROP TABLE IF EXISTS embeddings;
+DROP TABLE IF EXISTS search_documents;
+DROP TABLE IF EXISTS event_refs;
+DROP TABLE IF EXISTS events;
+DROP TABLE IF EXISTS field_values;
+DROP TABLE IF EXISTS field_definitions;
+DROP TABLE IF EXISTS group_links;
+DROP TABLE IF EXISTS group_members;
+DROP TABLE IF EXISTS groups;
+DROP TABLE IF EXISTS target_projections;
+DROP TABLE IF EXISTS repository_projections;

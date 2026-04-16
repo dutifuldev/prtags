@@ -1,0 +1,668 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/dutifuldev/prtags/internal/cli"
+	"github.com/dutifuldev/prtags/internal/config"
+	"github.com/dutifuldev/prtags/internal/core"
+	"github.com/dutifuldev/prtags/internal/database"
+	"github.com/dutifuldev/prtags/internal/embedding"
+	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
+	"github.com/dutifuldev/prtags/internal/httpapi"
+	"github.com/dutifuldev/prtags/internal/permissions"
+	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
+)
+
+func main() {
+	root := newRootCommand()
+	if err := root.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func newRootCommand() *cobra.Command {
+	var serverURL string
+
+	root := &cobra.Command{
+		Use: "prtags",
+	}
+	root.PersistentFlags().StringVar(&serverURL, "server", "http://127.0.0.1:8081", "PRtags API base URL")
+
+	root.AddCommand(newServeCommand())
+	root.AddCommand(newWorkerCommand())
+	root.AddCommand(newFieldCommand(&serverURL))
+	root.AddCommand(newGroupCommand(&serverURL))
+	root.AddCommand(newAnnotationCommand(&serverURL))
+	root.AddCommand(newSearchCommand(&serverURL))
+	root.AddCommand(newTargetsCommand(&serverURL))
+
+	return root
+}
+
+func newServeCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "serve",
+		Short: "Run the PRtags HTTP server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.FromEnv()
+			if err := cfg.Validate(); err != nil {
+				return err
+			}
+
+			db, err := database.Open(cfg.DatabaseURL)
+			if err != nil {
+				return err
+			}
+			if err := database.RunMigrations(db); err != nil {
+				return err
+			}
+
+			checker := permissions.Checker(permissions.AllowAllChecker{})
+			if !cfg.AllowUnauthWrites {
+				checker = permissions.NewGitHubChecker(0)
+			}
+
+			indexer := core.NewIndexer(db, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+			service := core.NewService(db, ghreplica.NewClient(cfg.GHReplicaBaseURL), checker, indexer)
+			server := httpapi.NewServer(db, service, cfg.AllowUnauthWrites)
+
+			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			defer stop()
+			if cfg.EnableWorker {
+				go indexer.Start(ctx, cfg.WorkerPollInterval)
+			}
+			go func() {
+				<-ctx.Done()
+				_ = server.Echo().Shutdown(context.Background())
+			}()
+			return server.Echo().Start(cfg.ListenAddr)
+		},
+	}
+}
+
+func newWorkerCommand() *cobra.Command {
+	worker := &cobra.Command{
+		Use:   "worker",
+		Short: "Run index workers",
+	}
+	worker.AddCommand(&cobra.Command{
+		Use:   "run-once",
+		Short: "Process one pending index job",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg := config.FromEnv()
+			if err := cfg.Validate(); err != nil {
+				return err
+			}
+			db, err := database.Open(cfg.DatabaseURL)
+			if err != nil {
+				return err
+			}
+			if err := database.RunMigrations(db); err != nil {
+				return err
+			}
+			indexer := core.NewIndexer(db, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+			return indexer.RunOnce(context.Background())
+		},
+	})
+	return worker
+}
+
+func newFieldCommand(serverURL *string) *cobra.Command {
+	fields := &cobra.Command{Use: "field"}
+
+	var repo string
+	create := &cobra.Command{
+		Use: "create",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			payload := map[string]any{
+				"name":          mustFlag(cmd, "name"),
+				"display_name":  cmd.Flag("display-name").Value.String(),
+				"object_scope":  mustFlag(cmd, "scope"),
+				"field_type":    mustFlag(cmd, "type"),
+				"enum_values":   strings.Fields(strings.ReplaceAll(cmd.Flag("enum-values").Value.String(), ",", " ")),
+				"is_required":   mustBoolFlag(cmd, "required"),
+				"is_filterable": mustBoolFlag(cmd, "filterable"),
+				"is_searchable": mustBoolFlag(cmd, "searchable"),
+				"is_vectorized": mustBoolFlag(cmd, "vectorized"),
+				"sort_order":    mustIntFlag(cmd, "sort-order"),
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/fields", owner, name), payload)
+		},
+	}
+	create.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = create.MarkFlagRequired("repo")
+	create.Flags().String("name", "", "field name")
+	create.Flags().String("display-name", "", "display name")
+	create.Flags().String("scope", "", "field scope")
+	create.Flags().String("type", "", "field type")
+	create.Flags().String("enum-values", "", "comma-separated enum values")
+	create.Flags().Bool("required", false, "field is required")
+	create.Flags().Bool("filterable", false, "field is filterable")
+	create.Flags().Bool("searchable", false, "field is searchable")
+	create.Flags().Bool("vectorized", false, "field is vectorized")
+	create.Flags().Int("sort-order", 0, "field sort order")
+	_ = create.MarkFlagRequired("name")
+	_ = create.MarkFlagRequired("scope")
+	_ = create.MarkFlagRequired("type")
+
+	list := &cobra.Command{
+		Use: "list",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/fields", owner, name), nil)
+		},
+	}
+	list.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = list.MarkFlagRequired("repo")
+
+	update := &cobra.Command{
+		Use:  "update <field-id>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			payload := map[string]any{}
+			if cmd.Flags().Changed("display-name") {
+				payload["display_name"] = cmd.Flag("display-name").Value.String()
+			}
+			if cmd.Flags().Changed("enum-values") {
+				payload["enum_values"] = strings.Fields(strings.ReplaceAll(cmd.Flag("enum-values").Value.String(), ",", " "))
+			}
+			if cmd.Flags().Changed("required") {
+				payload["is_required"] = mustBoolFlag(cmd, "required")
+			}
+			if cmd.Flags().Changed("filterable") {
+				payload["is_filterable"] = mustBoolFlag(cmd, "filterable")
+			}
+			if cmd.Flags().Changed("searchable") {
+				payload["is_searchable"] = mustBoolFlag(cmd, "searchable")
+			}
+			if cmd.Flags().Changed("vectorized") {
+				payload["is_vectorized"] = mustBoolFlag(cmd, "vectorized")
+			}
+			if cmd.Flags().Changed("sort-order") {
+				payload["sort_order"] = mustIntFlag(cmd, "sort-order")
+			}
+			if cmd.Flags().Changed("row-version") {
+				payload["expected_row_version"] = mustIntFlag(cmd, "row-version")
+			}
+			if len(payload) == 0 {
+				return fmt.Errorf("at least one field update is required")
+			}
+			return doPrintJSON(context.Background(), *serverURL, "PATCH", fmt.Sprintf("/v1/repos/%s/%s/fields/%s", owner, name, args[0]), payload)
+		},
+	}
+	update.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = update.MarkFlagRequired("repo")
+	update.Flags().String("display-name", "", "new display name")
+	update.Flags().String("enum-values", "", "comma-separated enum values")
+	update.Flags().Bool("required", false, "field is required")
+	update.Flags().Bool("filterable", false, "field is filterable")
+	update.Flags().Bool("searchable", false, "field is searchable")
+	update.Flags().Bool("vectorized", false, "field is vectorized")
+	update.Flags().Int("sort-order", 0, "field sort order")
+	update.Flags().Int("row-version", 0, "expected current row version")
+
+	archive := &cobra.Command{
+		Use:  "archive <field-id>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			var payload any
+			if cmd.Flags().Changed("row-version") {
+				payload = map[string]any{"expected_row_version": mustIntFlag(cmd, "row-version")}
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/fields/%s/archive", owner, name, args[0]), payload)
+		},
+	}
+	archive.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = archive.MarkFlagRequired("repo")
+	archive.Flags().Int("row-version", 0, "expected current row version")
+
+	importCmd := &cobra.Command{
+		Use:  "import <file>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			contents, err := os.ReadFile(args[0])
+			if err != nil {
+				return err
+			}
+			var manifest any
+			if strings.HasSuffix(args[0], ".yaml") || strings.HasSuffix(args[0], ".yml") {
+				if err := yaml.Unmarshal(contents, &manifest); err != nil {
+					return err
+				}
+			} else {
+				if err := json.Unmarshal(contents, &manifest); err != nil {
+					return err
+				}
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/fields/import", owner, name), manifest)
+		},
+	}
+	importCmd.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = importCmd.MarkFlagRequired("repo")
+
+	exportCmd := &cobra.Command{
+		Use: "export",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			client := cli.NewClient(*serverURL)
+			raw, err := client.DoJSON(context.Background(), "GET", fmt.Sprintf("/v1/repos/%s/%s/fields/export", owner, name), nil)
+			if err != nil {
+				return err
+			}
+			if mustBoolFlag(cmd, "yaml") {
+				var payload any
+				if err := json.Unmarshal(raw, &payload); err != nil {
+					return err
+				}
+				out, err := yaml.Marshal(payload)
+				if err != nil {
+					return err
+				}
+				fmt.Print(string(out))
+				return nil
+			}
+			fmt.Println(prettyJSON(raw))
+			return nil
+		},
+	}
+	exportCmd.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = exportCmd.MarkFlagRequired("repo")
+	exportCmd.Flags().Bool("yaml", false, "render YAML")
+
+	fields.AddCommand(create, list, update, archive, importCmd, exportCmd)
+	return fields
+}
+
+func newGroupCommand(serverURL *string) *cobra.Command {
+	groups := &cobra.Command{Use: "group"}
+	var repo string
+
+	create := &cobra.Command{
+		Use: "create",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			payload := map[string]any{
+				"kind":        mustFlag(cmd, "kind"),
+				"title":       mustFlag(cmd, "title"),
+				"description": cmd.Flag("description").Value.String(),
+				"status":      cmd.Flag("status").Value.String(),
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/groups", owner, name), payload)
+		},
+	}
+	create.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = create.MarkFlagRequired("repo")
+	create.Flags().String("kind", "", "group kind")
+	create.Flags().String("title", "", "group title")
+	create.Flags().String("description", "", "group description")
+	create.Flags().String("status", "open", "group status")
+	_ = create.MarkFlagRequired("kind")
+	_ = create.MarkFlagRequired("title")
+
+	list := &cobra.Command{
+		Use: "list",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/groups", owner, name), nil)
+		},
+	}
+	list.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = list.MarkFlagRequired("repo")
+
+	get := &cobra.Command{
+		Use:  "get <group-id>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return doPrintJSON(context.Background(), *serverURL, "GET", "/v1/groups/"+args[0], nil)
+		},
+	}
+
+	update := &cobra.Command{
+		Use:  "update <group-id>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			payload := map[string]any{}
+			if cmd.Flags().Changed("title") {
+				payload["title"] = cmd.Flag("title").Value.String()
+			}
+			if cmd.Flags().Changed("description") {
+				payload["description"] = cmd.Flag("description").Value.String()
+			}
+			if cmd.Flags().Changed("status") {
+				payload["status"] = cmd.Flag("status").Value.String()
+			}
+			if cmd.Flags().Changed("row-version") {
+				payload["expected_row_version"] = mustIntFlag(cmd, "row-version")
+			}
+			if len(payload) == 0 {
+				return fmt.Errorf("at least one group update is required")
+			}
+			return doPrintJSON(context.Background(), *serverURL, "PATCH", "/v1/groups/"+args[0], payload)
+		},
+	}
+	update.Flags().String("title", "", "new group title")
+	update.Flags().String("description", "", "new group description")
+	update.Flags().String("status", "", "new group status")
+	update.Flags().Int("row-version", 0, "expected current row version")
+
+	addPR := &cobra.Command{
+		Use:  "add-pr <group-id> <pr-number>",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			number, err := strconv.Atoi(args[1])
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/members", map[string]any{
+				"object_type":   "pull_request",
+				"object_number": number,
+			})
+		},
+	}
+
+	addIssue := &cobra.Command{
+		Use:  "add-issue <group-id> <issue-number>",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			number, err := strconv.Atoi(args[1])
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/members", map[string]any{
+				"object_type":   "issue",
+				"object_number": number,
+			})
+		},
+	}
+
+	link := &cobra.Command{
+		Use:  "link <from-group-id> <to-group-id> <relationship>",
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			toID, err := strconv.ParseUint(args[1], 10, 64)
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/links", map[string]any{
+				"to_group_id":       uint(toID),
+				"relationship_type": args[2],
+			})
+		},
+	}
+
+	unlink := &cobra.Command{
+		Use:  "unlink <group-id> <link-id>",
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return doPrintJSON(context.Background(), *serverURL, "DELETE", "/v1/groups/"+args[0]+"/links/"+args[1], nil)
+		},
+	}
+
+	groups.AddCommand(create, list, get, update, addPR, addIssue, link, unlink)
+	return groups
+}
+
+func newAnnotationCommand(serverURL *string) *cobra.Command {
+	root := &cobra.Command{Use: "annotation"}
+
+	root.AddCommand(newObjectAnnotationCommand(serverURL, "pr", "pulls"))
+	root.AddCommand(newObjectAnnotationCommand(serverURL, "issue", "issues"))
+
+	group := &cobra.Command{Use: "group"}
+	group.AddCommand(&cobra.Command{
+		Use:  "set <group-id> <field=value> [field=value...]",
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			annotations, err := parseAnnotationPairs(args[1:])
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/annotations", annotations)
+		},
+	})
+	group.AddCommand(&cobra.Command{
+		Use:  "get <group-id>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return doPrintJSON(context.Background(), *serverURL, "GET", "/v1/groups/"+args[0]+"/annotations", nil)
+		},
+	})
+
+	root.AddCommand(group)
+	return root
+}
+
+func newObjectAnnotationCommand(serverURL *string, name, route string) *cobra.Command {
+	var repo string
+	cmd := &cobra.Command{Use: name}
+	set := &cobra.Command{
+		Use:  "set <number> <field=value> [field=value...]",
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, repoName, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			annotations, err := parseAnnotationPairs(args[1:])
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/%s/%s/annotations", owner, repoName, route, args[0]), annotations)
+		},
+	}
+	set.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = set.MarkFlagRequired("repo")
+	get := &cobra.Command{
+		Use:  "get <number>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, repoName, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/%s/%s/annotations", owner, repoName, route, args[0]), nil)
+		},
+	}
+	get.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = get.MarkFlagRequired("repo")
+	cmd.AddCommand(set, get)
+	return cmd
+}
+
+func newSearchCommand(serverURL *string) *cobra.Command {
+	search := &cobra.Command{Use: "search"}
+	var repo string
+
+	text := &cobra.Command{
+		Use:  "text <query>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			payload := map[string]any{
+				"query":        args[0],
+				"target_types": strings.Fields(strings.ReplaceAll(cmd.Flag("types").Value.String(), ",", " ")),
+				"limit":        mustIntFlag(cmd, "limit"),
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/search/text", owner, name), payload)
+		},
+	}
+	text.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = text.MarkFlagRequired("repo")
+	text.Flags().String("types", "pull_request issue group", "target types")
+	text.Flags().Int("limit", 10, "result limit")
+
+	similar := &cobra.Command{
+		Use:  "similar <query>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			payload := map[string]any{
+				"query":        args[0],
+				"target_types": strings.Fields(strings.ReplaceAll(cmd.Flag("types").Value.String(), ",", " ")),
+				"limit":        mustIntFlag(cmd, "limit"),
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/search/similar", owner, name), payload)
+		},
+	}
+	similar.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = similar.MarkFlagRequired("repo")
+	similar.Flags().String("types", "pull_request issue group", "target types")
+	similar.Flags().Int("limit", 10, "result limit")
+
+	search.AddCommand(text, similar)
+	return search
+}
+
+func newTargetsCommand(serverURL *string) *cobra.Command {
+	var repo string
+	targets := &cobra.Command{Use: "targets"}
+	filter := &cobra.Command{
+		Use: "filter",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			path := fmt.Sprintf("/v1/repos/%s/%s/targets?target_type=%s&field=%s&value=%s", owner, name, mustFlag(cmd, "type"), mustFlag(cmd, "field"), mustFlag(cmd, "value"))
+			return doPrintJSON(context.Background(), *serverURL, "GET", path, nil)
+		},
+	}
+	filter.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = filter.MarkFlagRequired("repo")
+	filter.Flags().String("type", "", "target type")
+	filter.Flags().String("field", "", "field name")
+	filter.Flags().String("value", "", "field value")
+	_ = filter.MarkFlagRequired("type")
+	_ = filter.MarkFlagRequired("field")
+	_ = filter.MarkFlagRequired("value")
+	targets.AddCommand(filter)
+	return targets
+}
+
+func doPrintJSON(ctx context.Context, serverURL, method, path string, payload any) error {
+	client := cli.NewClient(serverURL)
+	raw, err := client.DoJSON(ctx, method, path, payload)
+	if err != nil {
+		return err
+	}
+	fmt.Println(prettyJSON(raw))
+	return nil
+}
+
+func prettyJSON(raw []byte) string {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return string(raw)
+	}
+	out, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return string(raw)
+	}
+	return string(out)
+}
+
+func splitRepo(fullName string) (string, string, error) {
+	parts := strings.Split(strings.TrimSpace(fullName), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("repo must be owner/name")
+	}
+	return parts[0], parts[1], nil
+}
+
+func parseAnnotationPairs(pairs []string) (map[string]any, error) {
+	if len(pairs) == 0 {
+		return nil, fmt.Errorf("at least one annotation is required")
+	}
+	out := map[string]any{}
+	for _, pair := range pairs {
+		parts := strings.SplitN(pair, "=", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid annotation %q", pair)
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if key == "" {
+			return nil, fmt.Errorf("annotation key is required")
+		}
+		if strings.EqualFold(value, "null") {
+			out[key] = nil
+			continue
+		}
+		if value == "true" || value == "false" {
+			out[key] = value == "true"
+			continue
+		}
+		if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+			var items []any
+			if err := json.Unmarshal([]byte(value), &items); err != nil {
+				return nil, err
+			}
+			out[key] = items
+			continue
+		}
+		if number, err := strconv.ParseInt(value, 10, 64); err == nil {
+			out[key] = number
+			continue
+		}
+		out[key] = value
+	}
+	return out, nil
+}
+
+func mustFlag(cmd *cobra.Command, name string) string {
+	return cmd.Flag(name).Value.String()
+}
+
+func mustBoolFlag(cmd *cobra.Command, name string) bool {
+	value, _ := strconv.ParseBool(cmd.Flag(name).Value.String())
+	return value
+}
+
+func mustIntFlag(cmd *cobra.Command, name string) int {
+	value, _ := strconv.Atoi(cmd.Flag(name).Value.String())
+	return value
+}

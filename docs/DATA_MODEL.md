@@ -23,22 +23,35 @@ Third, the model should allow stricter group kinds now without blocking more fle
 
 Because `prtags` is a separate service, it cannot rely on database joins into `ghreplica`. So every curated object should be referenced in a stable, explicit way.
 
-The simplest shape is:
+The canonical shape should be:
 
-- `repository_owner`
-- `repository_name`
+- `github_repository_id`
 - `object_type`
   - `pull_request`
   - `issue`
 - `object_number`
 
-This should be the canonical identity model. `prtags` should store those values as separate columns because that is easier to validate, index, and query than a packed string key.
+This should be the canonical identity model. `prtags` should base GitHub-native object identity on stable IDs that do not change when a repository is renamed or transferred.
 
-If a display-friendly identifier is useful, it should be derived from those columns. For example:
+For repositories, that means:
 
-- `openclaw/openclaw#59883`
+- `github_repository_id` is the source of truth
+- `repository_owner`
+- `repository_name`
 
-That kind of packed key is fine for logs, URLs, CLI output, or cache keys, but it should not be the source of truth.
+For pull requests and issues, that means:
+
+- `github_repository_id`
+- `object_type`
+- `object_number`
+
+Human-friendly locators can still exist as derived or cached fields. For example:
+
+- `repository_owner = "openclaw"`
+- `repository_name = "openclaw"`
+- display key `openclaw/openclaw#59883`
+
+Those are useful for logs, URLs, CLI output, and caches, but they should not be the source of truth.
 
 Optionally, `prtags` can also cache a small local projection for display and search purposes, such as title, state, author, and updated time, but that projection should stay clearly separate from the source-of-truth reference.
 
@@ -51,6 +64,7 @@ This is the main container table.
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `kind`
@@ -75,6 +89,7 @@ Suggested columns:
 
 - `id`
 - `group_id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `object_type`
@@ -119,6 +134,7 @@ These definitions should be runtime data stored in the database, not Go code. Go
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `name`
@@ -162,9 +178,10 @@ Suggested columns:
   - `pull_request`
   - `issue`
   - `group`
+- `github_repository_id`
 - `target_id`
   - group ID for local objects
-  - or a synthetic key for referenced PRs/issues
+  - or a stable synthetic key for referenced PRs/issues built from stable GitHub identity
 - `string_value`
 - `text_value`
 - `bool_value`
@@ -185,6 +202,7 @@ The best model is not full event-sourcing. `prtags` should keep normal current-s
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `aggregate_type`
