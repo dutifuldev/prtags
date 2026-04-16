@@ -1514,29 +1514,43 @@ func convertAnnotationValue(definition database.FieldDefinition, raw any) (conve
 		return convertedValue{}, true, nil
 	}
 
+	base := convertedValue{MultiEnumJSON: datatypes.JSON([]byte("[]"))}
+
 	switch definition.FieldType {
 	case "string":
 		value := strings.TrimSpace(fmt.Sprint(raw))
-		return convertedValue{StringValue: &value, APIValue: value}, false, nil
+		base.StringValue = &value
+		base.APIValue = value
+		return base, false, nil
 	case "text":
 		value := strings.TrimSpace(fmt.Sprint(raw))
-		return convertedValue{TextValue: &value, APIValue: value}, false, nil
+		base.TextValue = &value
+		base.APIValue = value
+		return base, false, nil
 	case "boolean":
 		boolValue, ok := raw.(bool)
 		if !ok {
 			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected boolean value"}
 		}
-		return convertedValue{BoolValue: &boolValue, APIValue: boolValue}, false, nil
+		base.BoolValue = &boolValue
+		base.APIValue = boolValue
+		return base, false, nil
 	case "integer":
 		switch typed := raw.(type) {
 		case float64:
 			value := int64(typed)
-			return convertedValue{IntValue: &value, APIValue: value}, false, nil
+			base.IntValue = &value
+			base.APIValue = value
+			return base, false, nil
 		case int:
 			value := int64(typed)
-			return convertedValue{IntValue: &value, APIValue: value}, false, nil
+			base.IntValue = &value
+			base.APIValue = value
+			return base, false, nil
 		case int64:
-			return convertedValue{IntValue: &typed, APIValue: typed}, false, nil
+			base.IntValue = &typed
+			base.APIValue = typed
+			return base, false, nil
 		default:
 			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected integer value"}
 		}
@@ -1545,7 +1559,9 @@ func convertAnnotationValue(definition database.FieldDefinition, raw any) (conve
 		if !enumAllowed(definition.EnumValuesJSON, value) {
 			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "invalid enum value"}
 		}
-		return convertedValue{EnumValue: &value, APIValue: value}, false, nil
+		base.EnumValue = &value
+		base.APIValue = value
+		return base, false, nil
 	case "multi_enum":
 		items, ok := raw.([]any)
 		if !ok {
@@ -1561,7 +1577,9 @@ func convertAnnotationValue(definition database.FieldDefinition, raw any) (conve
 		}
 		sort.Strings(values)
 		bytes, _ := json.Marshal(values)
-		return convertedValue{MultiEnumJSON: datatypes.JSON(bytes), APIValue: values}, false, nil
+		base.MultiEnumJSON = datatypes.JSON(bytes)
+		base.APIValue = values
+		return base, false, nil
 	default:
 		return convertedValue{}, false, &FailError{StatusCode: 400, Message: "unsupported field type"}
 	}
