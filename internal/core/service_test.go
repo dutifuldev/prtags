@@ -167,6 +167,32 @@ func TestAnnotationSetResultJSONUsesSnakeCase(t *testing.T) {
 	require.NotContains(t, string(raw), `"Annotations"`)
 }
 
+func TestListGroupsReturnsMemberCounts(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:        "mixed",
+		Title:       "Auth work",
+		Description: "Track auth fixes",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "issue", 11, "")
+	require.NoError(t, err)
+
+	groups, err := service.ListGroups(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, groups, 1)
+	require.Equal(t, 2, groups[0].MemberCount)
+	require.Equal(t, 1, groups[0].MemberCounts["pull_request"])
+	require.Equal(t, 1, groups[0].MemberCounts["issue"])
+}
+
 func TestGetGroupEnrichesMembersWithBatchSummaries(t *testing.T) {
 	ctx := context.Background()
 	service, _, server := newTestService(t)
@@ -190,8 +216,14 @@ func TestGetGroupEnrichesMembersWithBatchSummaries(t *testing.T) {
 	require.Len(t, members, 2)
 	require.Equal(t, "Retry ACP turns safely (batched)", members[0].ObjectSummary.Title)
 	require.Equal(t, "bob", members[0].ObjectSummary.AuthorLogin)
+	require.NotNil(t, members[0].ObjectFreshness)
+	require.Equal(t, "current", members[0].ObjectFreshness.State)
+	require.Equal(t, "ghreplica_batch", members[0].ObjectFreshness.Source)
 	require.Equal(t, "Auth retries are flaky (batched)", members[1].ObjectSummary.Title)
 	require.Equal(t, "alice", members[1].ObjectSummary.AuthorLogin)
+	require.NotNil(t, members[1].ObjectFreshness)
+	require.Equal(t, "current", members[1].ObjectFreshness.State)
+	require.Equal(t, "ghreplica_batch", members[1].ObjectFreshness.Source)
 }
 
 func TestGetGroupFallsBackToCachedProjectionWhenBatchReadFails(t *testing.T) {
@@ -215,6 +247,9 @@ func TestGetGroupFallsBackToCachedProjectionWhenBatchReadFails(t *testing.T) {
 	require.NotNil(t, members[0].ObjectSummary)
 	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
 	require.Equal(t, "https://github.com/acme/widgets/pull/22", members[0].ObjectSummary.HTMLURL)
+	require.NotNil(t, members[0].ObjectFreshness)
+	require.Equal(t, "cached", members[0].ObjectFreshness.State)
+	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
 }
 
 func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {

@@ -98,6 +98,12 @@ type TargetFilterResult struct {
 	Annotations  map[string]any             `json:"annotations"`
 }
 
+type GroupListView struct {
+	database.Group
+	MemberCount  int            `json:"member_count"`
+	MemberCounts map[string]int `json:"member_counts"`
+}
+
 type GroupMemberObjectSummary struct {
 	Title       string    `json:"title"`
 	State       string    `json:"state"`
@@ -106,15 +112,22 @@ type GroupMemberObjectSummary struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+type GroupMemberObjectFreshness struct {
+	State     string     `json:"state"`
+	Source    string     `json:"source"`
+	FetchedAt *time.Time `json:"fetched_at,omitempty"`
+}
+
 type GroupMemberView struct {
-	ID                 uint                      `json:"id"`
-	GitHubRepositoryID int64                     `json:"github_repository_id"`
-	ObjectType         string                    `json:"object_type"`
-	ObjectNumber       int                       `json:"object_number"`
-	TargetKey          string                    `json:"target_key"`
-	AddedBy            string                    `json:"added_by"`
-	AddedAt            time.Time                 `json:"added_at"`
-	ObjectSummary      *GroupMemberObjectSummary `json:"object_summary,omitempty"`
+	ID                 uint                        `json:"id"`
+	GitHubRepositoryID int64                       `json:"github_repository_id"`
+	ObjectType         string                      `json:"object_type"`
+	ObjectNumber       int                         `json:"object_number"`
+	TargetKey          string                      `json:"target_key"`
+	AddedBy            string                      `json:"added_by"`
+	AddedAt            time.Time                   `json:"added_at"`
+	ObjectSummary      *GroupMemberObjectSummary   `json:"object_summary,omitempty"`
+	ObjectFreshness    *GroupMemberObjectFreshness `json:"object_summary_freshness,omitempty"`
 }
 
 func NewService(db *gorm.DB, gh *ghreplica.Client, checker permissions.Checker, indexer *Indexer) *Service {
@@ -731,7 +744,7 @@ func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, grou
 	return group, nil
 }
 
-func (s *Service) ListGroups(ctx context.Context, owner, repo string) ([]database.Group, error) {
+func (s *Service) ListGroups(ctx context.Context, owner, repo string) ([]GroupListView, error) {
 	repository, err := s.EnsureRepository(ctx, owner, repo)
 	if err != nil {
 		return nil, err
@@ -741,7 +754,28 @@ func (s *Service) ListGroups(ctx context.Context, owner, repo string) ([]databas
 		Where("github_repository_id = ?", repository.GitHubRepositoryID).
 		Order("updated_at DESC, id DESC").
 		Find(&groups).Error
-	return groups, err
+	if err != nil {
+		return nil, err
+	}
+
+	counts, err := s.listGroupMemberCounts(ctx, groups)
+	if err != nil {
+		return nil, err
+	}
+
+	views := make([]GroupListView, 0, len(groups))
+	for _, group := range groups {
+		view := GroupListView{
+			Group:        group,
+			MemberCounts: map[string]int{},
+		}
+		if count, ok := counts[group.ID]; ok {
+			view.MemberCount = count.Total
+			view.MemberCounts = count.ByType
+		}
+		views = append(views, view)
+	}
+	return views, nil
 }
 
 func (s *Service) GetGroup(ctx context.Context, groupPublicID string) (database.Group, []GroupMemberView, map[string]any, error) {
@@ -1263,20 +1297,69 @@ func (s *Service) enrichGroupMembers(ctx context.Context, group database.Group, 
 
 	views := make([]GroupMemberView, 0, len(members))
 	for _, member := range members {
-		var summary *GroupMemberObjectSummary
+		var resolution groupMemberResolution
 		if liveOK {
-			summary = liveSummaries[member.TargetKey]
+			resolution = liveSummaries[member.TargetKey]
 		} else {
-			summary = cachedSummaries[member.TargetKey]
+			resolution = cachedSummaries[member.TargetKey]
 		}
-		views = append(views, groupMemberViewFromModel(member, summary))
+		views = append(views, groupMemberViewFromModel(member, resolution))
 	}
 	return views, nil
 }
 
-func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repositoryID int64, members []database.GroupMember) (map[string]*GroupMemberObjectSummary, error) {
+type groupMemberCounts struct {
+	Total  int
+	ByType map[string]int
+}
+
+type groupMemberCountRow struct {
+	GroupID    uint
+	ObjectType string
+	Count      int64
+}
+
+type groupMemberResolution struct {
+	Summary   *GroupMemberObjectSummary
+	Freshness *GroupMemberObjectFreshness
+}
+
+func (s *Service) listGroupMemberCounts(ctx context.Context, groups []database.Group) (map[uint]groupMemberCounts, error) {
+	if len(groups) == 0 {
+		return map[uint]groupMemberCounts{}, nil
+	}
+
+	groupIDs := make([]uint, 0, len(groups))
+	for _, group := range groups {
+		groupIDs = append(groupIDs, group.ID)
+	}
+
+	var rows []groupMemberCountRow
+	if err := s.db.WithContext(ctx).
+		Model(&database.GroupMember{}).
+		Select("group_id, object_type, COUNT(*) AS count").
+		Where("group_id IN ?", groupIDs).
+		Group("group_id, object_type").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	counts := make(map[uint]groupMemberCounts, len(groupIDs))
+	for _, row := range rows {
+		entry := counts[row.GroupID]
+		if entry.ByType == nil {
+			entry.ByType = map[string]int{}
+		}
+		entry.ByType[row.ObjectType] = int(row.Count)
+		entry.Total += int(row.Count)
+		counts[row.GroupID] = entry
+	}
+	return counts, nil
+}
+
+func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repositoryID int64, members []database.GroupMember) (map[string]groupMemberResolution, error) {
 	if len(members) == 0 {
-		return map[string]*GroupMemberObjectSummary{}, nil
+		return map[string]groupMemberResolution{}, nil
 	}
 
 	targetTypes := make([]string, 0, len(members))
@@ -1297,7 +1380,7 @@ func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repository
 		}
 	}
 	if len(targetTypes) == 0 || len(objectNumbers) == 0 {
-		return map[string]*GroupMemberObjectSummary{}, nil
+		return map[string]groupMemberResolution{}, nil
 	}
 
 	var projections []database.TargetProjection
@@ -1307,14 +1390,14 @@ func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repository
 		return nil, err
 	}
 
-	summaries := make(map[string]*GroupMemberObjectSummary, len(projections))
+	summaries := make(map[string]groupMemberResolution, len(projections))
 	for _, projection := range projections {
-		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projectionToGroupMemberSummary(projection)
+		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projectionToGroupMemberResolution(projection)
 	}
 	return summaries, nil
 }
 
-func (s *Service) fetchLiveGroupMemberSummaries(ctx context.Context, group database.Group, members []database.GroupMember) (map[string]*GroupMemberObjectSummary, bool) {
+func (s *Service) fetchLiveGroupMemberSummaries(ctx context.Context, group database.Group, members []database.GroupMember) (map[string]groupMemberResolution, bool) {
 	refs := make([]ghreplica.BatchObjectRef, 0, len(members))
 	seen := map[string]struct{}{}
 	for _, member := range members {
@@ -1331,7 +1414,7 @@ func (s *Service) fetchLiveGroupMemberSummaries(ctx context.Context, group datab
 		})
 	}
 	if len(refs) == 0 {
-		return map[string]*GroupMemberObjectSummary{}, true
+		return map[string]groupMemberResolution{}, true
 	}
 
 	results, err := s.ghreplica.BatchGetObjects(ctx, group.RepositoryOwner, group.RepositoryName, refs)
@@ -1340,19 +1423,27 @@ func (s *Service) fetchLiveGroupMemberSummaries(ctx context.Context, group datab
 	}
 
 	now := time.Now().UTC()
-	summaries := make(map[string]*GroupMemberObjectSummary, len(results))
+	summaries := make(map[string]groupMemberResolution, len(results))
 	projections := make([]database.TargetProjection, 0, len(results))
 	for _, result := range results {
 		if !result.Found || result.Summary == nil {
 			continue
 		}
 		key := objectTargetKey(group.GitHubRepositoryID, result.Type, result.Number)
-		summaries[key] = &GroupMemberObjectSummary{
-			Title:       result.Summary.Title,
-			State:       result.Summary.State,
-			HTMLURL:     result.Summary.HTMLURL,
-			AuthorLogin: result.Summary.AuthorLogin,
-			UpdatedAt:   result.Summary.UpdatedAt.UTC(),
+		fetchedAt := now
+		summaries[key] = groupMemberResolution{
+			Summary: &GroupMemberObjectSummary{
+				Title:       result.Summary.Title,
+				State:       result.Summary.State,
+				HTMLURL:     result.Summary.HTMLURL,
+				AuthorLogin: result.Summary.AuthorLogin,
+				UpdatedAt:   result.Summary.UpdatedAt.UTC(),
+			},
+			Freshness: &GroupMemberObjectFreshness{
+				State:     "current",
+				Source:    "ghreplica_batch",
+				FetchedAt: &fetchedAt,
+			},
 		}
 		projections = append(projections, database.TargetProjection{
 			GitHubRepositoryID: group.GitHubRepositoryID,
@@ -1389,7 +1480,7 @@ func (s *Service) upsertTargetProjections(ctx context.Context, projections []dat
 	return nil
 }
 
-func groupMemberViewFromModel(member database.GroupMember, summary *GroupMemberObjectSummary) GroupMemberView {
+func groupMemberViewFromModel(member database.GroupMember, resolution groupMemberResolution) GroupMemberView {
 	return GroupMemberView{
 		ID:                 member.ID,
 		GitHubRepositoryID: member.GitHubRepositoryID,
@@ -1398,17 +1489,26 @@ func groupMemberViewFromModel(member database.GroupMember, summary *GroupMemberO
 		TargetKey:          member.TargetKey,
 		AddedBy:            member.AddedBy,
 		AddedAt:            member.AddedAt,
-		ObjectSummary:      summary,
+		ObjectSummary:      resolution.Summary,
+		ObjectFreshness:    resolution.Freshness,
 	}
 }
 
-func projectionToGroupMemberSummary(projection database.TargetProjection) *GroupMemberObjectSummary {
-	return &GroupMemberObjectSummary{
-		Title:       projection.Title,
-		State:       projection.State,
-		HTMLURL:     projection.HTMLURL,
-		AuthorLogin: projection.AuthorLogin,
-		UpdatedAt:   projection.SourceUpdatedAt,
+func projectionToGroupMemberResolution(projection database.TargetProjection) groupMemberResolution {
+	fetchedAt := projection.FetchedAt
+	return groupMemberResolution{
+		Summary: &GroupMemberObjectSummary{
+			Title:       projection.Title,
+			State:       projection.State,
+			HTMLURL:     projection.HTMLURL,
+			AuthorLogin: projection.AuthorLogin,
+			UpdatedAt:   projection.SourceUpdatedAt,
+		},
+		Freshness: &GroupMemberObjectFreshness{
+			State:     "cached",
+			Source:    "target_projection",
+			FetchedAt: &fetchedAt,
+		},
 	}
 }
 
