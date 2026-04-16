@@ -37,9 +37,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Check formatting
+      - name: Detect Go files
+        id: go-files
         run: |
-          unformatted="$(gofmt -l .)"
+          if find . -type f -name '*.go' -not -path './vendor/*' | grep -q .; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check formatting
+        if: steps.go-files.outputs.present == 'true'
+        run: |
+          unformatted="$(find . -type f -name '*.go' -not -path './vendor/*' | xargs gofmt -l)"
           if [ -n "$unformatted" ]; then
             echo "The following files are not gofmt-formatted:"
             echo "$unformatted"
@@ -47,7 +57,9 @@ jobs:
           fi
 
       - name: Vet
+        if: steps.go-files.outputs.present == 'true'
         run: go vet ./...
 
       - name: Run tests
+        if: steps.go-files.outputs.present == 'true'
         run: go test ./...
