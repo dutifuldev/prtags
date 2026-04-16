@@ -868,6 +868,27 @@ Suggested projected fields:
 - updated_at
 - html_url
 
+For group reads, `PRtags` should enrich member references on the server side by calling `ghreplica`'s batch object-read extension. The CLI should keep talking only to `PRtags`; it should not be responsible for making separate `ghreplica` calls.
+
+The default read behavior should be:
+
+- `group get`
+  - resolve members through one `ghreplica` batch request
+  - return member refs plus a small `object_summary`
+- `group list`
+  - return group metadata and member counts by default
+  - only expand member summaries when explicitly requested later
+
+The `object_summary` should stay intentionally small:
+
+- `type`
+- `number`
+- `title`
+- `state`
+- `html_url`
+- `author_login`
+- `updated_at`
+
 This is useful for list views and result rendering, but it should remain optional and secondary.
 
 The refresh model should be:
