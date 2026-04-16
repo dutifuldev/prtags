@@ -61,8 +61,6 @@ func (s *Server) registerRoutes() {
 	s.echo.PATCH("/v1/groups/:id", s.handleUpdateGroup)
 	s.echo.POST("/v1/groups/:id/members", s.handleAddGroupMember)
 	s.echo.DELETE("/v1/groups/:id/members/:member_id", s.handleRemoveGroupMember)
-	s.echo.POST("/v1/groups/:id/links", s.handleLinkGroups)
-	s.echo.DELETE("/v1/groups/:id/links/:link_id", s.handleDeleteGroupLink)
 
 	s.echo.POST("/v1/repos/:owner/:repo/pulls/:number/annotations", s.handleSetPullRequestAnnotations)
 	s.echo.GET("/v1/repos/:owner/:repo/pulls/:number/annotations", s.handleGetPullRequestAnnotations)
@@ -171,32 +169,23 @@ func (s *Server) handleListGroups(c echo.Context) error {
 }
 
 func (s *Server) handleGetGroup(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
-	group, members, links, annotations, err := s.service.GetGroup(c.Request().Context(), groupID)
+	group, members, annotations, err := s.service.GetGroup(c.Request().Context(), c.Param("id"))
 	if err != nil {
 		return s.renderError(c, err)
 	}
 	return c.JSON(http.StatusOK, jsend.Success(map[string]any{
 		"group":       group,
 		"members":     members,
-		"links":       links,
 		"annotations": annotations,
 	}))
 }
 
 func (s *Server) handleUpdateGroup(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
 	var input core.GroupPatchInput
 	if err := decodeJSONBody(c, &input); err != nil {
 		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid request body"})
 	}
-	group, err := s.service.UpdateGroup(c.Request().Context(), s.actorFromRequest(c), groupID, input, c.Request().Header.Get("Idempotency-Key"))
+	group, err := s.service.UpdateGroup(c.Request().Context(), s.actorFromRequest(c), c.Param("id"), input, c.Request().Header.Get("Idempotency-Key"))
 	if err != nil {
 		return s.renderError(c, err)
 	}
@@ -204,10 +193,6 @@ func (s *Server) handleUpdateGroup(c echo.Context) error {
 }
 
 func (s *Server) handleAddGroupMember(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
 	var input struct {
 		ObjectType   string `json:"object_type"`
 		ObjectNumber int    `json:"object_number"`
@@ -215,7 +200,7 @@ func (s *Server) handleAddGroupMember(c echo.Context) error {
 	if err := decodeJSONBody(c, &input); err != nil {
 		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid request body"})
 	}
-	member, err := s.service.AddGroupMember(c.Request().Context(), s.actorFromRequest(c), groupID, input.ObjectType, input.ObjectNumber, c.Request().Header.Get("Idempotency-Key"))
+	member, err := s.service.AddGroupMember(c.Request().Context(), s.actorFromRequest(c), c.Param("id"), input.ObjectType, input.ObjectNumber, c.Request().Header.Get("Idempotency-Key"))
 	if err != nil {
 		return s.renderError(c, err)
 	}
@@ -223,49 +208,11 @@ func (s *Server) handleAddGroupMember(c echo.Context) error {
 }
 
 func (s *Server) handleRemoveGroupMember(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
 	memberID, err := parseUintParam(c.Param("member_id"))
 	if err != nil {
 		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid member id"})
 	}
-	if err := s.service.RemoveGroupMember(c.Request().Context(), s.actorFromRequest(c), groupID, memberID, c.Request().Header.Get("Idempotency-Key")); err != nil {
-		return s.renderError(c, err)
-	}
-	return c.JSON(http.StatusOK, jsend.Success(map[string]any{"removed": true}))
-}
-
-func (s *Server) handleLinkGroups(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
-	var input struct {
-		ToGroupID        uint   `json:"to_group_id"`
-		RelationshipType string `json:"relationship_type"`
-	}
-	if err := decodeJSONBody(c, &input); err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid request body"})
-	}
-	link, err := s.service.LinkGroups(c.Request().Context(), s.actorFromRequest(c), groupID, input.ToGroupID, input.RelationshipType, c.Request().Header.Get("Idempotency-Key"))
-	if err != nil {
-		return s.renderError(c, err)
-	}
-	return c.JSON(http.StatusCreated, jsend.Success(link))
-}
-
-func (s *Server) handleDeleteGroupLink(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
-	linkID, err := parseUintParam(c.Param("link_id"))
-	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid link id"})
-	}
-	if err := s.service.DeleteGroupLink(c.Request().Context(), s.actorFromRequest(c), groupID, linkID, c.Request().Header.Get("Idempotency-Key")); err != nil {
+	if err := s.service.RemoveGroupMember(c.Request().Context(), s.actorFromRequest(c), c.Param("id"), memberID, c.Request().Header.Get("Idempotency-Key")); err != nil {
 		return s.renderError(c, err)
 	}
 	return c.JSON(http.StatusOK, jsend.Success(map[string]any{"removed": true}))
@@ -316,19 +263,15 @@ func (s *Server) handleGetObjectAnnotations(c echo.Context, targetType string) e
 }
 
 func (s *Server) handleSetGroupAnnotations(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
+	group, err := s.loadGroupByPublicID(c)
 	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
-	var group database.Group
-	if err := s.db.WithContext(c.Request().Context()).First(&group, groupID).Error; err != nil {
 		return s.renderError(c, err)
 	}
 	values := map[string]any{}
 	if err := decodeJSONBody(c, &values); err != nil {
 		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid request body"})
 	}
-	result, err := s.service.SetAnnotations(c.Request().Context(), s.actorFromRequest(c), group.RepositoryOwner, group.RepositoryName, "group", 0, &groupID, values, c.Request().Header.Get("Idempotency-Key"))
+	result, err := s.service.SetAnnotations(c.Request().Context(), s.actorFromRequest(c), group.RepositoryOwner, group.RepositoryName, "group", 0, &group.ID, values, c.Request().Header.Get("Idempotency-Key"))
 	if err != nil {
 		return s.renderError(c, err)
 	}
@@ -336,15 +279,11 @@ func (s *Server) handleSetGroupAnnotations(c echo.Context) error {
 }
 
 func (s *Server) handleGetGroupAnnotations(c echo.Context) error {
-	groupID, err := parseUintParam(c.Param("id"))
+	group, err := s.loadGroupByPublicID(c)
 	if err != nil {
-		return s.renderError(c, &core.FailError{StatusCode: 400, Message: "invalid group id"})
-	}
-	var group database.Group
-	if err := s.db.WithContext(c.Request().Context()).First(&group, groupID).Error; err != nil {
 		return s.renderError(c, err)
 	}
-	result, err := s.service.GetAnnotations(c.Request().Context(), group.RepositoryOwner, group.RepositoryName, "group", 0, &groupID)
+	result, err := s.service.GetAnnotations(c.Request().Context(), group.RepositoryOwner, group.RepositoryName, "group", 0, &group.ID)
 	if err != nil {
 		return s.renderError(c, err)
 	}
@@ -441,4 +380,12 @@ func decodeJSONBody(c echo.Context, target any) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) loadGroupByPublicID(c echo.Context) (database.Group, error) {
+	var group database.Group
+	err := s.db.WithContext(c.Request().Context()).
+		Where("public_id = ?", strings.TrimSpace(c.Param("id"))).
+		First(&group).Error
+	return group, err
 }

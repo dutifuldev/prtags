@@ -190,6 +190,9 @@ func newServeCommand() *cobra.Command {
 			if err := database.RunMigrations(db); err != nil {
 				return err
 			}
+			if err := database.EnsureGroupPublicIDs(context.Background(), db); err != nil {
+				return err
+			}
 
 			checker := permissions.Checker(permissions.AllowAllChecker{})
 			if !cfg.AllowUnauthWrites {
@@ -232,6 +235,9 @@ func newWorkerCommand() *cobra.Command {
 				return err
 			}
 			if err := database.RunMigrations(db); err != nil {
+				return err
+			}
+			if err := database.EnsureGroupPublicIDs(context.Background(), db); err != nil {
 				return err
 			}
 			indexer := core.NewIndexer(db, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
@@ -541,30 +547,7 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 		},
 	}
 
-	link := &cobra.Command{
-		Use:  "link <from-group-id> <to-group-id> <relationship>",
-		Args: cobra.ExactArgs(3),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			toID, err := strconv.ParseUint(args[1], 10, 64)
-			if err != nil {
-				return err
-			}
-			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/links", map[string]any{
-				"to_group_id":       uint(toID),
-				"relationship_type": args[2],
-			})
-		},
-	}
-
-	unlink := &cobra.Command{
-		Use:  "unlink <group-id> <link-id>",
-		Args: cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return doPrintJSON(context.Background(), *serverURL, "DELETE", "/v1/groups/"+args[0]+"/links/"+args[1], nil)
-		},
-	}
-
-	groups.AddCommand(create, list, get, update, addPR, addIssue, link, unlink)
+	groups.AddCommand(create, list, get, update, addPR, addIssue)
 	return groups
 }
 

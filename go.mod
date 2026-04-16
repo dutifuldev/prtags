@@ -3,6 +3,7 @@ module github.com/dutifuldev/prtags
 go 1.25.0
 
 require (
+	github.com/dustinkirkland/golang-petname v0.0.0-20260215035315-f0c533e9ce9b
 	github.com/google/go-github/v74 v74.0.0
 	github.com/labstack/echo/v4 v4.15.1
 	github.com/pgvector/pgvector-go v0.3.0

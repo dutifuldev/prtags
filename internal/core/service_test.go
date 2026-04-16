@@ -179,7 +179,6 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
 		&database.TargetProjection{},
 		&database.Group{},
 		&database.GroupMember{},
-		&database.GroupLink{},
 		&database.FieldDefinition{},
 		&database.FieldValue{},
 		&database.Event{},

@@ -81,7 +81,7 @@ Suggested columns:
 
 `kind` keeps the semantics clear. A `pull_request` group should only contain PRs. An `issue` group should only contain issues. A `mixed` group can be introduced later if needed without redesigning the whole model.
 
-The public group identity should not be the bare numeric database ID. Groups should have a separate public ID that follows the rules in [PUBLIC_IDS.md](./PUBLIC_IDS.md).
+The public group identity should not be the bare numeric database ID. Groups should have a separate public ID that follows the rules in [PUBLIC_IDS.md](./PUBLIC_IDS.md). At the storage layer that field can be named `public_id`, but the API and CLI should expose it as the group's `id`.
 
 ### `group_members`
 

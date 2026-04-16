@@ -14,6 +14,7 @@ import (
 	"github.com/dutifuldev/prtags/internal/database"
 	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/permissions"
+	"github.com/dutifuldev/prtags/internal/publicid"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 )
@@ -91,7 +92,7 @@ type AnnotationSetResult struct {
 type TargetFilterResult struct {
 	TargetType   string                     `json:"target_type"`
 	ObjectNumber int                        `json:"object_number,omitempty"`
-	GroupID      uint                       `json:"group_id,omitempty"`
+	ID           string                     `json:"id,omitempty"`
 	TargetKey    string                     `json:"target_key"`
 	Projection   *database.TargetProjection `json:"projection,omitempty"`
 	Annotations  map[string]any             `json:"annotations"`
@@ -576,47 +577,58 @@ func (s *Service) CreateGroup(ctx context.Context, actor permissions.Actor, owne
 		RowVersion:         1,
 	}
 
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&group).Error; err != nil {
-			return err
+	for attempts := 0; attempts < 20; attempts++ {
+		group.PublicID, err = publicid.NewGroupID()
+		if err != nil {
+			return database.Group{}, err
 		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   repository.GitHubRepositoryID,
-			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.ID),
-			EventType:      "group.created",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"group_id": group.ID,
-				"title":    group.Title,
-				"kind":     group.Kind,
-			},
-		}); err != nil {
-			return err
+
+		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(&group).Error; err != nil {
+				return err
+			}
+			if err := s.appendEventTx(tx, eventInput{
+				RepositoryID:   repository.GitHubRepositoryID,
+				AggregateType:  "group",
+				AggregateKey:   groupTargetKey(group.PublicID),
+				EventType:      "group.created",
+				Actor:          actor,
+				IdempotencyKey: idempotencyKey,
+				Payload: map[string]any{
+					"group_id":        group.ID,
+					"group_public_id": group.PublicID,
+					"title":           group.Title,
+					"kind":            group.Kind,
+				},
+			}); err != nil {
+				return err
+			}
+			return s.enqueueRebuildsTx(tx, repository, targetRef{
+				RepositoryID: repository.GitHubRepositoryID,
+				Owner:        repository.Owner,
+				Name:         repository.Name,
+				TargetType:   "group",
+				TargetKey:    groupTargetKey(group.PublicID),
+				GroupID:      &group.ID,
+			}, time.Now().UTC())
+		})
+		if err == nil {
+			return group, nil
 		}
-		return s.enqueueRebuildsTx(tx, repository, targetRef{
-			RepositoryID: repository.GitHubRepositoryID,
-			Owner:        repository.Owner,
-			Name:         repository.Name,
-			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.ID),
-			GroupID:      &group.ID,
-		}, time.Now().UTC())
-	})
-	if err != nil {
-		return database.Group{}, translateDBError(err)
+		if !isGroupPublicIDConflict(err) {
+			return database.Group{}, translateDBError(err)
+		}
 	}
-	return group, nil
+	return database.Group{}, &FailError{StatusCode: 409, Message: "could not allocate group id"}
 }
 
-func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, groupID uint, input GroupPatchInput, idempotencyKey string) (database.Group, error) {
+func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, groupPublicID string, input GroupPatchInput, idempotencyKey string) (database.Group, error) {
 	if err := validateGroupPatchInput(input); err != nil {
 		return database.Group{}, err
 	}
 
-	var group database.Group
-	if err := s.db.WithContext(ctx).First(&group, groupID).Error; err != nil {
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
 		return database.Group{}, translateDBError(err)
 	}
 	repository := database.RepositoryProjection{
@@ -654,7 +666,7 @@ func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, grou
 		updates["status"] = value
 	}
 
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		query := tx.Model(&database.Group{}).Where("id = ?", group.ID)
 		if input.ExpectedRowVersion != nil {
 			query = query.Where("row_version = ?", *input.ExpectedRowVersion)
@@ -672,14 +684,15 @@ func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, grou
 		if err := s.appendEventTx(tx, eventInput{
 			RepositoryID:   group.GitHubRepositoryID,
 			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.ID),
+			AggregateKey:   groupTargetKey(group.PublicID),
 			EventType:      "group.updated",
 			Actor:          actor,
 			IdempotencyKey: idempotencyKey,
 			Payload: map[string]any{
-				"group_id": group.ID,
-				"title":    group.Title,
-				"status":   group.Status,
+				"group_id":        group.ID,
+				"group_public_id": group.PublicID,
+				"title":           group.Title,
+				"status":          group.Status,
 			},
 		}); err != nil {
 			return err
@@ -689,7 +702,7 @@ func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, grou
 			Owner:        group.RepositoryOwner,
 			Name:         group.RepositoryName,
 			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.ID),
+			TargetKey:    groupTargetKey(group.PublicID),
 			GroupID:      &group.ID,
 		}, time.Now().UTC())
 	})
@@ -712,29 +725,24 @@ func (s *Service) ListGroups(ctx context.Context, owner, repo string) ([]databas
 	return groups, err
 }
 
-func (s *Service) GetGroup(ctx context.Context, groupID uint) (database.Group, []database.GroupMember, []database.GroupLink, map[string]any, error) {
-	var group database.Group
-	if err := s.db.WithContext(ctx).First(&group, groupID).Error; err != nil {
-		return database.Group{}, nil, nil, nil, translateDBError(err)
+func (s *Service) GetGroup(ctx context.Context, groupPublicID string) (database.Group, []database.GroupMember, map[string]any, error) {
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
+		return database.Group{}, nil, nil, translateDBError(err)
 	}
 
 	var members []database.GroupMember
-	if err := s.db.WithContext(ctx).Where("group_id = ?", groupID).Order("id ASC").Find(&members).Error; err != nil {
-		return database.Group{}, nil, nil, nil, err
+	if err := s.db.WithContext(ctx).Where("group_id = ?", group.ID).Order("id ASC").Find(&members).Error; err != nil {
+		return database.Group{}, nil, nil, err
 	}
 
-	var links []database.GroupLink
-	if err := s.db.WithContext(ctx).Where("from_group_id = ?", groupID).Order("id ASC").Find(&links).Error; err != nil {
-		return database.Group{}, nil, nil, nil, err
-	}
-
-	annotations, err := s.getAnnotationsForTarget(ctx, "group", group.GitHubRepositoryID, 0, &groupID)
-	return group, members, links, annotations, err
+	annotations, err := s.getAnnotationsForTarget(ctx, "group", group.GitHubRepositoryID, 0, &group.ID)
+	return group, members, annotations, err
 }
 
-func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, groupID uint, objectType string, objectNumber int, idempotencyKey string) (database.GroupMember, error) {
-	var group database.Group
-	if err := s.db.WithContext(ctx).First(&group, groupID).Error; err != nil {
+func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, groupPublicID string, objectType string, objectNumber int, idempotencyKey string) (database.GroupMember, error) {
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
 		return database.GroupMember{}, translateDBError(err)
 	}
 	repository := database.RepositoryProjection{
@@ -770,14 +778,15 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 		if err := s.appendEventTx(tx, eventInput{
 			RepositoryID:   group.GitHubRepositoryID,
 			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.ID),
+			AggregateKey:   groupTargetKey(group.PublicID),
 			EventType:      "group.member_added",
 			Actor:          actor,
 			IdempotencyKey: idempotencyKey,
 			Payload: map[string]any{
-				"group_id":      group.ID,
-				"object_type":   objectType,
-				"object_number": objectNumber,
+				"group_id":        group.ID,
+				"group_public_id": group.PublicID,
+				"object_type":     objectType,
+				"object_number":   objectNumber,
 			},
 			Refs: []eventRefInput{{Role: "member", Type: objectType, Key: member.TargetKey}},
 		}); err != nil {
@@ -788,7 +797,7 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 			Owner:        group.RepositoryOwner,
 			Name:         group.RepositoryName,
 			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.ID),
+			TargetKey:    groupTargetKey(group.PublicID),
 			GroupID:      &group.ID,
 		}, time.Now().UTC()); err != nil {
 			return err
@@ -806,9 +815,9 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 	return member, translateDBError(err)
 }
 
-func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor, groupID, memberID uint, idempotencyKey string) error {
-	var group database.Group
-	if err := s.db.WithContext(ctx).First(&group, groupID).Error; err != nil {
+func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor, groupPublicID string, memberID uint, idempotencyKey string) error {
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
 		return translateDBError(err)
 	}
 	repository := database.RepositoryProjection{
@@ -821,7 +830,7 @@ func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor
 	}
 
 	var member database.GroupMember
-	if err := s.db.WithContext(ctx).Where("group_id = ? AND id = ?", groupID, memberID).First(&member).Error; err != nil {
+	if err := s.db.WithContext(ctx).Where("group_id = ? AND id = ?", group.ID, memberID).First(&member).Error; err != nil {
 		return translateDBError(err)
 	}
 
@@ -832,13 +841,14 @@ func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor
 		if err := s.appendEventTx(tx, eventInput{
 			RepositoryID:   group.GitHubRepositoryID,
 			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.ID),
+			AggregateKey:   groupTargetKey(group.PublicID),
 			EventType:      "group.member_removed",
 			Actor:          actor,
 			IdempotencyKey: idempotencyKey,
 			Payload: map[string]any{
-				"group_id":  group.ID,
-				"member_id": memberID,
+				"group_id":        group.ID,
+				"group_public_id": group.PublicID,
+				"member_id":       memberID,
 			},
 			Refs: []eventRefInput{{Role: "member", Type: member.ObjectType, Key: member.TargetKey}},
 		}); err != nil {
@@ -849,118 +859,7 @@ func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor
 			Owner:        group.RepositoryOwner,
 			Name:         group.RepositoryName,
 			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.ID),
-			GroupID:      &group.ID,
-		}, time.Now().UTC())
-	})
-}
-
-func (s *Service) LinkGroups(ctx context.Context, actor permissions.Actor, fromGroupID, toGroupID uint, relationshipType, idempotencyKey string) (database.GroupLink, error) {
-	var fromGroup database.Group
-	if err := s.db.WithContext(ctx).First(&fromGroup, fromGroupID).Error; err != nil {
-		return database.GroupLink{}, translateDBError(err)
-	}
-	var toGroup database.Group
-	if err := s.db.WithContext(ctx).First(&toGroup, toGroupID).Error; err != nil {
-		return database.GroupLink{}, translateDBError(err)
-	}
-	if fromGroup.GitHubRepositoryID != toGroup.GitHubRepositoryID {
-		return database.GroupLink{}, &FailError{StatusCode: 400, Message: "groups must belong to the same repository"}
-	}
-
-	repository := database.RepositoryProjection{
-		GitHubRepositoryID: fromGroup.GitHubRepositoryID,
-		Owner:              fromGroup.RepositoryOwner,
-		Name:               fromGroup.RepositoryName,
-	}
-	if err := s.requireWrite(ctx, actor, repository); err != nil {
-		return database.GroupLink{}, err
-	}
-
-	link := database.GroupLink{
-		FromGroupID:      fromGroup.ID,
-		ToGroupID:        toGroup.ID,
-		RelationshipType: strings.TrimSpace(relationshipType),
-		CreatedBy:        actor.ID,
-		CreatedAt:        time.Now().UTC(),
-	}
-
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&link).Error; err != nil {
-			return err
-		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   fromGroup.GitHubRepositoryID,
-			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(fromGroup.ID),
-			EventType:      "group.link_created",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"from_group_id": fromGroup.ID,
-				"to_group_id":   toGroup.ID,
-				"relationship":  link.RelationshipType,
-			},
-			Refs: []eventRefInput{{Role: "to_group", Type: "group", Key: groupTargetKey(toGroup.ID)}},
-		}); err != nil {
-			return err
-		}
-		return s.enqueueRebuildsTx(tx, repository, targetRef{
-			RepositoryID: fromGroup.GitHubRepositoryID,
-			Owner:        fromGroup.RepositoryOwner,
-			Name:         fromGroup.RepositoryName,
-			TargetType:   "group",
-			TargetKey:    groupTargetKey(fromGroup.ID),
-			GroupID:      &fromGroup.ID,
-		}, time.Now().UTC())
-	})
-	return link, translateDBError(err)
-}
-
-func (s *Service) DeleteGroupLink(ctx context.Context, actor permissions.Actor, groupID, linkID uint, idempotencyKey string) error {
-	var group database.Group
-	if err := s.db.WithContext(ctx).First(&group, groupID).Error; err != nil {
-		return translateDBError(err)
-	}
-	repository := database.RepositoryProjection{
-		GitHubRepositoryID: group.GitHubRepositoryID,
-		Owner:              group.RepositoryOwner,
-		Name:               group.RepositoryName,
-	}
-	if err := s.requireWrite(ctx, actor, repository); err != nil {
-		return err
-	}
-
-	var link database.GroupLink
-	if err := s.db.WithContext(ctx).Where("id = ? AND from_group_id = ?", linkID, groupID).First(&link).Error; err != nil {
-		return translateDBError(err)
-	}
-
-	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if err := tx.Delete(&database.GroupLink{}, link.ID).Error; err != nil {
-			return err
-		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   group.GitHubRepositoryID,
-			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.ID),
-			EventType:      "group.link_removed",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"group_id": group.ID,
-				"link_id":  link.ID,
-			},
-			Refs: []eventRefInput{{Role: "to_group", Type: "group", Key: groupTargetKey(link.ToGroupID)}},
-		}); err != nil {
-			return err
-		}
-		return s.enqueueRebuildsTx(tx, repository, targetRef{
-			RepositoryID: group.GitHubRepositoryID,
-			Owner:        group.RepositoryOwner,
-			Name:         group.RepositoryName,
-			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.ID),
+			TargetKey:    groupTargetKey(group.PublicID),
 			GroupID:      &group.ID,
 		}, time.Now().UTC())
 	})
@@ -1200,11 +1099,18 @@ func (s *Service) FilterTargets(ctx context.Context, owner, repo, targetType, fi
 		results = append(results, TargetFilterResult{
 			TargetType:   value.TargetType,
 			ObjectNumber: intValueOrZero(value.ObjectNumber),
-			GroupID:      uintValueOrZero(value.GroupID),
+			ID:           "",
 			TargetKey:    value.TargetKey,
 			Projection:   projection,
 			Annotations:  annotations,
 		})
+		if value.TargetType == "group" && value.GroupID != nil {
+			group, err := s.lookupGroupByID(ctx, *value.GroupID)
+			if err != nil {
+				return nil, translateDBError(err)
+			}
+			results[len(results)-1].ID = group.PublicID
+		}
 	}
 	return results, nil
 }
@@ -1212,7 +1118,11 @@ func (s *Service) FilterTargets(ctx context.Context, owner, repo, targetType, fi
 func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string, repositoryID int64, objectNumber int, groupID *uint) (map[string]any, error) {
 	targetKey := objectTargetKey(repositoryID, targetType, objectNumber)
 	if targetType == "group" && groupID != nil {
-		targetKey = groupTargetKey(*groupID)
+		group, err := s.lookupGroupByID(ctx, *groupID)
+		if err != nil {
+			return nil, translateDBError(err)
+		}
+		targetKey = groupTargetKey(group.PublicID)
 	}
 
 	var values []database.FieldValue
@@ -1250,8 +1160,8 @@ func (s *Service) resolveTarget(ctx context.Context, repository database.Reposit
 		if groupID == nil || *groupID == 0 {
 			return targetRef{}, &FailError{StatusCode: 400, Message: "group_id is required"}
 		}
-		var group database.Group
-		if err := s.db.WithContext(ctx).First(&group, *groupID).Error; err != nil {
+		group, err := s.lookupGroupByID(ctx, *groupID)
+		if err != nil {
 			return targetRef{}, translateDBError(err)
 		}
 		return targetRef{
@@ -1259,7 +1169,7 @@ func (s *Service) resolveTarget(ctx context.Context, repository database.Reposit
 			Owner:        repository.Owner,
 			Name:         repository.Name,
 			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.ID),
+			TargetKey:    groupTargetKey(group.PublicID),
 			GroupID:      groupID,
 		}, nil
 	default:
@@ -1800,8 +1710,8 @@ func objectTargetKey(repositoryID int64, targetType string, objectNumber int) st
 	return fmt.Sprintf("repo:%d:%s:%d", repositoryID, targetType, objectNumber)
 }
 
-func groupTargetKey(groupID uint) string {
-	return fmt.Sprintf("group:%d", groupID)
+func groupTargetKey(groupPublicID string) string {
+	return "group:" + groupPublicID
 }
 
 func fieldAggregateKey(repositoryID int64, name, scope string) string {
@@ -1828,4 +1738,31 @@ func uintValueOrZero(value *uint) uint {
 		return 0
 	}
 	return *value
+}
+
+func (s *Service) lookupGroupByID(ctx context.Context, groupID uint) (database.Group, error) {
+	var group database.Group
+	err := s.db.WithContext(ctx).First(&group, groupID).Error
+	return group, err
+}
+
+func (s *Service) lookupGroupByPublicID(ctx context.Context, groupPublicID string) (database.Group, error) {
+	var group database.Group
+	err := s.db.WithContext(ctx).
+		Where("public_id = ?", strings.TrimSpace(groupPublicID)).
+		First(&group).Error
+	return group, err
+}
+
+func isGroupPublicIDConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "idx_groups_public_id") ||
+		strings.Contains(text, "groups.public_id") ||
+		strings.Contains(text, "duplicate key")
 }

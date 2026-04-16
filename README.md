@@ -90,14 +90,15 @@ Once fields exist, users can create groups, attach PRs or issues to them, and an
 From the CLI:
 
 ```bash
-prtags group create -R dutifuldev/ghreplica \
+GROUP_ID=$(prtags group create -R dutifuldev/ghreplica \
   --kind mixed \
   --title "Rename hardening work" \
-  --description "Repository rename safety and follow-up cleanup"
+  --description "Repository rename safety and follow-up cleanup" \
+  --server http://127.0.0.1:8081 | jq -r '.data.id')
 
-prtags group add-pr 1 23 --server http://127.0.0.1:8081
+prtags group add-pr "$GROUP_ID" 23 --server http://127.0.0.1:8081
 prtags annotation pr set -R dutifuldev/ghreplica 23 intent="harden rename handling" quality=high
-prtags annotation group set 1 summary="rename hardening, reused-name safety, and refresh cleanup"
+prtags annotation group set "$GROUP_ID" summary="rename hardening, reused-name safety, and refresh cleanup"
 ```
 
 From the API:
@@ -120,6 +121,8 @@ curl -fsS http://127.0.0.1:8081/v1/repos/dutifuldev/ghreplica/pulls/23/annotatio
     "intent": "harden rename handling",
     "quality": "high"
   }' | jq
+
+curl -fsS http://127.0.0.1:8081/v1/repos/dutifuldev/ghreplica/groups | jq '.data[0].id'
 ```
 
 The important distinction is that `PRtags` stores the curation data, while the underlying PR and issue content still comes from `ghreplica`.

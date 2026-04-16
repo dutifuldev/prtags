@@ -165,7 +165,7 @@ Important indexes:
 - `(github_repository_id, kind, status)`
 - `(github_repository_id, updated_at desc)`
 
-`public_id` should follow the group public-ID rules in [PUBLIC_IDS.md](./PUBLIC_IDS.md), not expose the bare numeric primary key.
+`public_id` should follow the group public-ID rules in [PUBLIC_IDS.md](./PUBLIC_IDS.md), not expose the bare numeric primary key. At the API and CLI layer, the externally exposed field should simply be `id`.
 
 ### `group_members`
 

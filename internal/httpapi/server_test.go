@@ -59,21 +59,11 @@ func TestAPIEndToEndFlow(t *testing.T) {
 		"title":       "Auth reliability",
 		"description": "Track auth retry fixes",
 	}, http.StatusCreated)
-	groupID := uint(extractPathNumber(t, groupRaw, "data.id"))
-	secondGroupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
-		"kind":        "pull_request",
-		"title":       "ACP stability",
-		"description": "Track ACP stability follow-ups",
-	}, http.StatusCreated)
-	secondGroupID := uint(extractPathNumber(t, secondGroupRaw, "data.id"))
+	groupID := extractPathString(t, groupRaw, "data.id")
 
-	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%d/members", groupID), map[string]any{
+	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%s/members", groupID), map[string]any{
 		"object_type":   "pull_request",
 		"object_number": 22,
-	}, http.StatusCreated)
-	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%d/links", groupID), map[string]any{
-		"to_group_id":       secondGroupID,
-		"relationship_type": "related",
 	}, http.StatusCreated)
 
 	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/pulls/22/annotations", map[string]any{
@@ -81,7 +71,7 @@ func TestAPIEndToEndFlow(t *testing.T) {
 		"quality": "high",
 	}, http.StatusOK)
 
-	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%d/annotations", groupID), map[string]any{
+	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%s/annotations", groupID), map[string]any{
 		"theme": "auth retry reliability",
 	}, http.StatusOK)
 
@@ -97,9 +87,9 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	filtered := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/targets?target_type=pull_request&field=quality&value=high", nil, http.StatusOK)
 	require.Contains(t, filtered, `"target_type":"pull_request"`)
 
-	group := postJSON(t, server.Echo(), http.MethodGet, fmt.Sprintf("/v1/groups/%d", groupID), nil, http.StatusOK)
-	require.Contains(t, group, `"relationship_type":"related"`)
+	group := postJSON(t, server.Echo(), http.MethodGet, fmt.Sprintf("/v1/groups/%s", groupID), nil, http.StatusOK)
 	require.Contains(t, group, `"Auth reliability"`)
+	require.Contains(t, group, fmt.Sprintf(`"id":"%s"`, groupID))
 
 	var events int64
 	require.NoError(t, db.WithContext(ctx).Model(&database.Event{}).Count(&events).Error)
@@ -160,19 +150,7 @@ func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 		"title":       "Auth reliability",
 		"description": "Track auth retry fixes",
 	}, http.StatusCreated)
-	groupID := uint(extractPathNumber(t, groupRaw, "data.id"))
-	secondGroupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
-		"kind":        "pull_request",
-		"title":       "Auth follow-up",
-		"description": "Track auth follow-ups",
-	}, http.StatusCreated)
-	secondGroupID := uint(extractPathNumber(t, secondGroupRaw, "data.id"))
-
-	linkRaw := postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%d/links", groupID), map[string]any{
-		"to_group_id":       secondGroupID,
-		"relationship_type": "related",
-	}, http.StatusCreated)
-	linkID := uint(extractPathNumber(t, linkRaw, "data.id"))
+	groupID := extractPathString(t, groupRaw, "data.id")
 
 	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/pulls/22/annotations", map[string]any{
 		"intent": "Retry flaky auth ACP turns more safely",
@@ -194,22 +172,17 @@ func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 	}, http.StatusConflict)
 	require.Contains(t, conflict, `"row version conflict"`)
 
-	postJSON(t, server.Echo(), http.MethodPatch, fmt.Sprintf("/v1/groups/%d", groupID), map[string]any{
+	postJSON(t, server.Echo(), http.MethodPatch, fmt.Sprintf("/v1/groups/%s", groupID), map[string]any{
 		"title":                "Auth reliability updates",
 		"status":               "in_progress",
 		"expected_row_version": 1,
 	}, http.StatusOK)
 
 	var group database.Group
-	require.NoError(t, db.WithContext(ctx).First(&group, groupID).Error)
+	require.NoError(t, db.WithContext(ctx).Where("public_id = ?", groupID).First(&group).Error)
 	require.Equal(t, "Auth reliability updates", group.Title)
 	require.Equal(t, "in_progress", group.Status)
 	require.Equal(t, 2, group.RowVersion)
-
-	postJSON(t, server.Echo(), http.MethodDelete, fmt.Sprintf("/v1/groups/%d/links/%d", groupID, linkID), nil, http.StatusOK)
-	var links int64
-	require.NoError(t, db.WithContext(ctx).Model(&database.GroupLink{}).Where("id = ?", linkID).Count(&links).Error)
-	require.Equal(t, int64(0), links)
 
 	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/repos/acme/widgets/fields/%d/archive", intentID), map[string]any{
 		"expected_row_version": 2,
@@ -237,7 +210,6 @@ func openTestDB(t *testing.T) *gorm.DB {
 		&database.TargetProjection{},
 		&database.Group{},
 		&database.GroupMember{},
-		&database.GroupLink{},
 		&database.FieldDefinition{},
 		&database.FieldValue{},
 		&database.Event{},
@@ -329,6 +301,27 @@ func extractPathNumber(t *testing.T, raw, path string) int64 {
 		current = next
 	}
 	return int64(current.(float64))
+}
+
+func extractPathString(t *testing.T, raw, path string) string {
+	t.Helper()
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal([]byte(raw), &payload))
+	current := any(payload)
+	for _, part := range strings.Split(path, ".") {
+		object := current.(map[string]any)
+		next := object[part]
+		if next == nil {
+			for key, value := range object {
+				if strings.EqualFold(key, part) {
+					next = value
+					break
+				}
+			}
+		}
+		current = next
+	}
+	return current.(string)
 }
 
 func drainIndexJobs(t *testing.T, ctx context.Context, db *gorm.DB, indexer *core.Indexer) {

@@ -23,6 +23,7 @@ type Indexer struct {
 
 type TextSearchResult struct {
 	TargetType  string                     `json:"target_type"`
+	ID          string                     `json:"id,omitempty"`
 	TargetKey   string                     `json:"target_key"`
 	Score       float64                    `json:"score"`
 	Projection  *database.TargetProjection `json:"projection,omitempty"`
@@ -161,12 +162,17 @@ func (s *Service) buildSearchResult(ctx context.Context, repositoryID int64, tar
 			}
 		}
 	} else {
-		groupID, ok := groupIDFromTargetKey(targetKey)
+		groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
 		if ok {
-			annotations, err := s.getAnnotationsForTarget(ctx, "group", repositoryID, 0, &groupID)
+			group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+			if err != nil {
+				return TextSearchResult{}, translateDBError(err)
+			}
+			annotations, err := s.getAnnotationsForTarget(ctx, "group", repositoryID, 0, &group.ID)
 			if err != nil {
 				return TextSearchResult{}, err
 			}
+			result.ID = group.PublicID
 			result.Annotations = annotations
 		}
 	}
@@ -345,10 +351,10 @@ func (i *Indexer) buildSearchText(ctx context.Context, repositoryID int64, targe
 			}
 		}
 	} else {
-		groupID, ok := groupIDFromTargetKey(targetKey)
+		groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
 		if ok {
 			var group database.Group
-			err := i.db.WithContext(ctx).First(&group, groupID).Error
+			err := i.db.WithContext(ctx).Where("public_id = ?", groupPublicID).First(&group).Error
 			if err == nil {
 				if strings.TrimSpace(group.Title) != "" {
 					parts = append(parts, group.Title)
@@ -478,10 +484,12 @@ func objectNumberFromTargetKey(targetKey string) (int, bool) {
 	return value, true
 }
 
-func groupIDFromTargetKey(targetKey string) (uint, bool) {
-	var id uint
-	_, err := fmt.Sscanf(targetKey, "group:%d", &id)
-	return id, err == nil
+func groupPublicIDFromTargetKey(targetKey string) (string, bool) {
+	if !strings.HasPrefix(targetKey, "group:") {
+		return "", false
+	}
+	value := strings.TrimSpace(strings.TrimPrefix(targetKey, "group:"))
+	return value, value != ""
 }
 
 func timePtr(value time.Time) *time.Time {

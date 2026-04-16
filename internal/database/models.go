@@ -41,7 +41,8 @@ type TargetProjection struct {
 }
 
 type Group struct {
-	ID                 uint       `gorm:"primaryKey" json:"id"`
+	ID                 uint       `gorm:"primaryKey" json:"-"`
+	PublicID           string     `gorm:"column:public_id;uniqueIndex" json:"id"`
 	GitHubRepositoryID int64      `gorm:"column:github_repository_id;index:idx_groups_repo_kind_status,priority:1;index:idx_groups_repo_updated,priority:1" json:"github_repository_id"`
 	RepositoryOwner    string     `json:"repository_owner"`
 	RepositoryName     string     `json:"repository_name"`
@@ -59,22 +60,13 @@ type Group struct {
 
 type GroupMember struct {
 	ID                 uint      `gorm:"primaryKey" json:"id"`
-	GroupID            uint      `gorm:"uniqueIndex:idx_group_members_unique,priority:1;index" json:"group_id"`
+	GroupID            uint      `gorm:"uniqueIndex:idx_group_members_unique,priority:1;index" json:"-"`
 	GitHubRepositoryID int64     `gorm:"column:github_repository_id;index:idx_group_members_target,priority:1" json:"github_repository_id"`
 	ObjectType         string    `gorm:"uniqueIndex:idx_group_members_unique,priority:2;index:idx_group_members_target,priority:2" json:"object_type"`
 	ObjectNumber       int       `gorm:"uniqueIndex:idx_group_members_unique,priority:3;index:idx_group_members_target,priority:3" json:"object_number"`
 	TargetKey          string    `gorm:"index" json:"target_key"`
 	AddedBy            string    `json:"added_by"`
 	AddedAt            time.Time `json:"added_at"`
-}
-
-type GroupLink struct {
-	ID               uint      `gorm:"primaryKey" json:"id"`
-	FromGroupID      uint      `gorm:"uniqueIndex:idx_group_links_unique,priority:1;index" json:"from_group_id"`
-	ToGroupID        uint      `gorm:"uniqueIndex:idx_group_links_unique,priority:2;index" json:"to_group_id"`
-	RelationshipType string    `gorm:"uniqueIndex:idx_group_links_unique,priority:3" json:"relationship_type"`
-	CreatedBy        string    `json:"created_by"`
-	CreatedAt        time.Time `json:"created_at"`
 }
 
 type FieldDefinition struct {
