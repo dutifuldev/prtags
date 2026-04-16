@@ -43,6 +43,28 @@ The implementation should follow these rules:
 4. Exact filters, full-text search, and vector search each get their own optimized storage path.
 5. `ghreplica` remains the source of truth for mirrored GitHub content.
 
+## Implementation Stack
+
+The implementation stack should be pinned down now.
+
+The default backend stack for `PRtags` should be:
+
+- Echo for HTTP routing, middleware, and request handling
+- GORM for the main persistence layer and transactional writes
+- PostgreSQL as the primary database
+- SQL migrations in-repo as the schema source of truth
+
+This does not mean every query should be forced through high-level ORM abstractions. The production rule should be:
+
+- use GORM for the core CRUD model and normal transactional writes
+- use explicit SQL, GORM raw queries, or database-specific migration steps for PostgreSQL-native features such as:
+  - full-text search indexes
+  - vector indexes
+  - partial indexes
+  - hybrid ranking queries
+
+That keeps the main service code ergonomic while still leaving room for the parts of the system that need direct control over SQL and index behavior.
+
 ## Storage Layers
 
 The production shape should have three storage layers.
