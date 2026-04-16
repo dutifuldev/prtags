@@ -452,6 +452,16 @@ That should be implemented as a composed query path, not by collapsing everythin
 
 The production API should be split cleanly.
 
+All `PRtags` JSON API responses should use JSend as the response envelope format. The reference for that contract should live in [JSEND.md](JSEND.md).
+
+The practical rule should be:
+
+- `success` for successful reads and writes, with the result under `data`
+- `fail` for validation errors, bad input, or unmet preconditions
+- `error` for server-side failures
+
+`PRtags` should still use normal HTTP status codes alongside JSend bodies. JSend is the body contract, not a replacement for HTTP semantics.
+
 ### Schema Management
 
 - create field definitions
