@@ -98,6 +98,25 @@ type TargetFilterResult struct {
 	Annotations  map[string]any             `json:"annotations"`
 }
 
+type GroupMemberObjectSummary struct {
+	Title       string    `json:"title"`
+	State       string    `json:"state"`
+	HTMLURL     string    `json:"html_url"`
+	AuthorLogin string    `json:"author_login"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type GroupMemberView struct {
+	ID                 uint                      `json:"id"`
+	GitHubRepositoryID int64                     `json:"github_repository_id"`
+	ObjectType         string                    `json:"object_type"`
+	ObjectNumber       int                       `json:"object_number"`
+	TargetKey          string                    `json:"target_key"`
+	AddedBy            string                    `json:"added_by"`
+	AddedAt            time.Time                 `json:"added_at"`
+	ObjectSummary      *GroupMemberObjectSummary `json:"object_summary,omitempty"`
+}
+
 func NewService(db *gorm.DB, gh *ghreplica.Client, checker permissions.Checker, indexer *Indexer) *Service {
 	return &Service{
 		db:         db,
@@ -725,7 +744,7 @@ func (s *Service) ListGroups(ctx context.Context, owner, repo string) ([]databas
 	return groups, err
 }
 
-func (s *Service) GetGroup(ctx context.Context, groupPublicID string) (database.Group, []database.GroupMember, map[string]any, error) {
+func (s *Service) GetGroup(ctx context.Context, groupPublicID string) (database.Group, []GroupMemberView, map[string]any, error) {
 	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
 	if err != nil {
 		return database.Group{}, nil, nil, translateDBError(err)
@@ -736,8 +755,13 @@ func (s *Service) GetGroup(ctx context.Context, groupPublicID string) (database.
 		return database.Group{}, nil, nil, err
 	}
 
+	memberViews, err := s.enrichGroupMembers(ctx, group, members)
+	if err != nil {
+		return database.Group{}, nil, nil, err
+	}
+
 	annotations, err := s.getAnnotationsForTarget(ctx, "group", group.GitHubRepositoryID, 0, &group.ID)
-	return group, members, annotations, err
+	return group, memberViews, annotations, err
 }
 
 func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, groupPublicID string, objectType string, objectNumber int, idempotencyKey string) (database.GroupMember, error) {
@@ -1227,6 +1251,165 @@ func (s *Service) ensureTargetProjection(ctx context.Context, owner, repo string
 		return database.TargetProjection{}, err
 	}
 	return model, nil
+}
+
+func (s *Service) enrichGroupMembers(ctx context.Context, group database.Group, members []database.GroupMember) ([]GroupMemberView, error) {
+	cachedSummaries, err := s.loadCachedGroupMemberSummaries(ctx, group.GitHubRepositoryID, members)
+	if err != nil {
+		return nil, err
+	}
+
+	liveSummaries, liveOK := s.fetchLiveGroupMemberSummaries(ctx, group, members)
+
+	views := make([]GroupMemberView, 0, len(members))
+	for _, member := range members {
+		var summary *GroupMemberObjectSummary
+		if liveOK {
+			summary = liveSummaries[member.TargetKey]
+		} else {
+			summary = cachedSummaries[member.TargetKey]
+		}
+		views = append(views, groupMemberViewFromModel(member, summary))
+	}
+	return views, nil
+}
+
+func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repositoryID int64, members []database.GroupMember) (map[string]*GroupMemberObjectSummary, error) {
+	if len(members) == 0 {
+		return map[string]*GroupMemberObjectSummary{}, nil
+	}
+
+	targetTypes := make([]string, 0, len(members))
+	objectNumbers := make([]int, 0, len(members))
+	seenTypes := map[string]struct{}{}
+	seenNumbers := map[int]struct{}{}
+	for _, member := range members {
+		if member.ObjectType != "pull_request" && member.ObjectType != "issue" {
+			continue
+		}
+		if _, ok := seenTypes[member.ObjectType]; !ok {
+			seenTypes[member.ObjectType] = struct{}{}
+			targetTypes = append(targetTypes, member.ObjectType)
+		}
+		if _, ok := seenNumbers[member.ObjectNumber]; !ok {
+			seenNumbers[member.ObjectNumber] = struct{}{}
+			objectNumbers = append(objectNumbers, member.ObjectNumber)
+		}
+	}
+	if len(targetTypes) == 0 || len(objectNumbers) == 0 {
+		return map[string]*GroupMemberObjectSummary{}, nil
+	}
+
+	var projections []database.TargetProjection
+	if err := s.db.WithContext(ctx).
+		Where("github_repository_id = ? AND target_type IN ? AND object_number IN ?", repositoryID, targetTypes, objectNumbers).
+		Find(&projections).Error; err != nil {
+		return nil, err
+	}
+
+	summaries := make(map[string]*GroupMemberObjectSummary, len(projections))
+	for _, projection := range projections {
+		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projectionToGroupMemberSummary(projection)
+	}
+	return summaries, nil
+}
+
+func (s *Service) fetchLiveGroupMemberSummaries(ctx context.Context, group database.Group, members []database.GroupMember) (map[string]*GroupMemberObjectSummary, bool) {
+	refs := make([]ghreplica.BatchObjectRef, 0, len(members))
+	seen := map[string]struct{}{}
+	for _, member := range members {
+		if member.ObjectType != "pull_request" && member.ObjectType != "issue" {
+			continue
+		}
+		if _, ok := seen[member.TargetKey]; ok {
+			continue
+		}
+		seen[member.TargetKey] = struct{}{}
+		refs = append(refs, ghreplica.BatchObjectRef{
+			Type:   member.ObjectType,
+			Number: member.ObjectNumber,
+		})
+	}
+	if len(refs) == 0 {
+		return map[string]*GroupMemberObjectSummary{}, true
+	}
+
+	results, err := s.ghreplica.BatchGetObjects(ctx, group.RepositoryOwner, group.RepositoryName, refs)
+	if err != nil {
+		return nil, false
+	}
+
+	now := time.Now().UTC()
+	summaries := make(map[string]*GroupMemberObjectSummary, len(results))
+	projections := make([]database.TargetProjection, 0, len(results))
+	for _, result := range results {
+		if !result.Found || result.Summary == nil {
+			continue
+		}
+		key := objectTargetKey(group.GitHubRepositoryID, result.Type, result.Number)
+		summaries[key] = &GroupMemberObjectSummary{
+			Title:       result.Summary.Title,
+			State:       result.Summary.State,
+			HTMLURL:     result.Summary.HTMLURL,
+			AuthorLogin: result.Summary.AuthorLogin,
+			UpdatedAt:   result.Summary.UpdatedAt.UTC(),
+		}
+		projections = append(projections, database.TargetProjection{
+			GitHubRepositoryID: group.GitHubRepositoryID,
+			RepositoryOwner:    group.RepositoryOwner,
+			RepositoryName:     group.RepositoryName,
+			TargetType:         result.Type,
+			ObjectNumber:       result.Number,
+			Title:              result.Summary.Title,
+			State:              result.Summary.State,
+			AuthorLogin:        result.Summary.AuthorLogin,
+			HTMLURL:            result.Summary.HTMLURL,
+			SourceUpdatedAt:    result.Summary.UpdatedAt.UTC(),
+			FetchedAt:          now,
+		})
+	}
+
+	if len(projections) > 0 {
+		_ = s.upsertTargetProjections(ctx, projections)
+	}
+
+	return summaries, true
+}
+
+func (s *Service) upsertTargetProjections(ctx context.Context, projections []database.TargetProjection) error {
+	for _, projection := range projections {
+		model := projection
+		if err := s.db.WithContext(ctx).
+			Where("github_repository_id = ? AND target_type = ? AND object_number = ?", projection.GitHubRepositoryID, projection.TargetType, projection.ObjectNumber).
+			Assign(model).
+			FirstOrCreate(&model).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func groupMemberViewFromModel(member database.GroupMember, summary *GroupMemberObjectSummary) GroupMemberView {
+	return GroupMemberView{
+		ID:                 member.ID,
+		GitHubRepositoryID: member.GitHubRepositoryID,
+		ObjectType:         member.ObjectType,
+		ObjectNumber:       member.ObjectNumber,
+		TargetKey:          member.TargetKey,
+		AddedBy:            member.AddedBy,
+		AddedAt:            member.AddedAt,
+		ObjectSummary:      summary,
+	}
+}
+
+func projectionToGroupMemberSummary(projection database.TargetProjection) *GroupMemberObjectSummary {
+	return &GroupMemberObjectSummary{
+		Title:       projection.Title,
+		State:       projection.State,
+		HTMLURL:     projection.HTMLURL,
+		AuthorLogin: projection.AuthorLogin,
+		UpdatedAt:   projection.SourceUpdatedAt,
+	}
 }
 
 func (s *Service) loadFieldDefinitionsTx(tx *gorm.DB, repositoryID int64, scope string) ([]database.FieldDefinition, error) {

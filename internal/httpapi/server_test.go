@@ -90,6 +90,9 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	group := postJSON(t, server.Echo(), http.MethodGet, fmt.Sprintf("/v1/groups/%s", groupID), nil, http.StatusOK)
 	require.Contains(t, group, `"Auth reliability"`)
 	require.Contains(t, group, fmt.Sprintf(`"id":"%s"`, groupID))
+	require.Contains(t, group, `"object_summary"`)
+	require.Contains(t, group, `"Retry ACP turns safely (batched)"`)
+	require.Contains(t, group, `"https://github.com/acme/widgets/pull/22"`)
 
 	var events int64
 	require.NoError(t, db.WithContext(ctx).Model(&database.Event{}).Count(&events).Error)
@@ -256,6 +259,54 @@ func newStubGHReplica(t *testing.T) *httptest.Server {
 				"updated_at": "2026-04-16T12:00:00Z",
 				"user": {"login": "alice"}
 			}`))
+		case "/v1/github-ext/repos/acme/widgets/objects/batch":
+			var input struct {
+				Objects []ghreplica.BatchObjectRef `json:"objects"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+
+			results := make([]map[string]any, 0, len(input.Objects))
+			for _, object := range input.Objects {
+				switch {
+				case object.Type == "pull_request" && object.Number == 22:
+					results = append(results, map[string]any{
+						"type":   object.Type,
+						"number": object.Number,
+						"found":  true,
+						"object": map[string]any{
+							"id":         2022,
+							"number":     22,
+							"title":      "Retry ACP turns safely (batched)",
+							"state":      "open",
+							"html_url":   "https://github.com/acme/widgets/pull/22",
+							"updated_at": "2026-04-16T13:00:00Z",
+							"user":       map[string]any{"login": "bob"},
+						},
+					})
+				case object.Type == "issue" && object.Number == 11:
+					results = append(results, map[string]any{
+						"type":   object.Type,
+						"number": object.Number,
+						"found":  true,
+						"object": map[string]any{
+							"id":         1111,
+							"number":     11,
+							"title":      "Auth retries are flaky (batched)",
+							"state":      "open",
+							"html_url":   "https://github.com/acme/widgets/issues/11",
+							"updated_at": "2026-04-16T13:00:00Z",
+							"user":       map[string]any{"login": "alice"},
+						},
+					})
+				default:
+					results = append(results, map[string]any{
+						"type":   object.Type,
+						"number": object.Number,
+						"found":  false,
+					})
+				}
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
 		default:
 			http.NotFound(w, r)
 		}

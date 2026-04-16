@@ -167,7 +167,65 @@ func TestAnnotationSetResultJSONUsesSnakeCase(t *testing.T) {
 	require.NotContains(t, string(raw), `"Annotations"`)
 }
 
+func TestGetGroupEnrichesMembersWithBatchSummaries(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:        "mixed",
+		Title:       "Auth work",
+		Description: "Track auth fixes",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "issue", 11, "")
+	require.NoError(t, err)
+
+	_, members, _, err := service.GetGroup(ctx, group.PublicID)
+	require.NoError(t, err)
+	require.Len(t, members, 2)
+	require.Equal(t, "Retry ACP turns safely (batched)", members[0].ObjectSummary.Title)
+	require.Equal(t, "bob", members[0].ObjectSummary.AuthorLogin)
+	require.Equal(t, "Auth retries are flaky (batched)", members[1].ObjectSummary.Title)
+	require.Equal(t, "alice", members[1].ObjectSummary.AuthorLogin)
+}
+
+func TestGetGroupFallsBackToCachedProjectionWhenBatchReadFails(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestServiceWithBatchFailure(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Auth work",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+
+	_, members, _, err := service.GetGroup(ctx, group.PublicID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.NotNil(t, members[0].ObjectSummary)
+	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
+	require.Equal(t, "https://github.com/acme/widgets/pull/22", members[0].ObjectSummary.HTMLURL)
+}
+
 func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
+	return newTestServiceWithBatchBehavior(t, false)
+}
+
+func newTestServiceWithBatchFailure(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
+	return newTestServiceWithBatchBehavior(t, true)
+}
+
+func newTestServiceWithBatchBehavior(t *testing.T, failBatch bool) (*Service, *gorm.DB, *httptest.Server) {
 	t.Helper()
 
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{
@@ -188,7 +246,17 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
 		&database.IndexJob{},
 	))
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newTestGHReplicaServer(t, failBatch)
+
+	indexer := NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := NewService(db, ghreplica.NewClient(server.URL), permissions.AllowAllChecker{}, indexer)
+	return service, db, server
+}
+
+func newTestGHReplicaServer(t *testing.T, failBatch bool) *httptest.Server {
+	t.Helper()
+
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/github/repos/acme/widgets":
@@ -221,12 +289,60 @@ func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
 				"updated_at": "2026-04-16T12:00:00Z",
 				"user": {"login": "alice"}
 			}`))
+		case "/v1/github-ext/repos/acme/widgets/objects/batch":
+			if failBatch {
+				http.Error(w, `{"error":"batch unavailable"}`, http.StatusBadGateway)
+				return
+			}
+			var input struct {
+				Objects []ghreplica.BatchObjectRef `json:"objects"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+
+			results := make([]map[string]any, 0, len(input.Objects))
+			for _, object := range input.Objects {
+				switch {
+				case object.Type == "pull_request" && object.Number == 22:
+					results = append(results, map[string]any{
+						"type":   object.Type,
+						"number": object.Number,
+						"found":  true,
+						"object": map[string]any{
+							"id":         2022,
+							"number":     22,
+							"title":      "Retry ACP turns safely (batched)",
+							"state":      "open",
+							"html_url":   "https://github.com/acme/widgets/pull/22",
+							"updated_at": "2026-04-16T13:00:00Z",
+							"user":       map[string]any{"login": "bob"},
+						},
+					})
+				case object.Type == "issue" && object.Number == 11:
+					results = append(results, map[string]any{
+						"type":   object.Type,
+						"number": object.Number,
+						"found":  true,
+						"object": map[string]any{
+							"id":         1111,
+							"number":     11,
+							"title":      "Auth retries are flaky (batched)",
+							"state":      "open",
+							"html_url":   "https://github.com/acme/widgets/issues/11",
+							"updated_at": "2026-04-16T13:00:00Z",
+							"user":       map[string]any{"login": "alice"},
+						},
+					})
+				default:
+					results = append(results, map[string]any{
+						"type":   object.Type,
+						"number": object.Number,
+						"found":  false,
+					})
+				}
+			}
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
 		default:
 			http.NotFound(w, r)
 		}
 	}))
-
-	indexer := NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
-	service := NewService(db, ghreplica.NewClient(server.URL), permissions.AllowAllChecker{}, indexer)
-	return service, db, server
 }

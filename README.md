@@ -17,7 +17,7 @@ On top of that core curation model, `PRtags` already adds a few practical capabi
 
 Current public instance:
 
-- none yet
+- `https://prtags.dutiful.dev`
 
 ## Why
 
@@ -145,7 +145,7 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 This split is important operationally too. `PRtags` owns its own database, jobs, search documents, and embeddings. It should not share a database with `ghreplica`, and it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
 
-For group reads, the clean production behavior is that `PRtags` enriches member references on the server side. `PRtags` should call `ghreplica`'s batch object-read extension internally, resolve the referenced PRs and issues in one request, and return a small `object_summary` for each member rather than making the CLI orchestrate multiple services. The CLI should keep calling only `PRtags`.
+For group reads, `PRtags` enriches member references on the server side. It calls `ghreplica`'s batch object-read extension internally, resolves the referenced PRs and issues in one request, and returns a small `object_summary` for each member rather than making the CLI orchestrate multiple services. The CLI keeps calling only `PRtags`.
 
 ## Authentication
 
