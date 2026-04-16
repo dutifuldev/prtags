@@ -84,7 +84,7 @@ The clean operator flow is:
 
 1. define fields through the `ghanno` API or CLI
 2. store those definitions in `field_definitions`
-3. let users write values against PRs, issues, or clusters
+3. let users write values against PRs, issues, or groups
 4. build derived text indexes and embeddings only for fields that were marked as searchable or vectorized
 
 If manifest support is added, it should just be another way to feed step 1.
@@ -128,7 +128,7 @@ fields:
     is_vectorized: false
 
   - name: theme
-    object_scope: cluster
+    object_scope: group
     field_type: text
     is_required: false
     is_filterable: false

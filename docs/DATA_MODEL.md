@@ -4,9 +4,9 @@
 
 The core idea is to support:
 
-- clusters of pull requests
-- clusters of issues
-- links between clusters
+- groups of pull requests
+- groups of issues
+- links between groups
 - annotations on individual pull requests and issues
 
 ## Design Rules
@@ -15,9 +15,9 @@ The model should follow a few simple rules.
 
 First, `ghanno` should not duplicate full PR or issue content. It should store references to mirrored GitHub objects and keep only the metadata that belongs to the curation layer.
 
-Second, membership and relationship should be separate concepts. A cluster contains members. A cluster may also be related to another cluster. Those are not the same thing and should not be represented by the same table.
+Second, membership and relationship should be separate concepts. A group contains members. A group may also be related to another group. Those are not the same thing and should not be represented by the same table.
 
-Third, the model should allow stricter cluster kinds now without blocking more flexible mixed clusters later.
+Third, the model should allow stricter group kinds now without blocking more flexible mixed groups later.
 
 ## Referenced Objects
 
@@ -36,7 +36,7 @@ Optionally, `ghanno` can also cache a small local projection for display and sea
 
 ## Core Tables
 
-### `clusters`
+### `groups`
 
 This is the main container table.
 
@@ -57,16 +57,16 @@ Suggested columns:
 - `created_at`
 - `updated_at`
 
-`kind` keeps the semantics clear. A `pull_request` cluster should only contain PRs. An `issue` cluster should only contain issues. A `mixed` cluster can be introduced later if needed without redesigning the whole model.
+`kind` keeps the semantics clear. A `pull_request` group should only contain PRs. An `issue` group should only contain issues. A `mixed` group can be introduced later if needed without redesigning the whole model.
 
-### `cluster_members`
+### `group_members`
 
-This table represents cluster membership only.
+This table represents group membership only.
 
 Suggested columns:
 
 - `id`
-- `cluster_id`
+- `group_id`
 - `object_type`
 - `object_number`
 - `repository_owner`
@@ -74,17 +74,17 @@ Suggested columns:
 - `added_by`
 - `added_at`
 
-This table answers the question: “which mirrored GitHub objects are inside this cluster?”
+This table answers the question: “which mirrored GitHub objects are inside this group?”
 
-### `cluster_links`
+### `group_links`
 
-This table represents relationships between clusters.
+This table represents relationships between groups.
 
 Suggested columns:
 
 - `id`
-- `from_cluster_id`
-- `to_cluster_id`
+- `from_group_id`
+- `to_group_id`
 - `relationship_type`
   - `implements`
   - `tracks`
@@ -94,13 +94,13 @@ Suggested columns:
 - `created_by`
 - `created_at`
 
-This table answers the question: “how does one cluster relate to another cluster?”
+This table answers the question: “how does one group relate to another group?”
 
 That is the clean way to model:
 
-- a PR cluster connected to an issue cluster
-- one issue cluster duplicating another
-- two PR clusters solving related parts of the same problem
+- a PR group connected to an issue group
+- one issue group duplicating another
+- two PR groups solving related parts of the same problem
 
 ### `field_definitions`
 
@@ -117,7 +117,7 @@ Suggested columns:
 - `object_scope`
   - `pull_request`
   - `issue`
-  - `cluster`
+  - `group`
   - `all`
 - `field_type`
   - `string`
@@ -144,7 +144,7 @@ The important rule is:
 
 ### `field_values`
 
-This table stores actual metadata values for objects or clusters.
+This table stores actual metadata values for objects or groups.
 
 Suggested columns:
 
@@ -153,9 +153,9 @@ Suggested columns:
 - `target_type`
   - `pull_request`
   - `issue`
-  - `cluster`
+  - `group`
 - `target_id`
-  - cluster ID for local objects
+  - group ID for local objects
   - or a synthetic key for referenced PRs/issues
 - `string_value`
 - `text_value`
@@ -168,16 +168,16 @@ Suggested columns:
 
 The point is to store typed values, not arbitrary blobs, so filtering and indexing stay straightforward.
 
-## Why One Generic Cluster Model Is Better
+## Why One Generic Group Model Is Better
 
-The elegant part of this design is that there is only one cluster concept. `ghanno` does not need a separate PR-cluster subsystem and a separate issue-cluster subsystem. Instead, the same cluster model works for both, and `kind` keeps the rules understandable.
+The elegant part of this design is that there is only one group concept. `ghanno` does not need a separate PR-group subsystem and a separate issue-group subsystem. Instead, the same group model works for both, and `kind` keeps the rules understandable.
 
 That means:
 
-- PR clusters and issue clusters look structurally the same
+- PR groups and issue groups look structurally the same
 - membership stays simple
-- cluster-to-cluster links stay generic
-- future mixed clusters remain possible
+- group-to-group links stay generic
+- future mixed groups remain possible
 
 ## Query Model
 
@@ -185,11 +185,11 @@ The query model should stay simple at first.
 
 The important queries are:
 
-- list clusters for a repo
-- fetch one cluster with its members
-- list all clusters containing a given PR or issue
-- list links from one cluster to related clusters
-- filter PRs, issues, or clusters by custom metadata fields
+- list groups for a repo
+- fetch one group with its members
+- list all groups containing a given PR or issue
+- list links from one group to related groups
+- filter PRs, issues, or groups by custom metadata fields
 
 If vector search is added later, it should be a derived layer over selected annotation fields such as intent, notes, or summaries. That should be stored separately from the core curation model so the base CRUD layer remains simple and predictable.
 
@@ -205,17 +205,17 @@ That keeps the customizable layer flexible without making the data impossible to
 
 The thinnest useful version of `ghanno` should start with:
 
-- `clusters`
-- `cluster_members`
-- `cluster_links`
+- `groups`
+- `group_members`
+- `group_links`
 - `field_definitions`
 - `field_values`
 
 That is enough to support:
 
-- creating PR clusters
-- creating issue clusters
-- linking PR clusters to issue clusters
+- creating PR groups
+- creating issue groups
+- linking PR groups to issue groups
 - attaching repo-defined metadata like `intent` or `quality`
 
 That should be the foundation before adding embeddings, vector search, or richer projections.
