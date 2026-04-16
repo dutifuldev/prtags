@@ -1,12 +1,19 @@
 ---
 title: Production Implementation Plan
 date: 2026-04-16
-status: proposed
+status: mixed
 ---
 
 # Production Implementation Plan
 
 This document turns the current `prtags` design into a concrete implementation plan for a production-ready system.
+
+This document now mixes two things:
+
+- the parts of `PRtags` that have already shipped
+- the remaining production work that is still planned
+
+For the live system as it exists today, see [CURRENT_STATE.md](./CURRENT_STATE.md).
 
 The main goal is to build a customizable annotation layer on top of `ghreplica` without polluting the mirrored GitHub model. `prtags` should store only references to GitHub-native objects plus human-added structure such as groups, field definitions, field values, search documents, and embeddings.
 
@@ -751,9 +758,9 @@ The schema should carry `created_by` and `updated_by` fields consistently even b
 
 The authentication model should be pinned down separately from the write-permission model.
 
-`PRtags` is CLI-first, so the primary interactive login flow should be GitHub OAuth device flow rather than browser-first session login.
+`PRtags` is CLI-first, so the primary interactive login flow is GitHub OAuth device flow rather than browser-first session login.
 
-The production choice should be:
+The shipped production choice is:
 
 - a GitHub OAuth App for human login into `PRtags`
 - GitHub.com as the initial provider
@@ -783,13 +790,13 @@ This should be treated as the default production scope set. If a later deploymen
 
 ### CLI Auth Commands
 
-The CLI should grow a small explicit auth surface:
+The CLI now has a small explicit auth surface:
 
 - `prtags auth login`
 - `prtags auth status`
 - `prtags auth logout`
 
-`prtags auth login` should:
+`prtags auth login`:
 
 - request a device code from GitHub
 - show the verification URL and user code
@@ -799,19 +806,19 @@ The CLI should grow a small explicit auth surface:
 
 ### Token Storage
 
-The CLI should store the device-flow token locally rather than requiring users to keep exporting tokens manually.
+The CLI stores the device-flow token locally rather than requiring users to keep exporting tokens manually.
 
-The production shape should be:
+The current shape is:
 
 - local auth file under the user's config directory
 - file mode `0600`
 - enough metadata to show the logged-in GitHub user and the granted scopes
 
-The stored token should then be used automatically by the CLI when no explicit environment token is present.
+The stored token is then used automatically by the CLI when no explicit environment token is present.
 
 ### Auth Resolution Order
 
-The CLI should resolve GitHub auth in this order:
+The CLI resolves GitHub auth in this order:
 
 1. `PRTAGS_GITHUB_TOKEN`
 2. locally stored device-flow token
@@ -834,7 +841,7 @@ That future web flow should be additive. It should not replace device flow as th
 
 ### Initial Auth Validation Targets
 
-The first real auth validation should happen against `dutifuldev` repositories.
+The first real auth validation happened against `dutifuldev` repositories.
 
 The initial targets should be:
 
@@ -851,7 +858,7 @@ Only after the login flow and write-permission checks are stable there should `P
 
 ## Local Projection Policy
 
-Because `prtags` is a separate service, it may optionally keep a small projected cache of GitHub object fields for display and search convenience.
+Because `prtags` is a separate service, it keeps a small projected cache of GitHub object fields for display and search convenience.
 
 That projection should be:
 
@@ -868,16 +875,18 @@ Suggested projected fields:
 - updated_at
 - html_url
 
-For group reads, `PRtags` should enrich member references on the server side by calling `ghreplica`'s batch object-read extension. The CLI should keep talking only to `PRtags`; it should not be responsible for making separate `ghreplica` calls.
+For group reads, `PRtags` enriches member references on the server side by calling `ghreplica`'s batch object-read extension. The CLI keeps talking only to `PRtags`; it is not responsible for making separate `ghreplica` calls.
 
-The default read behavior should be:
+The current default read behavior is:
 
 - `group get`
-  - resolve members through one `ghreplica` batch request
-  - return member refs plus a small `object_summary`
+  - resolves members through one `ghreplica` batch request
+  - returns member refs plus a small `object_summary`
+  - includes `object_summary_freshness` metadata
 - `group list`
-  - return group metadata and member counts by default
-  - only expand member summaries when explicitly requested later
+  - returns group metadata and member counts by default
+  - includes `member_count` and `member_counts`
+  - does not expand member summaries by default
 
 The `object_summary` should stay intentionally small:
 
@@ -889,15 +898,15 @@ The `object_summary` should stay intentionally small:
 - `author_login`
 - `updated_at`
 
-This is useful for list views and result rendering, but it should remain optional and secondary.
+This is useful for list views and result rendering, but it remains intentionally small and secondary to the canonical GitHub-shaped data in `ghreplica`.
 
-The refresh model should be:
+The shipped refresh model is:
 
 - lazy refresh on reads when cached data is missing or obviously stale
 - background refresh during indexing and rebuild jobs
-- explicit freshness metadata on the cached projection
+- explicit freshness metadata on the returned summary
 
-If `ghreplica` is unavailable, `PRtags` should be allowed to serve cached projected data with an explicit freshness signal instead of failing hard for every read.
+If `ghreplica` is unavailable, `PRtags` can serve cached projected data with an explicit freshness signal instead of failing hard for every read.
 
 The projection should stay intentionally small:
 

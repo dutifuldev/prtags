@@ -1,0 +1,144 @@
+# Current State
+
+This document describes the current shipped state of `PRtags`.
+
+It is intentionally narrower than the production implementation plan. The goal here is to make it easy to see what already exists today without reading future-tense design material.
+
+## Live Service
+
+Current public instance:
+
+- `https://prtags.dutiful.dev`
+
+`PRtags` runs as a separate service next to `ghreplica` and uses its own Postgres database.
+
+## Core Product
+
+`PRtags` currently supports:
+
+- repo-defined typed metadata fields for pull requests, issues, and groups
+- group creation, update, and membership
+- annotations on pull requests, issues, and groups
+- exact filtering over typed field values
+- full-text search over searchable fields
+- similarity search over vectorized fields
+- background indexing for derived search data
+
+## Group Identity
+
+Groups use public string IDs in the API and CLI.
+
+The external group ID format is:
+
+- two-word petname
+- plus `4` lowercase base36 characters of entropy
+
+Example:
+
+- `coherent-skunk-mbll`
+
+The numeric database ID stays internal.
+
+## Group Reads
+
+`group get` enriches member references on the server side.
+
+The flow is:
+
+1. `PRtags` reads the group and its member refs from its own database.
+2. `PRtags` calls `ghreplica`'s batch object-read extension.
+3. `PRtags` returns the member refs plus a small `object_summary`.
+
+The enrichment path uses:
+
+- `POST /v1/github-ext/repos/{owner}/{repo}/objects/batch`
+
+on `ghreplica`.
+
+Returned member enrichment currently includes:
+
+- `title`
+- `state`
+- `html_url`
+- `author_login`
+- `updated_at`
+
+`group get` also returns:
+
+- `object_summary_freshness`
+
+That freshness metadata currently reports whether the member summary came from:
+
+- `ghreplica_batch`
+- cached projection data
+
+## Group List Shape
+
+`group list` keeps the lighter default shape.
+
+It currently returns:
+
+- group metadata
+- `member_count`
+- `member_counts`
+
+It does not expand member summaries by default.
+
+## Authentication
+
+`PRtags` is CLI-first.
+
+The current interactive login path is:
+
+- GitHub OAuth device flow
+
+The current CLI auth commands are:
+
+- `prtags auth login`
+- `prtags auth status`
+- `prtags auth logout`
+
+Current token resolution order:
+
+1. `PRTAGS_GITHUB_TOKEN`
+2. locally stored device-flow token
+3. `GITHUB_TOKEN`
+4. `GH_TOKEN`
+
+The local auth file stores:
+
+- the GitHub user
+- the granted scopes
+- the token
+
+with restrictive file permissions.
+
+## Dependency Boundary
+
+`ghreplica` remains the source of truth for mirrored GitHub content.
+
+`PRtags` owns:
+
+- groups
+- field definitions
+- field values
+- search documents
+- embeddings
+
+`PRtags` does not own:
+
+- PR titles and bodies
+- issue titles and bodies
+- reviews
+- comments
+- Git-backed change truth
+
+## Current Docs
+
+For the longer-term design and planned future work, use:
+
+- [Production Implementation Plan](./2026-04-16-production-implementation-plan.md)
+- [Data Model](./DATA_MODEL.md)
+- [Annotation Fields](./ANNOTATION_FIELDS.md)
+- [Public IDs](./PUBLIC_IDS.md)
+- [JSend](./JSEND.md)

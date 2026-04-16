@@ -38,6 +38,8 @@ This API is intentionally not GitHub-compatible. Unlike `ghreplica`, `PRtags` is
 
 In practice, the current product already covers a meaningful first slice: field-definition CRUD, manifest import and export, group CRUD, group membership, annotations on PRs, issues, and groups, exact filtering on typed annotation values, full-text search over searchable fields, and similarity search over vectorized fields.
 
+Groups use public string IDs in the API and CLI. Those IDs are human-readable two-word petnames plus a short entropy suffix, for example `coherent-skunk-mbll`, rather than bare numeric database IDs.
+
 ## Quick Examples
 
 The easiest way to understand the boundary is to separate repo configuration from day-to-day curation work.
@@ -127,6 +129,8 @@ curl -fsS http://127.0.0.1:8081/v1/repos/dutifuldev/ghreplica/groups | jq '.data
 
 The important distinction is that `PRtags` stores the curation data, while the underlying PR and issue content still comes from `ghreplica`.
 
+For example, `group get` returns member refs enriched with a small `object_summary`, and also reports `object_summary_freshness` so callers can tell whether the summary came from a live `ghreplica` batch read or cached projection data. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type.
+
 ## Search
 
 Search in `PRtags` is intentionally split into two different capabilities because they answer different questions.
@@ -147,6 +151,25 @@ This split is important operationally too. `PRtags` owns its own database, jobs,
 
 For group reads, `PRtags` enriches member references on the server side. It calls `ghreplica`'s batch object-read extension internally, resolves the referenced PRs and issues in one request, and returns a small `object_summary` for each member together with `object_summary_freshness` metadata. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
 
+A simplified `group get` member looks like:
+
+```json
+{
+  "type": "pull_request",
+  "number": 24,
+  "object_summary": {
+    "title": "Fix repository rename hardening name reuse regressions",
+    "state": "closed",
+    "html_url": "https://github.com/dutifuldev/ghreplica/pull/24",
+    "author_login": "dutifulbob"
+  },
+  "object_summary_freshness": {
+    "state": "current",
+    "source": "ghreplica_batch"
+  }
+}
+```
+
 ## Authentication
 
 `PRtags` is CLI-first, so the intended interactive login flow is GitHub OAuth device flow, not browser-first sessions.
@@ -159,6 +182,21 @@ The pinned direction is:
 - bearer-token auth kept as a fallback for scripts and automation
 
 That keeps the auth story clean. Human users can log in once through the CLI and let `PRtags` reuse the stored token, while scripts can continue sending an explicit `Authorization: Bearer ...` token. A browser callback route is still reserved for future web login at `https://prtags.dutiful.dev/auth/github/callback`, but that is not the main auth path for the initial product.
+
+The current CLI auth commands are:
+
+```bash
+prtags auth login
+prtags auth status
+prtags auth logout
+```
+
+The CLI resolves auth in this order:
+
+1. `PRTAGS_GITHUB_TOKEN`
+2. locally stored device-flow token
+3. `GITHUB_TOKEN`
+4. `GH_TOKEN`
 
 ## Local Development
 
@@ -211,6 +249,7 @@ You can then run commands like:
 ```bash
 /tmp/prtags field list -R dutifuldev/ghreplica
 /tmp/prtags group list -R dutifuldev/ghreplica
+/tmp/prtags group get coherent-skunk-mbll
 /tmp/prtags search text -R dutifuldev/ghreplica "rename hardening"
 ```
 
@@ -247,6 +286,7 @@ The clean deployment boundary is:
 
 The deeper design details live in the docs:
 
+- [Current State](docs/CURRENT_STATE.md)
 - [Data Model](docs/DATA_MODEL.md)
 - [Annotation Fields](docs/ANNOTATION_FIELDS.md)
 - [Production Implementation Plan](docs/2026-04-16-production-implementation-plan.md)
