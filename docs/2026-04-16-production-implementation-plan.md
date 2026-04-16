@@ -146,6 +146,7 @@ Like the FTS layer, this is derived data and should be rebuildable from the cano
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `kind`
@@ -161,8 +162,8 @@ Suggested columns:
 
 Important indexes:
 
-- `(repository_owner, repository_name, kind, status)`
-- `(repository_owner, repository_name, updated_at desc)`
+- `(github_repository_id, kind, status)`
+- `(github_repository_id, updated_at desc)`
 
 ### `group_members`
 
@@ -172,6 +173,7 @@ Suggested columns:
 
 - `id`
 - `group_id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `object_type`
@@ -184,7 +186,7 @@ Suggested columns:
 Important constraints and indexes:
 
 - unique `(group_id, object_type, object_number)`
-- index `(repository_owner, repository_name, object_type, object_number)`
+- index `(github_repository_id, object_type, object_number)`
 - foreign key from `group_id` to `groups(id)`
 
 ### `group_links`
@@ -213,6 +215,7 @@ Important constraints and indexes:
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `name`
@@ -240,8 +243,8 @@ Suggested columns:
 
 Important constraints and indexes:
 
-- unique `(repository_owner, repository_name, name, object_scope)`
-- index `(repository_owner, repository_name, object_scope)`
+- unique `(github_repository_id, name, object_scope)`
+- index `(github_repository_id, object_scope)`
 
 ### `field_values`
 
@@ -255,6 +258,7 @@ Suggested columns:
   - `pull_request`
   - `issue`
   - `group`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `target_key`
@@ -271,7 +275,7 @@ Suggested columns:
 Important constraints and indexes:
 
 - unique `(field_definition_id, target_type, target_key)`
-- index `(repository_owner, repository_name, target_type, target_key)`
+- index `(github_repository_id, target_type, target_key)`
 - partial indexes for filterable value columns where useful:
   - `(field_definition_id, enum_value)`
   - `(field_definition_id, bool_value)`
@@ -284,24 +288,26 @@ Because `prtags` is a separate service, it should use stable explicit target ide
 
 The canonical identity model should be structured columns:
 
-- `repository_owner`
-- `repository_name`
+- `github_repository_id`
 - `target_type`
 - `object_number` for mirrored GitHub objects
 - local `group_id` for local group objects
 
 For pull requests and issues, this means the source-of-truth identity is:
 
-- `repository_owner`
-- `repository_name`
+- `github_repository_id`
 - `target_type`
 - `object_number`
 
-That is better than one packed string because it is easier to validate, index, and query. A human-friendly key like:
+That is better than using `owner/name` as the canonical key because repository names can change on rename or transfer. `github_repository_id` stays stable.
+
+A human-friendly key like:
 
 - `openclaw/openclaw#59883`
 
 can still exist, but only as a derived display or cache key, not as the canonical identity.
+
+`repository_owner` and `repository_name` should still be stored where useful for display, API routing, and CLI output, but they should be treated as the current locator, not the source of truth.
 
 For `field_values`, `search_documents`, and `embeddings`, the implementation may still keep a derived `target_key` for convenience. If it does, that key should be generated from the canonical structured identity rather than replacing it.
 
@@ -319,6 +325,7 @@ The important implementation rule is that field definitions drive inclusion. The
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `target_type`
@@ -330,7 +337,7 @@ Suggested columns:
 
 Important indexes:
 
-- unique `(repository_owner, repository_name, target_type, target_key)`
+- unique `(github_repository_id, target_type, target_key)`
 - GIN on `search_vector`
 
 ### Embeddings
@@ -351,6 +358,7 @@ The code should not try to infer whether an embedding is current from the vector
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `target_type`
@@ -369,7 +377,7 @@ That gives the system a stable way to decide whether older rows are still curren
 
 Important indexes:
 
-- unique `(repository_owner, repository_name, target_type, target_key, embedding_model)`
+- unique `(github_repository_id, target_type, target_key, embedding_model)`
 - vector index appropriate to the chosen vector extension and distance metric
 
 ## Rebuild Model
@@ -663,6 +671,7 @@ The system should not start with highly specialized one-off event names unless t
 Suggested columns:
 
 - `id`
+- `github_repository_id`
 - `repository_owner`
 - `repository_name`
 - `aggregate_type`
@@ -861,6 +870,145 @@ Important logs:
 - rebuild job start and finish
 - rebuild failures
 - manifest import results
+
+## Testing Strategy
+
+The testing strategy should match the layered architecture.
+
+The main rule is:
+
+- test canonical state behavior directly
+- test API contracts at the HTTP layer
+- test database behavior against real PostgreSQL
+- test derived index pipelines separately from canonical writes
+
+### 1. Model And Service Tests
+
+These tests should target the core domain logic without going through the full HTTP stack.
+
+They should cover:
+
+- group creation and updates
+- member add and remove
+- link create and remove
+- field-definition creation, update, archive, and manifest import
+- field-value set and clear
+- event creation and per-aggregate sequencing
+- field-evolution rules
+  - additive enum changes
+  - required-field behavior
+  - archive behavior
+- permission decisions from cached and refreshed GitHub permission state
+
+The goal is to prove the main product rules without needing a full end-to-end environment for every case.
+
+### 2. API Contract Tests
+
+These tests should hit Echo handlers directly.
+
+They should verify:
+
+- JSend envelopes
+- HTTP status codes
+- validation failures
+- permission failures
+- idempotency behavior
+- optimistic-concurrency behavior
+- stable response shapes for group, field, annotation, and search endpoints
+
+Important cases:
+
+- successful `POST`, `PATCH`, and action calls return `success`
+- validation and precondition problems return `fail`
+- server-side failures return `error`
+
+### 3. PostgreSQL Integration Tests
+
+These tests should use a real PostgreSQL database.
+
+They should verify:
+
+- uniqueness and foreign-key constraints
+- `github_repository_id`-based identity behavior
+- rename-safe identity handling
+- partial indexes for filterable fields
+- full-text search indexes and queries
+- vector index behavior once embeddings are implemented
+- event ordering and uniqueness constraints
+- job leasing and heartbeat behavior
+
+This layer matters because many of the important production guarantees depend on real PostgreSQL semantics, not in-memory mocks.
+
+### 4. Derived Index Tests
+
+Derived index behavior should be tested separately from canonical CRUD.
+
+These tests should cover:
+
+- search-document rebuild after searchable-field changes
+- embedding rebuild after vectorized-field changes
+- stale versus current freshness transitions
+- model-version rebuild behavior
+- repo-level freshness reporting
+- retry and backoff behavior for failed rebuild jobs
+
+The important production rule is that canonical writes stay cheap while derived work happens asynchronously, so tests should prove that split explicitly.
+
+### 5. Dependency-Behavior Tests
+
+Because `PRtags` depends on `ghreplica`, GitHub auth, and an embedding provider, those integrations should be tested through stubs or fakes.
+
+These tests should cover:
+
+- projection refresh from `ghreplica`
+- stale projection fallback when `ghreplica` is unavailable
+- GitHub-derived permission checks
+- permission-cache expiry behavior
+- embedding-provider failure behavior
+- idempotent rebuild requeue behavior
+
+The goal is to prove that the service behaves predictably when dependencies are slow, stale, or failing.
+
+### 6. End-To-End Scenarios
+
+The system should also have a smaller number of realistic end-to-end tests.
+
+The first important scenarios are:
+
+- create fields, create a group, add PRs and issues, set annotations, and read them back
+- import a manifest, then annotate objects under that schema
+- change searchable or vectorized fields and observe derived-index rebuilds
+- rename a repo in `ghreplica` and verify `PRtags` still resolves the same stable targets
+- remove a user’s GitHub write permission and verify writes stop after permission-cache expiry
+
+These are the tests that prove the whole architecture holds together, not just the individual pieces.
+
+### 7. Rollout Validation
+
+Before calling the system production-ready, validation should include:
+
+- migration smoke tests
+- API smoke tests against a deployed environment
+- rebuild worker smoke tests
+- queue and lease recovery tests
+- permission-check smoke tests with real GitHub auth
+
+The rollout check should explicitly verify:
+
+- writes succeed for users with repo write access
+- writes fail for users without repo write access
+- canonical data remains consistent under retries
+- JSend responses match the documented contract
+- derived FTS and vector state can become current after writes
+
+The first rollout targets should be explicit:
+
+- start with `dutifuldev/ghreplica`
+- then expand to `openclaw/openclaw`
+
+`dutifuldev/ghreplica` is the right first validation target because it is small, controlled, and easy to inspect end to end while the system is still settling.
+
+`openclaw/openclaw` should be the next validation target because it provides the larger and noisier real-world data needed to test projection freshness, search quality, and operational behavior at higher scale.
 
 ## Vector Search Defaults
 
