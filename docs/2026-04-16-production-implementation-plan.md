@@ -775,6 +775,91 @@ If read restrictions become necessary later, they should follow the same GitHub-
 
 The schema should carry `created_by` and `updated_by` fields consistently even before full authorization exists.
 
+## Authentication
+
+The authentication model should be pinned down separately from the write-permission model.
+
+`PRtags` is CLI-first, so the primary interactive login flow should be GitHub OAuth device flow rather than browser-first session login.
+
+The production choice should be:
+
+- a GitHub OAuth App for human login into `PRtags`
+- GitHub.com as the initial provider
+- device flow as the primary interactive auth flow for the CLI
+- bearer-token auth kept as a scripting and automation fallback
+
+This should stay separate from `ghreplica`'s GitHub App. The GitHub App is for mirroring and repo automation. `PRtags` should use an OAuth App for user authentication.
+
+### Initial OAuth Configuration
+
+The initial pinned configuration should be:
+
+- provider: GitHub.com
+- auth mechanism: GitHub OAuth App
+- primary interactive flow: device flow
+- public callback URL reserved for future browser auth: `https://prtags.dutiful.dev/auth/github/callback`
+- requested scopes: `read:org repo`
+
+The reasoning for the initial scopes is:
+
+- `read:org`
+  - needed to inspect organization and team membership when that matters for access checks or product behavior
+- `repo`
+  - needed for private-repo support and for repository-owned resources such as pull requests and issues
+
+This should be treated as the default production scope set. If a later deployment is explicitly public-repo-only, the scope choice can be narrowed then, but the default long-term product stance should be `read:org repo`.
+
+### CLI Auth Commands
+
+The CLI should grow a small explicit auth surface:
+
+- `prtags auth login`
+- `prtags auth status`
+- `prtags auth logout`
+
+`prtags auth login` should:
+
+- request a device code from GitHub
+- show the verification URL and user code
+- poll until the user completes authorization
+- fetch the authenticated GitHub user
+- store the token locally with restrictive file permissions
+
+### Token Storage
+
+The CLI should store the device-flow token locally rather than requiring users to keep exporting tokens manually.
+
+The production shape should be:
+
+- local auth file under the user's config directory
+- file mode `0600`
+- enough metadata to show the logged-in GitHub user and the granted scopes
+
+The stored token should then be used automatically by the CLI when no explicit environment token is present.
+
+### Auth Resolution Order
+
+The CLI should resolve GitHub auth in this order:
+
+1. `PRTAGS_GITHUB_TOKEN`
+2. locally stored device-flow token
+3. `GITHUB_TOKEN`
+4. `GH_TOKEN`
+
+That keeps explicit overrides working while still making `prtags auth login` useful as the normal day-to-day path.
+
+### Web Login
+
+Browser-based login and session cookies may exist later, but they should not be the first-class auth path for the initial product.
+
+If web login is added later, it should use the same OAuth App and the reserved callback route:
+
+- `/auth/github/login`
+- `/auth/github/callback`
+- `/auth/logout`
+
+That future web flow should be additive. It should not replace device flow as the main interactive auth story for the CLI.
+
 ## Local Projection Policy
 
 Because `prtags` is a separate service, it may optionally keep a small projected cache of GitHub object fields for display and search convenience.

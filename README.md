@@ -142,6 +142,19 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 This split is important operationally too. `PRtags` owns its own database, jobs, search documents, and embeddings. It should not share a database with `ghreplica`, and it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
 
+## Authentication
+
+`PRtags` is CLI-first, so the intended interactive login flow is GitHub OAuth device flow, not browser-first sessions.
+
+The pinned direction is:
+
+- GitHub OAuth App for `PRtags` user login
+- GitHub.com as the provider
+- `read:org repo` as the default scope set
+- bearer-token auth kept as a fallback for scripts and automation
+
+That keeps the auth story clean. Human users can log in once through the CLI and let `PRtags` reuse the stored token, while scripts can continue sending an explicit `Authorization: Bearer ...` token. A browser callback route is still reserved for future web login at `https://prtags.dutiful.dev/auth/github/callback`, but that is not the main auth path for the initial product.
+
 ## Local Development
 
 The local development loop is straightforward. Start a Postgres instance, point `PRtags` at a running `ghreplica`, and run the API:
