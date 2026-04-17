@@ -49,6 +49,23 @@ prtags annotation pr get -R dutifuldev/ghreplica 25
 
 That returns the current annotations for the PR, including `intent` when present.
 
+## Clear A PR Annotation
+
+If an agent needs to remove a value entirely, use the explicit clear command:
+
+```bash
+prtags annotation pr clear -R dutifuldev/ghreplica 25 intent
+```
+
+That removes the field value from the PR. It does not write an empty string.
+
+The same pattern works for issues and groups:
+
+```bash
+prtags annotation issue clear -R dutifuldev/ghreplica 11 quality
+prtags annotation group clear coherent-skunk-mbll summary
+```
+
 ## Search By Intent
 
 If the field is searchable, agents can find PRs by intent wording:
@@ -87,6 +104,7 @@ For the common PR-intent workflow, the recommended sequence is:
 1. `prtags field ensure ...`
 2. `prtags annotation pr set ...`
 3. `prtags annotation pr get ...`
-4. optionally `prtags search text ...`
+4. if needed, `prtags annotation pr clear ...`
+5. optionally `prtags search text ...`
 
 That keeps agents from having to manually branch on whether the field already exists.

@@ -153,6 +153,16 @@ prtags search text -R dutifuldev/ghreplica "batch object read endpoint"
 
 `field ensure` is the idempotent setup path. It creates the field if it is missing and updates it if the live field definition has drifted from the requested shape.
 
+If an agent needs to remove an annotation entirely, use the explicit `clear` command rather than writing an empty string:
+
+```bash
+prtags annotation pr clear -R dutifuldev/ghreplica 25 intent
+prtags annotation issue clear -R dutifuldev/ghreplica 11 quality
+prtags annotation group clear coherent-skunk-mbll summary
+```
+
+That removes the field value from the target. It is not the same as setting the value to `""` or `"null"` as text.
+
 ## Search
 
 Search in `PRtags` is intentionally split into two different capabilities because they answer different questions.

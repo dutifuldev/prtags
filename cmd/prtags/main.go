@@ -643,6 +643,17 @@ func newAnnotationCommand(serverURL *string) *cobra.Command {
 		},
 	})
 	group.AddCommand(&cobra.Command{
+		Use:  "clear <group-id> <field> [field...]",
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			annotations, err := parseAnnotationKeys(args[1:])
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/annotations", annotations)
+		},
+	})
+	group.AddCommand(&cobra.Command{
 		Use:  "get <group-id>",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -674,6 +685,23 @@ func newObjectAnnotationCommand(serverURL *string, name, route string) *cobra.Co
 	}
 	set.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
 	_ = set.MarkFlagRequired("repo")
+	clear := &cobra.Command{
+		Use:  "clear <number> <field> [field...]",
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, repoName, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			annotations, err := parseAnnotationKeys(args[1:])
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/%s/%s/annotations", owner, repoName, route, args[0]), annotations)
+		},
+	}
+	clear.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = clear.MarkFlagRequired("repo")
 	get := &cobra.Command{
 		Use:  "get <number>",
 		Args: cobra.ExactArgs(1),
@@ -687,7 +715,7 @@ func newObjectAnnotationCommand(serverURL *string, name, route string) *cobra.Co
 	}
 	get.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
 	_ = get.MarkFlagRequired("repo")
-	cmd.AddCommand(set, get)
+	cmd.AddCommand(set, clear, get)
 	return cmd
 }
 
@@ -833,6 +861,21 @@ func parseAnnotationPairs(pairs []string) (map[string]any, error) {
 			continue
 		}
 		out[key] = value
+	}
+	return out, nil
+}
+
+func parseAnnotationKeys(keys []string) (map[string]any, error) {
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("at least one field is required")
+	}
+	out := map[string]any{}
+	for _, raw := range keys {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			return nil, fmt.Errorf("annotation key is required")
+		}
+		out[key] = nil
 	}
 	return out, nil
 }

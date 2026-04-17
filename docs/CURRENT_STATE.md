@@ -17,12 +17,32 @@ Current public instance:
 `PRtags` currently supports:
 
 - repo-defined typed metadata fields for pull requests, issues, and groups
+- idempotent field setup through `field ensure`
+- filtered field inspection through `field list`
 - group creation, update, and membership
 - annotations on pull requests, issues, and groups
+- explicit annotation clearing for pull requests, issues, and groups
 - exact filtering over typed field values
 - full-text search over searchable fields
 - similarity search over vectorized fields
 - background indexing for derived search data
+
+## CLI Annotation Workflow
+
+The current CLI supports explicit set, get, and clear flows for annotations.
+
+Examples:
+
+```bash
+prtags annotation pr set -R dutifuldev/ghreplica 25 \
+  intent="Add a mirror-backed batch object read endpoint for downstream tools"
+
+prtags annotation pr get -R dutifuldev/ghreplica 25
+
+prtags annotation pr clear -R dutifuldev/ghreplica 25 intent
+```
+
+The `clear` command removes the field value from the target. It does not write an empty string.
 
 ## Group Identity
 
