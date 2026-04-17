@@ -51,7 +51,7 @@ Before users can annotate anything, the repo defines which fields exist and what
 From the CLI:
 
 ```bash
-prtags field create -R dutifuldev/ghreplica \
+prtags field ensure -R dutifuldev/ghreplica \
   --name intent \
   --display-name "Intent" \
   --scope pull_request \
@@ -59,7 +59,7 @@ prtags field create -R dutifuldev/ghreplica \
   --searchable \
   --vectorized
 
-prtags field create -R dutifuldev/ghreplica \
+prtags field ensure -R dutifuldev/ghreplica \
   --name quality \
   --scope pull_request \
   --type enum \
@@ -130,6 +130,28 @@ curl -fsS http://127.0.0.1:8081/v1/repos/dutifuldev/ghreplica/groups | jq '.data
 The important distinction is that `PRtags` stores the curation data, while the underlying PR and issue content still comes from `ghreplica`.
 
 For example, `group get` returns member refs enriched with a small `object_summary`, and also reports `object_summary_freshness` so callers can tell whether the summary came from a live `ghreplica` batch read or cached projection data. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type.
+
+### Agent Intent Workflow
+
+For the common agent workflow of attaching intent to a PR, the practical flow is:
+
+```bash
+prtags field ensure -R dutifuldev/ghreplica \
+  --name intent \
+  --display-name "Intent" \
+  --scope pull_request \
+  --type text \
+  --searchable \
+  --vectorized
+
+prtags annotation pr set -R dutifuldev/ghreplica 25 \
+  intent="Add a mirror-backed batch object read endpoint for downstream tools"
+
+prtags annotation pr get -R dutifuldev/ghreplica 25
+prtags search text -R dutifuldev/ghreplica "batch object read endpoint"
+```
+
+`field ensure` is the idempotent setup path. It creates the field if it is missing and updates it if the live field definition has drifted from the requested shape.
 
 ## Search
 
@@ -286,6 +308,7 @@ The clean deployment boundary is:
 
 The deeper design details live in the docs:
 
+- [Agent Workflows](docs/AGENT_WORKFLOWS.md)
 - [Current State](docs/CURRENT_STATE.md)
 - [Data Model](docs/DATA_MODEL.md)
 - [Annotation Fields](docs/ANNOTATION_FIELDS.md)

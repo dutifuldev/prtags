@@ -258,18 +258,7 @@ func newFieldCommand(serverURL *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			payload := map[string]any{
-				"name":          mustFlag(cmd, "name"),
-				"display_name":  cmd.Flag("display-name").Value.String(),
-				"object_scope":  mustFlag(cmd, "scope"),
-				"field_type":    mustFlag(cmd, "type"),
-				"enum_values":   strings.Fields(strings.ReplaceAll(cmd.Flag("enum-values").Value.String(), ",", " ")),
-				"is_required":   mustBoolFlag(cmd, "required"),
-				"is_filterable": mustBoolFlag(cmd, "filterable"),
-				"is_searchable": mustBoolFlag(cmd, "searchable"),
-				"is_vectorized": mustBoolFlag(cmd, "vectorized"),
-				"sort_order":    mustIntFlag(cmd, "sort-order"),
-			}
+			payload := parseDesiredFieldDefinition(cobraFlagReader{cmd: cmd}).createPayload()
 			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/fields", owner, name), payload)
 		},
 	}
@@ -289,18 +278,102 @@ func newFieldCommand(serverURL *string) *cobra.Command {
 	_ = create.MarkFlagRequired("scope")
 	_ = create.MarkFlagRequired("type")
 
-	list := &cobra.Command{
-		Use: "list",
+	ensure := &cobra.Command{
+		Use:   "ensure",
+		Short: "Create a field if missing, or update it to the requested shape",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			owner, name, err := splitRepo(repo)
 			if err != nil {
 				return err
 			}
-			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/fields", owner, name), nil)
+			desired := parseDesiredFieldDefinition(cobraFlagReader{cmd: cmd})
+			fields, err := fetchFieldDefinitions(context.Background(), *serverURL, owner, name)
+			if err != nil {
+				return err
+			}
+
+			var existing *fieldDefinitionView
+			for i := range fields {
+				if fields[i].Name == desired.Name && fields[i].ObjectScope == desired.ObjectScope {
+					existing = &fields[i]
+					break
+				}
+			}
+
+			if existing == nil {
+				created, err := createFieldDefinition(context.Background(), *serverURL, owner, name, desired.createPayload())
+				if err != nil {
+					return err
+				}
+				return printJSendSuccess(cmd.OutOrStdout(), fieldEnsureView{fieldDefinitionView: created, Action: "created"})
+			}
+			if existing.ArchivedAt != nil {
+				return fmt.Errorf("field %q (%s) exists but is archived", existing.Name, existing.ObjectScope)
+			}
+			if existing.FieldType != desired.FieldType {
+				return fmt.Errorf("field %q (%s) already exists with type %q", existing.Name, existing.ObjectScope, existing.FieldType)
+			}
+
+			patch := diffFieldDefinition(*existing, desired)
+			if len(patch) == 0 {
+				return printJSendSuccess(cmd.OutOrStdout(), fieldEnsureView{fieldDefinitionView: *existing, Action: "noop"})
+			}
+
+			updated, err := updateFieldDefinition(context.Background(), *serverURL, owner, name, existing.ID, patch)
+			if err != nil {
+				return err
+			}
+			return printJSendSuccess(cmd.OutOrStdout(), fieldEnsureView{fieldDefinitionView: updated, Action: "updated"})
+		},
+	}
+	ensure.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = ensure.MarkFlagRequired("repo")
+	ensure.Flags().String("name", "", "field name")
+	ensure.Flags().String("display-name", "", "display name")
+	ensure.Flags().String("scope", "", "field scope")
+	ensure.Flags().String("type", "", "field type")
+	ensure.Flags().String("enum-values", "", "comma-separated enum values")
+	ensure.Flags().Bool("required", false, "field is required")
+	ensure.Flags().Bool("filterable", false, "field is filterable")
+	ensure.Flags().Bool("searchable", false, "field is searchable")
+	ensure.Flags().Bool("vectorized", false, "field is vectorized")
+	ensure.Flags().Int("sort-order", 0, "field sort order")
+	_ = ensure.MarkFlagRequired("name")
+	_ = ensure.MarkFlagRequired("scope")
+	_ = ensure.MarkFlagRequired("type")
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List repo field definitions with optional filtering",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			fields, err := fetchFieldDefinitions(context.Background(), *serverURL, owner, name)
+			if err != nil {
+				return err
+			}
+			filtered := filterFieldDefinitions(fields, fieldListFilters{
+				Name:        mustFlag(cmd, "name"),
+				ObjectScope: mustFlag(cmd, "scope"),
+				FieldType:   mustFlag(cmd, "type"),
+				ActiveOnly:  mustBoolFlag(cmd, "active-only"),
+			})
+			format := mustFlag(cmd, "format")
+			if format == "auto" {
+				format = defaultFieldListFormat(cmd.OutOrStdout())
+			}
+			return printFieldDefinitions(cmd.OutOrStdout(), filtered, format)
 		},
 	}
 	list.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
 	_ = list.MarkFlagRequired("repo")
+	list.Flags().String("scope", "", "only show fields for this scope")
+	list.Flags().String("type", "", "only show fields of this type")
+	list.Flags().String("name", "", "only show the field with this name")
+	list.Flags().Bool("active-only", false, "only show active fields")
+	list.Flags().String("format", "auto", "output format: auto, json, table")
 
 	update := &cobra.Command{
 		Use:  "update <field-id>",
@@ -435,7 +508,7 @@ func newFieldCommand(serverURL *string) *cobra.Command {
 	_ = exportCmd.MarkFlagRequired("repo")
 	exportCmd.Flags().Bool("yaml", false, "render YAML")
 
-	fields.AddCommand(create, list, update, archive, importCmd, exportCmd)
+	fields.AddCommand(create, ensure, list, update, archive, importCmd, exportCmd)
 	return fields
 }
 
