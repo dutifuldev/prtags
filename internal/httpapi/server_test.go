@@ -28,8 +28,9 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 	stub := newStubGHReplica(t)
-	indexer := core.NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
-	service := core.NewService(db, ghreplica.NewClient(stub.URL), permissions.AllowAllChecker{}, indexer)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
 
 	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{
@@ -97,8 +98,8 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	require.Contains(t, group, `"object_summary"`)
 	require.Contains(t, group, `"object_summary_freshness"`)
 	require.Contains(t, group, `"state":"current"`)
-	require.Contains(t, group, `"source":"ghreplica_batch"`)
-	require.Contains(t, group, `"Retry ACP turns safely (batched)"`)
+	require.Contains(t, group, `"source":"target_projection"`)
+	require.Contains(t, group, `"Retry ACP turns safely"`)
 	require.Contains(t, group, `"https://github.com/acme/widgets/pull/22"`)
 
 	var events int64
@@ -109,8 +110,9 @@ func TestAPIEndToEndFlow(t *testing.T) {
 func TestManifestImportExport(t *testing.T) {
 	db := openTestDB(t)
 	stub := newStubGHReplica(t)
-	indexer := core.NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
-	service := core.NewService(db, ghreplica.NewClient(stub.URL), permissions.AllowAllChecker{}, indexer)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
 
 	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields/import", map[string]any{
@@ -142,8 +144,9 @@ func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
 	stub := newStubGHReplica(t)
-	indexer := core.NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
-	service := core.NewService(db, ghreplica.NewClient(stub.URL), permissions.AllowAllChecker{}, indexer)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
 
 	intentRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{

@@ -66,14 +66,9 @@ The numeric database ID stays internal.
 The flow is:
 
 1. `PRtags` reads the group and its member refs from its own database.
-2. `PRtags` calls `ghreplica`'s batch object-read extension.
-3. `PRtags` returns the member refs plus a small `object_summary`.
-
-The enrichment path uses:
-
-- `POST /v1/github-ext/repos/{owner}/{repo}/objects/batch`
-
-on `ghreplica`.
+2. `PRtags` loads cached target projections for member PRs and issues.
+3. if any projection is missing or stale, `PRtags` queues a background refresh job.
+4. `PRtags` returns the member refs plus a small `object_summary`.
 
 Returned member enrichment currently includes:
 
@@ -89,8 +84,9 @@ Returned member enrichment currently includes:
 
 That freshness metadata currently reports whether the member summary came from:
 
-- `ghreplica_batch`
-- cached projection data
+- current cached projection data
+- stale cached projection data
+- no cached projection yet, with a background refresh queued
 
 ## Group List Shape
 
