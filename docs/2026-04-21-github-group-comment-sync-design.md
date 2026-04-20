@@ -56,27 +56,49 @@ The comment should be readable by humans and recognizable by the service.
 Recommended structure:
 
 1. Hidden machine marker in an HTML comment
-2. Normal Markdown body
-3. Separate sections for related pull requests and related issues
+2. Group-level metadata above the table
+3. One basic Markdown table for related targets
 
 Example shape:
 
 ```md
 <!-- prtags:group-comment v1 group_id=coherent-skunk-mbll target_type=pull_request target_number=24 -->
 
-Related work from PRtags group `coherent-skunk-mbll`:
+Related work from PRtags group `coherent-skunk-mbll`
 
-Related PRs:
-- #31 Fix rename follow-up cleanup
-- #35 Harden repository identity lookups
+Name: Repository Rename Follow-up
+Status: open
 
-Related Issues:
-- #12 Repository rename breaks cached lookups
+| Number | Title |
+| --- | --- |
+| [#12](https://github.com/example/repo/issues/12) | Repository rename breaks cached lookups |
+| [#31](https://github.com/example/repo/pull/31) | Fix rename follow-up cleanup |
+| [#35](https://github.com/example/repo/pull/35) | Harden repository identity lookups |
 ```
 
 The visible body should not be raw JSON.
 
 The machine marker is enough to identify the comment if local sync state is lost and a repair pass needs to search for it.
+
+The rule for what belongs in the table should be explicit:
+
+- fields that map to each related issue or pull request go in the table
+- group-level fields stay outside the table
+
+For v1, the table should only include:
+
+- `Number`
+- `Title`
+
+`Number` should be the GitHub link target.
+
+The group name and other shared metadata should appear above the table rather than repeating on every row.
+
+Row ordering should be stable.
+
+Recommended first rule:
+
+- sort by object number ascending
 
 ## Storage
 
