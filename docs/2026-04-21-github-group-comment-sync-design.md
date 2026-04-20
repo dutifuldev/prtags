@@ -36,10 +36,10 @@ GitHub comments should be treated as a derived outbound projection of local grou
 The clean model is:
 
 1. `prtags` stores groups and group membership as it does today.
-2. A background sync worker renders the expected GitHub comment body for each affected target.
-3. `prtags` compares that rendered body with the last synced body hash.
-4. If the body changed, `prtags` updates the existing managed comment or creates it if missing.
-5. If a target leaves the group, `prtags` deletes that target's managed comment for that group.
+2. Each write appends a durable local event in the same transaction as the group change.
+3. A River projector consumes those events in order and updates one desired sync row per `(group, target)`.
+4. A River reconcile worker reads the latest desired state for that row and creates, updates, or deletes the managed GitHub comment.
+5. A repair worker periodically rechecks failed, drifted, or missing comments and requeues reconciliation.
 
 This means a group with three members produces three managed comments:
 
@@ -84,7 +84,7 @@ The machine marker is enough to identify the comment if local sync state is lost
 
 Suggested table name:
 
-- `github_group_comments`
+- `group_comment_sync_targets`
 
 Suggested columns:
 
@@ -94,10 +94,14 @@ Suggested columns:
 - `object_type`
 - `object_number`
 - `target_key`
+- `desired_revision`
+- `applied_revision`
+- `desired_deleted`
 - `github_comment_id`
 - `comment_body_hash`
 - `last_synced_at`
 - `last_error`
+- `last_error_at`
 - `created_at`
 - `updated_at`
 
@@ -107,15 +111,27 @@ Uniqueness should be:
 
 This table is the main mapping between local group membership and the managed GitHub comment.
 
+It should represent desired outbound state, not just the last successful GitHub write.
+
+That means:
+
+- `desired_revision` is bumped whenever the expected comment state changes
+- `applied_revision` records the newest revision successfully applied to GitHub
+- `desired_deleted` marks that the managed comment should be removed from GitHub
+
+This is what makes retries, stale job skipping, and repair safe.
+
 ## Job Model
 
 `prtags` should migrate all background work to River in one go.
 
 Comment sync should run as a River job, and the existing background work should move to River at the same time.
 
-Suggested job kind:
+Suggested River jobs:
 
-- `github_group_comment_sync`
+- `group_comment_sync_project`
+- `group_comment_sync_reconcile`
+- `group_comment_sync_repair`
 
 Existing job kinds that should also move:
 
@@ -125,15 +141,14 @@ Existing job kinds that should also move:
 
 Suggested job args:
 
-- `github_repository_id`
-- `repository_owner`
-- `repository_name`
-- `group_id`
-- `group_public_id`
-- `target_type`
-- `target_key`
-- `object_number`
-- optional later: `desired_revision`
+- projector:
+  - `event_id`
+- reconcile:
+  - `sync_target_id`
+  - `desired_revision`
+- repair:
+  - optional `github_repository_id`
+  - optional `group_id`
 
 This is a better fit than extending the current custom `index_jobs` worker further.
 
@@ -150,6 +165,19 @@ The current worker is fine for local derived indexing, but GitHub comment sync i
 
 Using River for all background work avoids keeping one homegrown queue system and one real queue system side by side.
 
+The important job-behavior rule is coalescing.
+
+If one group changes many times quickly, `prtags` should not try to apply every intermediate GitHub write in order.
+
+Instead:
+
+- the projector updates the sync row to the newest `desired_revision`
+- reconcile jobs are keyed by `sync_target_id`
+- the reconcile worker always loads the latest row state before rendering
+- stale jobs whose `desired_revision` is older than the current row are skipped
+
+That gives one final GitHub write for the newest wanted state instead of a burst of obsolete writes.
+
 ## Retry And Failure Tracking
 
 Comment sync should be explicit about success and failure.
@@ -163,11 +191,26 @@ That allows:
 - visibility into whether GitHub is out of sync with local `prtags` state
 - one retry model for both indexing work and comment sync work
 
-The `github_group_comments` row should also keep the last known sync result for the target mapping itself.
+The `group_comment_sync_targets` row should also keep the last known sync result for the target mapping itself.
+
+Stale retries must never win.
+
+The reconcile worker should:
+
+1. load the sync target row
+2. skip the job if its `desired_revision` is older than the row's current `desired_revision`
+3. skip the job if its `desired_revision` is already less than or equal to `applied_revision`
+4. otherwise apply the newest desired state and advance `applied_revision`
 
 ## Trigger Rules
 
-These local changes should enqueue comment sync:
+The durable trigger should be the local `events` table.
+
+Group writes should save local state and append events in one transaction.
+
+The projector then derives desired GitHub comment state from those events.
+
+These local changes should result in comment sync:
 
 - `group.created`
   - only if the group already has members
@@ -177,12 +220,14 @@ These local changes should enqueue comment sync:
   - sync the new member target
   - sync all existing member targets in the same group
 - `group.member_removed`
-  - delete the removed target comment for that group
+  - mark the removed target comment as `desired_deleted`
   - sync the remaining member targets
 
 Group annotation changes should enqueue comment sync only if those annotations are intentionally included in the rendered comment body.
 
 The first version can skip group annotations entirely and only render membership-based related links.
+
+This event-driven path is better than enqueueing GitHub jobs directly from request handlers because it does not lose sync if a write succeeds and the process crashes before a GitHub job is queued.
 
 ## GitHub API Surface
 
@@ -197,6 +242,33 @@ So the River worker should use:
 - delete issue comment
 
 It does not need pull-request review comments.
+
+## Managed Comment Policy
+
+Managed comments should be owned by `prtags`.
+
+That means:
+
+- if a user manually edits a managed comment, the next successful sync overwrites it with the canonical rendered body
+- `prtags` should not try to preserve mixed human and machine edits inside the managed comment
+
+This is the cleanest long-term rule.
+
+Trying to preserve partial manual edits would make repair and reconciliation much less predictable.
+
+## Repair Policy
+
+Repair should be an explicit part of the design, not a best-effort afterthought.
+
+The repair worker should:
+
+- requeue failed sync rows
+- recreate missing managed comments
+- detect deleted comments and recreate them
+- detect duplicate managed comments by hidden marker
+- keep one canonical comment, update it, and delete the extras
+
+This gives `prtags` a clear path to recover after crashes, operator mistakes, or temporary GitHub API failures.
 
 ## Authentication Choice
 
@@ -244,6 +316,8 @@ The smallest shippable version should:
 - update on membership changes
 - delete on membership removal
 - track failures and retry
+- overwrite manual edits to managed comments
+- repair missing and duplicate managed comments
 
 It should not initially:
 
