@@ -109,11 +109,19 @@ This table is the main mapping between local group membership and the managed Gi
 
 ## Job Model
 
-Comment sync should run as a River job.
+`prtags` should migrate all background work to River in one go.
+
+Comment sync should run as a River job, and the existing background work should move to River at the same time.
 
 Suggested job kind:
 
 - `github_group_comment_sync`
+
+Existing job kinds that should also move:
+
+- `target_projection_refresh`
+- `search_document_rebuild`
+- `embedding_rebuild`
 
 Suggested job args:
 
@@ -129,14 +137,18 @@ Suggested job args:
 
 This is a better fit than extending the current custom `index_jobs` worker further.
 
-The existing worker is fine for local derived indexing, but GitHub comment sync is a different class of work:
+The important point is that `prtags` should not keep two queue systems.
+
+Running River for comment sync while keeping the current custom worker for indexing would work, but it would not be the cleanest production shape.
+
+The current worker is fine for local derived indexing, but GitHub comment sync is a different class of work:
 
 - it talks to an external API
 - it needs stronger retry behavior
 - it needs clearer failure tracking
 - it will likely need repair and replay later
 
-Using River avoids growing a second homegrown queue system inside `prtags`.
+Using River for all background work avoids keeping one homegrown queue system and one real queue system side by side.
 
 ## Retry And Failure Tracking
 
@@ -149,6 +161,7 @@ That allows:
 - automatic retries after GitHub API failures
 - safe worker recovery after crashes
 - visibility into whether GitHub is out of sync with local `prtags` state
+- one retry model for both indexing work and comment sync work
 
 The `github_group_comments` row should also keep the last known sync result for the target mapping itself.
 
@@ -215,10 +228,11 @@ The current code already has most of the right local building blocks:
 
 That means the clean implementation path is:
 
-1. add comment-sync job enqueueing near the existing group write paths
-2. add GitHub comment sync state storage
-3. add a River worker with a `github_group_comment_sync` handler
-4. render and reconcile one managed comment per `(group, target)`
+1. add River to `prtags`
+2. migrate existing background job work from the custom worker onto River
+3. add GitHub comment sync state storage
+4. add a River worker with a `github_group_comment_sync` handler
+5. render and reconcile one managed comment per `(group, target)`
 
 ## First Implementation Scope
 
@@ -245,6 +259,6 @@ Use one managed issue comment per group per target.
 
 Track the GitHub comment ID locally.
 
-Run sync in the background with retries.
+Run all background work through River, including existing indexing work and the new comment sync.
 
 Authenticate the worker with a separate GitHub App, while keeping the existing OAuth app for user login.
