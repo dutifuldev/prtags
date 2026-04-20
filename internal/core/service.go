@@ -862,6 +862,9 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&member).Error; err != nil {
+			if isGroupMemberConflict(err) {
+				return &FailError{StatusCode: 409, Message: "group member already exists"}
+			}
 			return err
 		}
 		if err := s.appendEventTx(tx, eventInput{
@@ -1597,6 +1600,9 @@ func (s *Service) collectTargetsForFieldTx(tx *gorm.DB, fieldDefinitionID uint, 
 func (s *Service) appendEventTx(tx *gorm.DB, input eventInput) error {
 	payloadJSON, _ := json.Marshal(input.Payload)
 	metadataJSON, _ := json.Marshal(input.Metadata)
+	if err := lockEventAggregateTx(tx, input.AggregateType, input.AggregateKey); err != nil {
+		return err
+	}
 	var event database.Event
 	for attempts := 0; attempts < 5; attempts++ {
 		var nextSequence int
@@ -2109,4 +2115,27 @@ func isGroupPublicIDConflict(err error) bool {
 	return strings.Contains(text, "idx_groups_public_id") ||
 		strings.Contains(text, "groups.public_id") ||
 		strings.Contains(text, "duplicate key")
+}
+
+func isGroupMemberConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, gorm.ErrDuplicatedKey) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "idx_group_members_unique") ||
+		strings.Contains(text, "group_members_group_id_object_type_object_number_key") ||
+		strings.Contains(text, "duplicate key")
+}
+
+func lockEventAggregateTx(tx *gorm.DB, aggregateType string, aggregateKey string) error {
+	if tx == nil || tx.Dialector == nil {
+		return nil
+	}
+	if tx.Dialector.Name() != "postgres" {
+		return nil
+	}
+	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))", aggregateType, aggregateKey).Error
 }
