@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
@@ -206,9 +208,13 @@ func TestListGroupsReturnsMemberCounts(t *testing.T) {
 	require.Equal(t, 1, groups[0].MemberCounts["issue"])
 }
 
-func TestGetGroupEnrichesMembersWithBatchSummaries(t *testing.T) {
+func TestGetGroupUsesCurrentCachedProjectionWithoutBatchFetch(t *testing.T) {
 	ctx := context.Background()
-	service, _, server := newTestService(t)
+	var batchCalls atomic.Int32
+	service, _, server := newTestServiceWithBatchOptions(t, batchBehavior{
+		delay: time.Second,
+		calls: &batchCalls,
+	})
 	defer server.Close()
 
 	actor := permissions.Actor{Type: "user", ID: "tester"}
@@ -227,21 +233,75 @@ func TestGetGroupEnrichesMembersWithBatchSummaries(t *testing.T) {
 	_, members, _, err := service.GetGroup(ctx, group.PublicID)
 	require.NoError(t, err)
 	require.Len(t, members, 2)
-	require.Equal(t, "Retry ACP turns safely (batched)", members[0].ObjectSummary.Title)
+	require.Zero(t, batchCalls.Load())
+	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
 	require.Equal(t, "bob", members[0].ObjectSummary.AuthorLogin)
 	require.NotNil(t, members[0].ObjectFreshness)
 	require.Equal(t, "current", members[0].ObjectFreshness.State)
-	require.Equal(t, "ghreplica_batch", members[0].ObjectFreshness.Source)
-	require.Equal(t, "Auth retries are flaky (batched)", members[1].ObjectSummary.Title)
+	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
+	require.Equal(t, "Auth retries are flaky", members[1].ObjectSummary.Title)
 	require.Equal(t, "alice", members[1].ObjectSummary.AuthorLogin)
 	require.NotNil(t, members[1].ObjectFreshness)
 	require.Equal(t, "current", members[1].ObjectFreshness.State)
-	require.Equal(t, "ghreplica_batch", members[1].ObjectFreshness.Source)
+	require.Equal(t, "target_projection", members[1].ObjectFreshness.Source)
 }
 
-func TestGetGroupFallsBackToCachedProjectionWhenBatchReadFails(t *testing.T) {
+func TestGetGroupEnqueuesRefreshWhenProjectionMissing(t *testing.T) {
 	ctx := context.Background()
-	service, _, server := newTestServiceWithBatchFailure(t)
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Auth work",
+	}, "")
+	require.NoError(t, err)
+
+	member := database.GroupMember{
+		GroupID:            group.ID,
+		GitHubRepositoryID: group.GitHubRepositoryID,
+		ObjectType:         "pull_request",
+		ObjectNumber:       22,
+		TargetKey:          objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
+		AddedBy:            actor.ID,
+		AddedAt:            time.Now().UTC(),
+	}
+	require.NoError(t, db.WithContext(ctx).Create(&member).Error)
+
+	_, members, _, err := service.GetGroup(ctx, group.PublicID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.Nil(t, members[0].ObjectSummary)
+	require.NotNil(t, members[0].ObjectFreshness)
+	require.Equal(t, "missing", members[0].ObjectFreshness.State)
+	require.Equal(t, "missing_projection", members[0].ObjectFreshness.Source)
+
+	var jobs []database.IndexJob
+	require.NoError(t, db.WithContext(ctx).Where("kind = ?", indexJobKindTargetProjectionRefresh).Find(&jobs).Error)
+	require.Len(t, jobs, 1)
+	require.Equal(t, "pending", jobs[0].Status)
+
+	drainIndexJobs(t, ctx, db, service.indexer)
+
+	var projection database.TargetProjection
+	require.NoError(t, db.WithContext(ctx).
+		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", group.GitHubRepositoryID, "pull_request", 22).
+		First(&projection).Error)
+	require.Equal(t, "Retry ACP turns safely", projection.Title)
+
+	_, members, _, err = service.GetGroup(ctx, group.PublicID)
+	require.NoError(t, err)
+	require.Len(t, members, 1)
+	require.NotNil(t, members[0].ObjectSummary)
+	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
+	require.Equal(t, "current", members[0].ObjectFreshness.State)
+	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
+}
+
+func TestGetGroupMarksStaleProjectionAndEnqueuesRefresh(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
 	defer server.Close()
 
 	actor := permissions.Actor{Type: "user", ID: "tester"}
@@ -254,15 +314,22 @@ func TestGetGroupFallsBackToCachedProjectionWhenBatchReadFails(t *testing.T) {
 	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
 	require.NoError(t, err)
 
+	staleAt := time.Now().UTC().Add(-2 * targetProjectionFreshnessTTL)
+	require.NoError(t, db.WithContext(ctx).
+		Model(&database.TargetProjection{}).
+		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", group.GitHubRepositoryID, "pull_request", 22).
+		Update("fetched_at", staleAt).Error)
+
 	_, members, _, err := service.GetGroup(ctx, group.PublicID)
 	require.NoError(t, err)
 	require.Len(t, members, 1)
 	require.NotNil(t, members[0].ObjectSummary)
-	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
-	require.Equal(t, "https://github.com/acme/widgets/pull/22", members[0].ObjectSummary.HTMLURL)
-	require.NotNil(t, members[0].ObjectFreshness)
-	require.Equal(t, "cached", members[0].ObjectFreshness.State)
+	require.Equal(t, "stale", members[0].ObjectFreshness.State)
 	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
+
+	var jobs []database.IndexJob
+	require.NoError(t, db.WithContext(ctx).Where("kind = ?", indexJobKindTargetProjectionRefresh).Find(&jobs).Error)
+	require.Len(t, jobs, 1)
 }
 
 func TestCreateGroupFallsBackToRepositoryAccessGrant(t *testing.T) {
@@ -339,22 +406,28 @@ func TestDeleteRepositoryAccessGrantRemovesFallbackWrite(t *testing.T) {
 }
 
 func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
-	return newTestServiceWithBatchBehavior(t, false)
+	return newTestServiceWithBatchOptions(t, batchBehavior{})
 }
 
 func newTestServiceWithChecker(t *testing.T, checker permissions.Checker) (*Service, *gorm.DB, *httptest.Server) {
-	return newTestServiceWithBatchBehaviorAndChecker(t, false, checker)
+	return newTestServiceWithBatchBehaviorAndChecker(t, batchBehavior{}, checker)
 }
 
 func newTestServiceWithBatchFailure(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
-	return newTestServiceWithBatchBehavior(t, true)
+	return newTestServiceWithBatchOptions(t, batchBehavior{fail: true})
 }
 
-func newTestServiceWithBatchBehavior(t *testing.T, failBatch bool) (*Service, *gorm.DB, *httptest.Server) {
-	return newTestServiceWithBatchBehaviorAndChecker(t, failBatch, permissions.AllowAllChecker{})
+func newTestServiceWithBatchOptions(t *testing.T, behavior batchBehavior) (*Service, *gorm.DB, *httptest.Server) {
+	return newTestServiceWithBatchBehaviorAndChecker(t, behavior, permissions.AllowAllChecker{})
 }
 
-func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, failBatch bool, checker permissions.Checker) (*Service, *gorm.DB, *httptest.Server) {
+type batchBehavior struct {
+	fail  bool
+	delay time.Duration
+	calls *atomic.Int32
+}
+
+func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, behavior batchBehavior, checker permissions.Checker) (*Service, *gorm.DB, *httptest.Server) {
 	t.Helper()
 
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{
@@ -376,14 +449,15 @@ func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, failBatch bool, che
 		&database.IndexJob{},
 	))
 
-	server := newTestGHReplicaServer(t, failBatch)
+	server := newTestGHReplicaServer(t, behavior)
 
-	indexer := NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
-	service := NewService(db, ghreplica.NewClient(server.URL), checker, indexer)
+	ghClient := ghreplica.NewClient(server.URL)
+	indexer := NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := NewService(db, ghClient, checker, indexer)
 	return service, db, server
 }
 
-func newTestGHReplicaServer(t *testing.T, failBatch bool) *httptest.Server {
+func newTestGHReplicaServer(t *testing.T, behavior batchBehavior) *httptest.Server {
 	t.Helper()
 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -420,7 +494,13 @@ func newTestGHReplicaServer(t *testing.T, failBatch bool) *httptest.Server {
 				"user": {"login": "alice"}
 			}`))
 		case "/v1/github-ext/repos/acme/widgets/objects/batch":
-			if failBatch {
+			if behavior.calls != nil {
+				behavior.calls.Add(1)
+			}
+			if behavior.delay > 0 {
+				time.Sleep(behavior.delay)
+			}
+			if behavior.fail {
 				http.Error(w, `{"error":"batch unavailable"}`, http.StatusBadGateway)
 				return
 			}
@@ -475,4 +555,18 @@ func newTestGHReplicaServer(t *testing.T, failBatch bool) *httptest.Server {
 			http.NotFound(w, r)
 		}
 	}))
+}
+
+func drainIndexJobs(t *testing.T, ctx context.Context, db *gorm.DB, indexer *Indexer) {
+	t.Helper()
+	for i := 0; i < 16; i++ {
+		require.NoError(t, indexer.RunOnce(ctx))
+		var pending int64
+		require.NoError(t, db.WithContext(ctx).Model(&database.IndexJob{}).Where("status = ?", "pending").Count(&pending).Error)
+		if pending == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("index jobs did not drain")
 }

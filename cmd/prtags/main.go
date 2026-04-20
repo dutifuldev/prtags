@@ -200,8 +200,9 @@ func newServeCommand() *cobra.Command {
 				checker = permissions.NewGitHubChecker(0)
 			}
 
-			indexer := core.NewIndexer(db, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
-			service := core.NewService(db, ghreplica.NewClient(cfg.GHReplicaBaseURL), checker, indexer)
+			ghClient := ghreplica.NewClient(cfg.GHReplicaBaseURL)
+			indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+			service := core.NewService(db, ghClient, checker, indexer)
 			server := httpapi.NewServer(db, service, cfg.AllowUnauthWrites)
 
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -241,7 +242,7 @@ func newWorkerCommand() *cobra.Command {
 			if err := database.EnsureGroupPublicIDs(context.Background(), db); err != nil {
 				return err
 			}
-			indexer := core.NewIndexer(db, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+			indexer := core.NewIndexer(db, ghreplica.NewClient(cfg.GHReplicaBaseURL), embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
 			return indexer.RunOnce(context.Background())
 		},
 	})

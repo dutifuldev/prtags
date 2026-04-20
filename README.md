@@ -129,7 +129,7 @@ curl -fsS http://127.0.0.1:8081/v1/repos/dutifuldev/ghreplica/groups | jq '.data
 
 The important distinction is that `PRtags` stores the curation data, while the underlying PR and issue content still comes from `ghreplica`.
 
-For example, `group get` returns member refs enriched with a small `object_summary`, and also reports `object_summary_freshness` so callers can tell whether the summary came from a live `ghreplica` batch read or cached projection data. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type.
+For example, `group get` returns member refs enriched with a small `object_summary`, and also reports `object_summary_freshness` so callers can tell whether the summary came from the cached target projection layer and whether it is `current`, `stale`, or missing while a background refresh is queued. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type.
 
 ### Agent Intent Workflow
 
@@ -181,7 +181,7 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 This split is important operationally too. `PRtags` owns its own database, jobs, search documents, and embeddings. It should not share a database with `ghreplica`, and it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
 
-For group reads, `PRtags` enriches member references on the server side. It calls `ghreplica`'s batch object-read extension internally, resolves the referenced PRs and issues in one request, and returns a small `object_summary` for each member together with `object_summary_freshness` metadata. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
+For group reads, `PRtags` enriches member references on the server side from cached target projections. If a projection is missing or stale, `PRtags` returns the cached result it already has, marks the freshness state explicitly, and queues a background refresh from `ghreplica`. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
 
 A simplified `group get` member looks like:
 
@@ -197,7 +197,7 @@ A simplified `group get` member looks like:
   },
   "object_summary_freshness": {
     "state": "current",
-    "source": "ghreplica_batch"
+    "source": "target_projection"
   }
 }
 ```

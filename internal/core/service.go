@@ -24,6 +24,11 @@ var (
 	ErrForbidden = &FailError{StatusCode: 403, Message: "forbidden"}
 )
 
+const (
+	indexJobKindTargetProjectionRefresh = "target_projection_refresh"
+	targetProjectionFreshnessTTL        = 15 * time.Minute
+)
+
 type FailError struct {
 	StatusCode int
 	Message    string
@@ -1308,22 +1313,29 @@ func (s *Service) ensureTargetProjection(ctx context.Context, owner, repo string
 }
 
 func (s *Service) enrichGroupMembers(ctx context.Context, group database.Group, members []database.GroupMember) ([]GroupMemberView, error) {
-	cachedSummaries, err := s.loadCachedGroupMemberSummaries(ctx, group.GitHubRepositoryID, members)
+	cachedProjections, err := s.loadCachedGroupMemberProjections(ctx, group.GitHubRepositoryID, members)
 	if err != nil {
 		return nil, err
 	}
 
-	liveSummaries, liveOK := s.fetchLiveGroupMemberSummaries(ctx, group, members)
-
+	now := time.Now().UTC()
 	views := make([]GroupMemberView, 0, len(members))
+	refreshTargets := make([]targetRef, 0, len(members))
 	for _, member := range members {
 		var resolution groupMemberResolution
-		if liveOK {
-			resolution = liveSummaries[member.TargetKey]
+		if projection, ok := cachedProjections[member.TargetKey]; ok {
+			resolution = projectionToGroupMemberResolution(now, projection)
+			if targetProjectionStale(now, projection) {
+				refreshTargets = append(refreshTargets, groupMemberTargetRef(group, member, &projection))
+			}
 		} else {
-			resolution = cachedSummaries[member.TargetKey]
+			resolution = missingGroupMemberResolution()
+			refreshTargets = append(refreshTargets, groupMemberTargetRef(group, member, nil))
 		}
 		views = append(views, groupMemberViewFromModel(member, resolution))
+	}
+	if len(refreshTargets) > 0 {
+		_ = s.enqueueTargetProjectionRefreshJobs(ctx, group, refreshTargets)
 	}
 	return views, nil
 }
@@ -1377,9 +1389,9 @@ func (s *Service) listGroupMemberCounts(ctx context.Context, groups []database.G
 	return counts, nil
 }
 
-func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repositoryID int64, members []database.GroupMember) (map[string]groupMemberResolution, error) {
+func (s *Service) loadCachedGroupMemberProjections(ctx context.Context, repositoryID int64, members []database.GroupMember) (map[string]database.TargetProjection, error) {
 	if len(members) == 0 {
-		return map[string]groupMemberResolution{}, nil
+		return map[string]database.TargetProjection{}, nil
 	}
 
 	targetTypes := make([]string, 0, len(members))
@@ -1400,7 +1412,7 @@ func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repository
 		}
 	}
 	if len(targetTypes) == 0 || len(objectNumbers) == 0 {
-		return map[string]groupMemberResolution{}, nil
+		return map[string]database.TargetProjection{}, nil
 	}
 
 	var projections []database.TargetProjection
@@ -1410,90 +1422,54 @@ func (s *Service) loadCachedGroupMemberSummaries(ctx context.Context, repository
 		return nil, err
 	}
 
-	summaries := make(map[string]groupMemberResolution, len(projections))
+	summaries := make(map[string]database.TargetProjection, len(projections))
 	for _, projection := range projections {
-		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projectionToGroupMemberResolution(projection)
+		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projection
 	}
 	return summaries, nil
 }
 
-func (s *Service) fetchLiveGroupMemberSummaries(ctx context.Context, group database.Group, members []database.GroupMember) (map[string]groupMemberResolution, bool) {
-	refs := make([]ghreplica.BatchObjectRef, 0, len(members))
-	seen := map[string]struct{}{}
-	for _, member := range members {
-		if member.ObjectType != "pull_request" && member.ObjectType != "issue" {
-			continue
-		}
-		if _, ok := seen[member.TargetKey]; ok {
-			continue
-		}
-		seen[member.TargetKey] = struct{}{}
-		refs = append(refs, ghreplica.BatchObjectRef{
-			Type:   member.ObjectType,
-			Number: member.ObjectNumber,
-		})
-	}
-	if len(refs) == 0 {
-		return map[string]groupMemberResolution{}, true
-	}
-
-	results, err := s.ghreplica.BatchGetObjects(ctx, group.RepositoryOwner, group.RepositoryName, refs)
-	if err != nil {
-		return nil, false
-	}
-
+func (s *Service) enqueueTargetProjectionRefreshJobs(ctx context.Context, group database.Group, targets []targetRef) error {
 	now := time.Now().UTC()
-	summaries := make(map[string]groupMemberResolution, len(results))
-	projections := make([]database.TargetProjection, 0, len(results))
-	for _, result := range results {
-		if !result.Found || result.Summary == nil {
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target.TargetType != "pull_request" && target.TargetType != "issue" {
 			continue
 		}
-		key := objectTargetKey(group.GitHubRepositoryID, result.Type, result.Number)
-		fetchedAt := now
-		summaries[key] = groupMemberResolution{
-			Summary: &GroupMemberObjectSummary{
-				Title:       result.Summary.Title,
-				State:       result.Summary.State,
-				HTMLURL:     result.Summary.HTMLURL,
-				AuthorLogin: result.Summary.AuthorLogin,
-				UpdatedAt:   result.Summary.UpdatedAt.UTC(),
-			},
-			Freshness: &GroupMemberObjectFreshness{
-				State:     "current",
-				Source:    "ghreplica_batch",
-				FetchedAt: &fetchedAt,
-			},
+		if target.TargetKey == "" {
+			continue
 		}
-		projections = append(projections, database.TargetProjection{
+		dedupeKey := target.TargetType + ":" + target.TargetKey
+		if _, ok := seen[dedupeKey]; ok {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
+
+		var existing database.IndexJob
+		err := s.db.WithContext(ctx).
+			Where("kind = ? AND github_repository_id = ? AND target_type = ? AND target_key = ? AND status IN ?", indexJobKindTargetProjectionRefresh, group.GitHubRepositoryID, target.TargetType, target.TargetKey, []string{"pending", "processing"}).
+			First(&existing).Error
+		if err == nil {
+			continue
+		}
+		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		job := database.IndexJob{
+			Kind:               indexJobKindTargetProjectionRefresh,
+			Status:             "pending",
 			GitHubRepositoryID: group.GitHubRepositoryID,
 			RepositoryOwner:    group.RepositoryOwner,
 			RepositoryName:     group.RepositoryName,
-			TargetType:         result.Type,
-			ObjectNumber:       result.Number,
-			Title:              result.Summary.Title,
-			State:              result.Summary.State,
-			AuthorLogin:        result.Summary.AuthorLogin,
-			HTMLURL:            result.Summary.HTMLURL,
-			SourceUpdatedAt:    result.Summary.UpdatedAt.UTC(),
-			FetchedAt:          now,
-		})
-	}
-
-	if len(projections) > 0 {
-		_ = s.upsertTargetProjections(ctx, projections)
-	}
-
-	return summaries, true
-}
-
-func (s *Service) upsertTargetProjections(ctx context.Context, projections []database.TargetProjection) error {
-	for _, projection := range projections {
-		model := projection
-		if err := s.db.WithContext(ctx).
-			Where("github_repository_id = ? AND target_type = ? AND object_number = ?", projection.GitHubRepositoryID, projection.TargetType, projection.ObjectNumber).
-			Assign(model).
-			FirstOrCreate(&model).Error; err != nil {
+			TargetType:         target.TargetType,
+			TargetKey:          target.TargetKey,
+			NextAttemptAt:      timePtr(now),
+		}
+		if target.Projection != nil {
+			job.SourceUpdatedAt = timePtr(target.Projection.SourceUpdatedAt)
+		}
+		if err := s.db.WithContext(ctx).Create(&job).Error; err != nil {
 			return err
 		}
 	}
@@ -1514,8 +1490,12 @@ func groupMemberViewFromModel(member database.GroupMember, resolution groupMembe
 	}
 }
 
-func projectionToGroupMemberResolution(projection database.TargetProjection) groupMemberResolution {
+func projectionToGroupMemberResolution(now time.Time, projection database.TargetProjection) groupMemberResolution {
 	fetchedAt := projection.FetchedAt
+	state := "current"
+	if targetProjectionStale(now, projection) {
+		state = "stale"
+	}
 	return groupMemberResolution{
 		Summary: &GroupMemberObjectSummary{
 			Title:       projection.Title,
@@ -1525,10 +1505,38 @@ func projectionToGroupMemberResolution(projection database.TargetProjection) gro
 			UpdatedAt:   projection.SourceUpdatedAt,
 		},
 		Freshness: &GroupMemberObjectFreshness{
-			State:     "cached",
+			State:     state,
 			Source:    "target_projection",
 			FetchedAt: &fetchedAt,
 		},
+	}
+}
+
+func missingGroupMemberResolution() groupMemberResolution {
+	return groupMemberResolution{
+		Freshness: &GroupMemberObjectFreshness{
+			State:  "missing",
+			Source: "missing_projection",
+		},
+	}
+}
+
+func targetProjectionStale(now time.Time, projection database.TargetProjection) bool {
+	if projection.FetchedAt.IsZero() {
+		return true
+	}
+	return now.Sub(projection.FetchedAt.UTC()) > targetProjectionFreshnessTTL
+}
+
+func groupMemberTargetRef(group database.Group, member database.GroupMember, projection *database.TargetProjection) targetRef {
+	return targetRef{
+		RepositoryID: group.GitHubRepositoryID,
+		Owner:        group.RepositoryOwner,
+		Name:         group.RepositoryName,
+		TargetType:   member.ObjectType,
+		TargetKey:    member.TargetKey,
+		ObjectNumber: member.ObjectNumber,
+		Projection:   projection,
 	}
 }
 

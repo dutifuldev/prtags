@@ -8,6 +8,7 @@ import (
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
+	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -34,7 +35,7 @@ func TestRecoverStaleJobsRequeuesExpiredProcessingJobs(t *testing.T) {
 		HeartbeatAt:        &stale,
 	}).Error)
 
-	indexer := NewIndexer(db, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	indexer := NewIndexer(db, ghreplica.NewClient("http://127.0.0.1"), embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	require.NoError(t, indexer.recoverStaleJobs(context.Background()))
 
 	var job database.IndexJob
