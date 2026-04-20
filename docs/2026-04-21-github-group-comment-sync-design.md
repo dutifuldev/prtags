@@ -85,6 +85,11 @@ The rule for what belongs in the table should be explicit:
 - fields that map to each related issue or pull request go in the table
 - group-level fields stay outside the table
 
+For v1, the group-level fields above the table should be:
+
+- `Name`
+- `Status`
+
 For v1, the table should only include:
 
 - `Number`
@@ -93,6 +98,14 @@ For v1, the table should only include:
 `Number` should be the GitHub link target.
 
 The group name and other shared metadata should appear above the table rather than repeating on every row.
+
+The current target should not appear in its own table.
+
+Each managed comment should list only the other linked issues and pull requests in the same group.
+
+If a group has only one item, `prtags` should not create a managed comment for it.
+
+If a group shrinks from multiple items to a single remaining item, the last managed comment for that group should be deleted.
 
 Row ordering should be stable.
 
@@ -283,6 +296,10 @@ The first version can skip group annotations entirely and only render membership
 
 This event-driven path is better than enqueueing GitHub jobs directly from request handlers because it does not lose sync if a write succeeds and the process crashes before a GitHub job is queued.
 
+Cross-repo deduplication is out of scope.
+
+The first version should only render same-repository group relationships into the managed comment.
+
 ## GitHub API Surface
 
 The simplest write surface is issue comments.
@@ -361,13 +378,34 @@ That means the clean implementation path is:
 4. add a River worker with a `github_group_comment_sync` handler
 5. render and reconcile one managed comment per `(group, target)`
 
+## Backfill And Manual Trigger
+
+Comment creation should not automatically backfill all existing groups when the feature is enabled.
+
+The default rollout should be:
+
+- new or changed groups start producing managed comments
+- untouched historical groups do not get comments automatically
+
+`prtags` should provide an explicit function to trigger comment creation or reconciliation for one group on demand.
+
+That function is useful for:
+
+- operator-driven backfill of selected groups
+- repairing one group after a bug fix
+- testing the feature on a narrow slice before broader rollout
+
 ## First Implementation Scope
 
 The smallest shippable version should:
 
 - support only issue and pull request group members
+- support only same-repository linked items in the rendered comment
 - render membership links only
+- render `Name` and `Status` above the table
 - create one managed comment per `(group, target)`
+- exclude the current target from its own table
+- skip comment creation for singleton groups
 - update on membership changes
 - delete on membership removal
 - track failures and retry
