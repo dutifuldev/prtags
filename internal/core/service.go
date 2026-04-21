@@ -891,8 +891,15 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		const memberInsertSavepoint = "group_member_insert"
+		if err := tx.SavePoint(memberInsertSavepoint).Error; err != nil {
+			return err
+		}
 		if err := tx.Create(&member).Error; err != nil {
 			if isGroupMemberConflict(err) {
+				if rollbackErr := tx.RollbackTo(memberInsertSavepoint).Error; rollbackErr != nil {
+					return rollbackErr
+				}
 				return s.translateGroupMemberConflictTx(tx, group, member)
 			}
 			return err
