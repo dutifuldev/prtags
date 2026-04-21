@@ -157,13 +157,13 @@ func TestCommentSyncTriggerAndReconcileCreatesAndUpdatesComments(t *testing.T) {
 	require.Contains(t, issueComments[0].Body, "Title: Auth reliability")
 	require.Contains(t, issueComments[0].Body, "[#11*](https://github.com/acme/widgets/issues/11)")
 	require.Contains(t, issueComments[0].Body, "[#22](https://github.com/acme/widgets/pull/22)")
-	require.Contains(t, issueComments[0].Body, "* This issue")
+	require.Contains(t, issueComments[0].Body, "`*` This issue")
 
 	prComments := store.list(22)
 	require.Len(t, prComments, 1)
 	require.Contains(t, prComments[0].Body, "[#22*](https://github.com/acme/widgets/pull/22)")
 	require.Contains(t, prComments[0].Body, "[#11](https://github.com/acme/widgets/issues/11)")
-	require.Contains(t, prComments[0].Body, "* This PR")
+	require.Contains(t, prComments[0].Body, "`*` This PR")
 
 	require.NoError(t, db.WithContext(ctx).Model(&database.Group{}).Where("id = ?", group.ID).Updates(map[string]any{
 		"title":  "Auth reliability follow-up",
@@ -309,7 +309,7 @@ func TestCommentSyncDeletesDuplicateManagedComments(t *testing.T) {
 	issueComments := store.list(11)
 	require.Len(t, issueComments, 1)
 	require.Contains(t, issueComments[0].Body, "Title: Auth reliability")
-	require.Contains(t, issueComments[0].Body, "* This issue")
+	require.Contains(t, issueComments[0].Body, "`*` This issue")
 }
 
 func TestCommentSyncRetryableFailureSucceedsLater(t *testing.T) {

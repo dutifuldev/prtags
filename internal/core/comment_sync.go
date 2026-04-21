@@ -576,9 +576,9 @@ func issueURL(owner, repo, targetType string, number int, fallback string) strin
 
 func selfReferenceFootnote(targetType string) string {
 	if targetType == "pull_request" {
-		return "* This PR"
+		return "`*` This PR"
 	}
-	return "* This issue"
+	return "`*` This issue"
 }
 
 func markdownCell(value string) string {
