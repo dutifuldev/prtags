@@ -35,8 +35,10 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	sqlDB.SetMaxOpenConns(10)
-	sqlDB.SetMaxIdleConns(10)
+	// Keep the default pool conservative because the shared Cloud SQL instance
+	// has a low connection limit and PRtags now runs River on the same pool.
+	sqlDB.SetMaxOpenConns(5)
+	sqlDB.SetMaxIdleConns(2)
 	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
 
