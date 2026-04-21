@@ -1,19 +1,19 @@
 package database
 
 const (
-	RepositoryProjectionsTable    = "repository_projections"
-	RepositoryAccessGrantsTable   = "repository_access_grants"
-	TargetProjectionsTable        = "target_projections"
-	GroupsTable                   = "groups"
-	GroupMembersTable             = "group_members"
-	FieldDefinitionsTable         = "field_definitions"
-	FieldValuesTable              = "field_values"
-	EventsTable                   = "events"
-	EventRefsTable                = "event_refs"
-	SearchDocumentsTable          = "search_documents"
-	EmbeddingsTable               = "embeddings"
-	IndexJobsTable                = "index_jobs"
-	GroupCommentSyncTargetsTable  = "group_comment_sync_targets"
+	RepositoryProjectionsTable   = "repository_projections"
+	RepositoryAccessGrantsTable  = "repository_access_grants"
+	TargetProjectionsTable       = "target_projections"
+	GroupsTable                  = "groups"
+	GroupMembersTable            = "group_members"
+	FieldDefinitionsTable        = "field_definitions"
+	FieldValuesTable             = "field_values"
+	EventsTable                  = "events"
+	EventRefsTable               = "event_refs"
+	SearchDocumentsTable         = "search_documents"
+	EmbeddingsTable              = "embeddings"
+	IndexJobsTable               = "index_jobs"
+	GroupCommentSyncTargetsTable = "group_comment_sync_targets"
 )
 
 func (RepositoryProjection) TableName() string   { return RepositoryProjectionsTable }
