@@ -401,6 +401,100 @@ func TestAddGroupMemberDoesNotBlockOnProjectionFetch(t *testing.T) {
 	require.EqualValues(t, 1, projectionCount)
 }
 
+func TestAddGroupMemberRejectsTargetAlreadyOwnedByAnotherGroup(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	first, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "First group",
+	}, "")
+	require.NoError(t, err)
+	second, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Second group",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, first.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, second.PublicID, "pull_request", 22, "")
+	require.Error(t, err)
+
+	var fail *FailError
+	require.ErrorAs(t, err, &fail)
+	require.Equal(t, 409, fail.StatusCode)
+	require.Equal(t, "target already belongs to another group", fail.Message)
+	require.Equal(t, groupMemberConflictDetails{GroupPublicID: first.PublicID}, fail.Data)
+
+	var members []database.GroupMember
+	require.NoError(t, db.WithContext(ctx).
+		Where("github_repository_id = ? AND object_type = ? AND object_number = ?", first.GitHubRepositoryID, "pull_request", 22).
+		Find(&members).Error)
+	require.Len(t, members, 1)
+	require.Equal(t, first.ID, members[0].GroupID)
+}
+
+func TestAddGroupMemberStillRejectsDuplicateInSameGroup(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Only group",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.Error(t, err)
+
+	var fail *FailError
+	require.ErrorAs(t, err, &fail)
+	require.Equal(t, 409, fail.StatusCode)
+	require.Equal(t, "group member already exists", fail.Message)
+}
+
+func TestRemoveGroupMemberReleasesTargetForAnotherGroup(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	first, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "First group",
+	}, "")
+	require.NoError(t, err)
+	second, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Second group",
+	}, "")
+	require.NoError(t, err)
+
+	member, err := service.AddGroupMember(ctx, actor, first.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+	require.NoError(t, service.RemoveGroupMember(ctx, actor, first.PublicID, member.ID, ""))
+
+	_, err = service.AddGroupMember(ctx, actor, second.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+
+	var members []database.GroupMember
+	require.NoError(t, db.WithContext(ctx).
+		Where("github_repository_id = ? AND object_type = ? AND object_number = ?", first.GitHubRepositoryID, "pull_request", 22).
+		Order("group_id ASC").
+		Find(&members).Error)
+	require.Len(t, members, 1)
+	require.Equal(t, second.ID, members[0].GroupID)
+}
+
 func TestCreateGroupFallsBackToRepositoryAccessGrant(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestServiceWithChecker(t, grantTestChecker{

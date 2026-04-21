@@ -73,9 +73,9 @@ type Group struct {
 type GroupMember struct {
 	ID                 uint      `gorm:"primaryKey" json:"id"`
 	GroupID            uint      `gorm:"uniqueIndex:idx_group_members_unique,priority:1;index" json:"-"`
-	GitHubRepositoryID int64     `gorm:"column:github_repository_id;index:idx_group_members_target,priority:1" json:"github_repository_id"`
-	ObjectType         string    `gorm:"uniqueIndex:idx_group_members_unique,priority:2;index:idx_group_members_target,priority:2" json:"object_type"`
-	ObjectNumber       int       `gorm:"uniqueIndex:idx_group_members_unique,priority:3;index:idx_group_members_target,priority:3" json:"object_number"`
+	GitHubRepositoryID int64     `gorm:"column:github_repository_id;uniqueIndex:idx_group_members_unique_target,priority:1" json:"github_repository_id"`
+	ObjectType         string    `gorm:"uniqueIndex:idx_group_members_unique,priority:2;uniqueIndex:idx_group_members_unique_target,priority:2" json:"object_type"`
+	ObjectNumber       int       `gorm:"uniqueIndex:idx_group_members_unique,priority:3;uniqueIndex:idx_group_members_unique_target,priority:3" json:"object_number"`
 	TargetKey          string    `gorm:"index" json:"target_key"`
 	AddedBy            string    `json:"added_by"`
 	AddedAt            time.Time `json:"added_at"`

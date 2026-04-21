@@ -48,6 +48,10 @@ type Service struct {
 	commentSync *CommentSyncService
 }
 
+type groupMemberConflictDetails struct {
+	GroupPublicID string `json:"group_public_id"`
+}
+
 type FieldDefinitionInput struct {
 	Name         string   `json:"name" yaml:"name"`
 	DisplayName  string   `json:"display_name" yaml:"display_name"`
@@ -889,7 +893,7 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&member).Error; err != nil {
 			if isGroupMemberConflict(err) {
-				return &FailError{StatusCode: 409, Message: "group member already exists"}
+				return s.translateGroupMemberConflictTx(tx, group, member)
 			}
 			return err
 		}
@@ -2261,8 +2265,52 @@ func isGroupMemberConflict(err error) bool {
 	}
 	text := strings.ToLower(err.Error())
 	return strings.Contains(text, "idx_group_members_unique") ||
+		strings.Contains(text, "idx_group_members_unique_target") ||
 		strings.Contains(text, "group_members_group_id_object_type_object_number_key") ||
+		strings.Contains(text, "group_members_github_repository_id_object_type_object_number_key") ||
+		strings.Contains(text, "unique constraint failed: group_members.group_id, group_members.object_type, group_members.object_number") ||
+		strings.Contains(text, "unique constraint failed: group_members.github_repository_id, group_members.object_type, group_members.object_number") ||
 		strings.Contains(text, "duplicate key")
+}
+
+func (s *Service) translateGroupMemberConflictTx(tx *gorm.DB, group database.Group, member database.GroupMember) error {
+	existing, owner, found, err := lookupGroupMemberConflictTx(tx, member.GitHubRepositoryID, member.ObjectType, member.ObjectNumber)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return &FailError{StatusCode: 409, Message: "group member already exists"}
+	}
+	if existing.GroupID == group.ID {
+		return &FailError{StatusCode: 409, Message: "group member already exists"}
+	}
+	return &FailError{
+		StatusCode: 409,
+		Message:    "target already belongs to another group",
+		Data: groupMemberConflictDetails{
+			GroupPublicID: owner.PublicID,
+		},
+	}
+}
+
+func lookupGroupMemberConflictTx(tx *gorm.DB, repositoryID int64, objectType string, objectNumber int) (database.GroupMember, database.Group, bool, error) {
+	var member database.GroupMember
+	err := tx.
+		Where("github_repository_id = ? AND object_type = ? AND object_number = ?", repositoryID, objectType, objectNumber).
+		First(&member).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return database.GroupMember{}, database.Group{}, false, nil
+	}
+	if err != nil {
+		return database.GroupMember{}, database.Group{}, false, err
+	}
+
+	var group database.Group
+	err = tx.Where("id = ?", member.GroupID).First(&group).Error
+	if err != nil {
+		return database.GroupMember{}, database.Group{}, false, err
+	}
+	return member, group, true, nil
 }
 
 func lockEventAggregateTx(tx *gorm.DB, aggregateType string, aggregateKey string) error {

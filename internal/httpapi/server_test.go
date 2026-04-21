@@ -111,6 +111,47 @@ func TestAPIEndToEndFlow(t *testing.T) {
 	require.Greater(t, events, int64(0))
 }
 
+func TestAPIAddGroupMemberRejectsTargetAlreadyInAnotherGroup(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	stub := newStubGHReplica(t)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
+	server := httpapi.NewServer(db, service, true)
+
+	firstRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "pull_request",
+		"title": "First group",
+	}, http.StatusCreated)
+	firstID := extractPathString(t, firstRaw, "data.id")
+
+	secondRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "pull_request",
+		"title": "Second group",
+	}, http.StatusCreated)
+	secondID := extractPathString(t, secondRaw, "data.id")
+
+	postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%s/members", firstID), map[string]any{
+		"object_type":   "pull_request",
+		"object_number": 22,
+	}, http.StatusCreated)
+
+	conflict := postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%s/members", secondID), map[string]any{
+		"object_type":   "pull_request",
+		"object_number": 22,
+	}, http.StatusConflict)
+
+	require.Contains(t, conflict, `"message":"target already belongs to another group"`)
+	require.Contains(t, conflict, fmt.Sprintf(`"group_public_id":"%s"`, firstID))
+
+	var members []database.GroupMember
+	require.NoError(t, db.WithContext(ctx).
+		Where("github_repository_id = ? AND object_type = ? AND object_number = ?", int64(101), "pull_request", 22).
+		Find(&members).Error)
+	require.Len(t, members, 1)
+}
+
 func TestManifestImportExport(t *testing.T) {
 	db := openTestDB(t)
 	stub := newStubGHReplica(t)

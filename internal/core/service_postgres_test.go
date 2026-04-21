@@ -107,6 +107,70 @@ func TestAddGroupMemberConcurrentDuplicatePostgres(t *testing.T) {
 	require.Len(t, events, 2)
 }
 
+func TestAddGroupMemberConcurrentCrossGroupDuplicatePostgres(t *testing.T) {
+	ctx := context.Background()
+	service, db := newPostgresTestServiceWithBatchOptions(t, batchBehavior{})
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	first, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "First group",
+	}, "")
+	require.NoError(t, err)
+	second, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Second group",
+	}, "")
+	require.NoError(t, err)
+
+	type result struct {
+		groupPublicID string
+		err           error
+	}
+	start := make(chan struct{})
+	results := make([]result, 2)
+	groupIDs := []string{first.PublicID, second.PublicID}
+	var wg sync.WaitGroup
+	for i, groupPublicID := range groupIDs {
+		wg.Add(1)
+		go func(index int, id string) {
+			defer wg.Done()
+			<-start
+			_, err := service.AddGroupMember(ctx, actor, id, "pull_request", 22, "")
+			results[index] = result{groupPublicID: id, err: err}
+		}(i, groupPublicID)
+	}
+	close(start)
+	wg.Wait()
+
+	successCount := 0
+	conflictCount := 0
+	for _, result := range results {
+		if result.err == nil {
+			successCount++
+			continue
+		}
+		var fail *FailError
+		require.ErrorAs(t, result.err, &fail)
+		require.Equal(t, 409, fail.StatusCode)
+		require.Equal(t, "target already belongs to another group", fail.Message)
+		details, ok := fail.Data.(groupMemberConflictDetails)
+		require.True(t, ok)
+		require.Contains(t, []string{first.PublicID, second.PublicID}, details.GroupPublicID)
+		require.NotContains(t, strings.ToLower(result.err.Error()), "25p02")
+		conflictCount++
+	}
+	require.Equal(t, 1, successCount)
+	require.Equal(t, 1, conflictCount)
+
+	var members []database.GroupMember
+	require.NoError(t, db.WithContext(ctx).
+		Where("github_repository_id = ? AND object_type = ? AND object_number = ?", first.GitHubRepositoryID, "pull_request", 22).
+		Find(&members).Error)
+	require.Len(t, members, 1)
+	require.Contains(t, []uint{first.ID, second.ID}, members[0].GroupID)
+}
+
 type addGroupMemberResult struct {
 	number int
 	err    error

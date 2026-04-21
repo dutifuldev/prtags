@@ -101,6 +101,16 @@ Suggested columns:
 
 This table answers the question: “which mirrored GitHub objects are inside this group?”
 
+Membership is exclusive by target identity within a repository.
+
+That means one row identified by:
+
+- `github_repository_id`
+- `object_type`
+- `object_number`
+
+can belong to only one group at a time.
+
 ### `field_definitions`
 
 This table defines repo-level custom metadata fields.
