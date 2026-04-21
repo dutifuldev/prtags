@@ -57,6 +57,7 @@ func (s *Server) registerRoutes() {
 
 	s.echo.POST("/v1/repos/:owner/:repo/groups", s.handleCreateGroup)
 	s.echo.GET("/v1/repos/:owner/:repo/groups", s.handleListGroups)
+	s.echo.GET("/v1/repos/:owner/:repo/group-comment-sync-targets", s.handleListGroupCommentSyncTargets)
 	s.echo.GET("/v1/groups/:id", s.handleGetGroup)
 	s.echo.PATCH("/v1/groups/:id", s.handleUpdateGroup)
 	s.echo.POST("/v1/groups/:id/members", s.handleAddGroupMember)
@@ -167,6 +168,14 @@ func (s *Server) handleListGroups(c echo.Context) error {
 		return s.renderError(c, err)
 	}
 	return c.JSON(http.StatusOK, jsend.Success(groups))
+}
+
+func (s *Server) handleListGroupCommentSyncTargets(c echo.Context) error {
+	targets, err := s.service.ListGroupCommentSyncTargets(c.Request().Context(), s.actorFromRequest(c), c.Param("owner"), c.Param("repo"))
+	if err != nil {
+		return s.renderError(c, err)
+	}
+	return c.JSON(http.StatusOK, jsend.Success(targets))
 }
 
 func (s *Server) handleGetGroup(c echo.Context) error {

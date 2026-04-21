@@ -5,10 +5,17 @@ services:
       dockerfile: Dockerfile
     command: ["serve"]
     volumes:
+      # The mounted GitHub App key directory must stay readable by the container
+      # user only. On the VM, keep /home/bob/prtags/secrets at mode 0500 and the
+      # key file at mode 0400, both owned by uid/gid 10001.
       - /home/bob/prtags/secrets:/home/bob/prtags/secrets:ro
     environment:
       LISTEN_ADDR: ":8081"
       DATABASE_URL: "postgres://${DB_IAM_USER_URLENCODED}@cloudsql-proxy:5432/${DB_NAME}?sslmode=disable"
+      DB_MAX_OPEN_CONNS: "${DB_MAX_OPEN_CONNS:-5}"
+      DB_MAX_IDLE_CONNS: "${DB_MAX_IDLE_CONNS:-2}"
+      DB_CONN_MAX_IDLE_TIME: "${DB_CONN_MAX_IDLE_TIME:-5m}"
+      DB_CONN_MAX_LIFETIME: "${DB_CONN_MAX_LIFETIME:-30m}"
       GHREPLICA_BASE_URL: "${GHREPLICA_BASE_URL:-https://ghreplica.dutiful.dev}"
       GITHUB_BASE_URL: "${GITHUB_BASE_URL:-https://api.github.com}"
       GITHUB_APP_ID: "${GITHUB_APP_ID:-}"

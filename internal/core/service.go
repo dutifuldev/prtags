@@ -137,6 +137,22 @@ type GroupMemberView struct {
 	ObjectFreshness    *GroupMemberObjectFreshness `json:"object_summary_freshness,omitempty"`
 }
 
+type GroupCommentSyncTargetStatusView struct {
+	GroupID         string     `json:"group_id"`
+	GroupTitle      string     `json:"group_title"`
+	ObjectType      string     `json:"object_type"`
+	ObjectNumber    int        `json:"object_number"`
+	TargetKey       string     `json:"target_key"`
+	DesiredRevision int        `json:"desired_revision"`
+	AppliedRevision int        `json:"applied_revision"`
+	DesiredDeleted  bool       `json:"desired_deleted"`
+	State           string     `json:"state"`
+	LastErrorKind   string     `json:"last_error_kind"`
+	LastError       string     `json:"last_error"`
+	LastErrorAt     *time.Time `json:"last_error_at,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
 type GetGroupOptions struct {
 	IncludeMetadata bool
 }
@@ -996,6 +1012,62 @@ func (s *Service) SyncGroupComments(ctx context.Context, actor permissions.Actor
 		return GroupCommentSyncResult{}, &FailError{StatusCode: 503, Message: "github comment sync is not configured"}
 	}
 	return s.commentSync.TriggerGroupSync(ctx, groupPublicID)
+}
+
+func (s *Service) ListGroupCommentSyncTargets(ctx context.Context, actor permissions.Actor, owner, repo string) ([]GroupCommentSyncTargetStatusView, error) {
+	repository, err := s.EnsureRepository(ctx, owner, repo)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireWrite(ctx, actor, repository); err != nil {
+		return nil, err
+	}
+
+	type syncTargetRow struct {
+		database.GroupCommentSyncTarget
+		GroupPublicID string `gorm:"column:group_public_id"`
+		GroupTitle    string `gorm:"column:group_title"`
+	}
+
+	var rows []syncTargetRow
+	if err := s.db.WithContext(ctx).
+		Table("group_comment_sync_targets").
+		Select("group_comment_sync_targets.*, groups.public_id AS group_public_id, groups.title AS group_title").
+		Joins("JOIN groups ON groups.id = group_comment_sync_targets.group_id").
+		Where("group_comment_sync_targets.github_repository_id = ?", repository.GitHubRepositoryID).
+		Where("(group_comment_sync_targets.last_error_at IS NOT NULL) OR (group_comment_sync_targets.desired_revision > group_comment_sync_targets.applied_revision)").
+		Order("CASE WHEN group_comment_sync_targets.last_error_at IS NULL THEN 1 ELSE 0 END ASC").
+		Order("group_comment_sync_targets.last_error_at DESC").
+		Order("group_comment_sync_targets.updated_at DESC").
+		Order("groups.public_id ASC").
+		Order("group_comment_sync_targets.object_number ASC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	views := make([]GroupCommentSyncTargetStatusView, 0, len(rows))
+	for _, row := range rows {
+		state := "pending"
+		if row.LastErrorAt != nil {
+			state = "failed"
+		}
+		views = append(views, GroupCommentSyncTargetStatusView{
+			GroupID:         row.GroupPublicID,
+			GroupTitle:      row.GroupTitle,
+			ObjectType:      row.ObjectType,
+			ObjectNumber:    row.ObjectNumber,
+			TargetKey:       row.TargetKey,
+			DesiredRevision: row.DesiredRevision,
+			AppliedRevision: row.AppliedRevision,
+			DesiredDeleted:  row.DesiredDeleted,
+			State:           state,
+			LastErrorKind:   row.LastErrorKind,
+			LastError:       row.LastError,
+			LastErrorAt:     row.LastErrorAt,
+			UpdatedAt:       row.UpdatedAt,
+		})
+	}
+	return views, nil
 }
 
 func (s *Service) SetAnnotations(ctx context.Context, actor permissions.Actor, owner, repo, targetType string, objectNumber int, groupID *uint, values map[string]any, idempotencyKey string) (AnnotationSetResult, error) {

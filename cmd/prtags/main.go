@@ -185,7 +185,12 @@ func newServeCommand() *cobra.Command {
 				return err
 			}
 
-			db, err := database.Open(cfg.DatabaseURL)
+			db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
+				MaxOpenConns:    cfg.DBMaxOpenConns,
+				MaxIdleConns:    cfg.DBMaxIdleConns,
+				ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+				ConnMaxLifetime: cfg.DBConnMaxLifetime,
+			})
 			if err != nil {
 				return err
 			}
@@ -261,7 +266,12 @@ func newWorkerCommand() *cobra.Command {
 			if err := cfg.Validate(); err != nil {
 				return err
 			}
-			db, err := database.Open(cfg.DatabaseURL)
+			db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
+				MaxOpenConns:    cfg.DBMaxOpenConns,
+				MaxIdleConns:    cfg.DBMaxIdleConns,
+				ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+				ConnMaxLifetime: cfg.DBConnMaxLifetime,
+			})
 			if err != nil {
 				return err
 			}
@@ -695,7 +705,21 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 		},
 	}
 
-	groups.AddCommand(create, list, get, update, addPR, addIssue, syncComments)
+	listCommentSyncTargets := &cobra.Command{
+		Use:   "list-comment-sync-targets",
+		Short: "List group comment sync targets that need operator attention",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			owner, name, err := splitRepo(repo)
+			if err != nil {
+				return err
+			}
+			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/group-comment-sync-targets", owner, name), nil)
+		},
+	}
+	listCommentSyncTargets.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	_ = listCommentSyncTargets.MarkFlagRequired("repo")
+
+	groups.AddCommand(create, list, get, update, addPR, addIssue, syncComments, listCommentSyncTargets)
 	return groups
 }
 

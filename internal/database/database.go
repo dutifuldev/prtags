@@ -19,7 +19,27 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+type PoolConfig struct {
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxIdleTime time.Duration
+	ConnMaxLifetime time.Duration
+}
+
+func DefaultPoolConfig() PoolConfig {
+	return PoolConfig{
+		MaxOpenConns:    5,
+		MaxIdleConns:    2,
+		ConnMaxIdleTime: 5 * time.Minute,
+		ConnMaxLifetime: 30 * time.Minute,
+	}
+}
+
 func Open(databaseURL string) (*gorm.DB, error) {
+	return OpenWithPool(databaseURL, DefaultPoolConfig())
+}
+
+func OpenWithPool(databaseURL string, pool PoolConfig) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(databaseURL), &gorm.Config{
 		Logger: logger.New(log.New(os.Stdout, "\r\n", log.LstdFlags), logger.Config{
 			LogLevel:                  logger.Warn,
@@ -35,12 +55,10 @@ func Open(databaseURL string) (*gorm.DB, error) {
 		return nil, err
 	}
 
-	// Keep the default pool conservative because the shared Cloud SQL instance
-	// has a low connection limit and PRtags now runs River on the same pool.
-	sqlDB.SetMaxOpenConns(5)
-	sqlDB.SetMaxIdleConns(2)
-	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
-	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetMaxOpenConns(pool.MaxOpenConns)
+	sqlDB.SetMaxIdleConns(pool.MaxIdleConns)
+	sqlDB.SetConnMaxIdleTime(pool.ConnMaxIdleTime)
+	sqlDB.SetConnMaxLifetime(pool.ConnMaxLifetime)
 
 	return db, nil
 }

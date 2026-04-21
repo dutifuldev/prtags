@@ -216,6 +216,45 @@ func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 	require.NotContains(t, documents[0].SearchText, "intent:")
 }
 
+func TestAPIListGroupCommentSyncTargets(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	stub := newStubGHReplica(t)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
+	server := httpapi.NewServer(db, service, true)
+
+	groupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "mixed",
+		"title": "Auth reliability",
+	}, http.StatusCreated)
+	groupID := extractPathString(t, groupRaw, "data.id")
+
+	var group database.Group
+	require.NoError(t, db.WithContext(ctx).Where("public_id = ?", groupID).First(&group).Error)
+	require.NoError(t, db.WithContext(ctx).Create(&database.GroupCommentSyncTarget{
+		GitHubRepositoryID: group.GitHubRepositoryID,
+		GroupID:            group.ID,
+		ObjectType:         "pull_request",
+		ObjectNumber:       22,
+		TargetKey:          "repo:101:pull_request:22",
+		DesiredRevision:    3,
+		AppliedRevision:    1,
+		LastErrorKind:      "permission_denied",
+		LastError:          "Resource not accessible by integration",
+		LastErrorAt:        timePtr(time.Now().UTC()),
+	}).Error)
+
+	raw := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/group-comment-sync-targets", nil, http.StatusOK)
+	require.Contains(t, raw, `"group_id":"`+groupID+`"`)
+	require.Contains(t, raw, `"group_title":"Auth reliability"`)
+	require.Contains(t, raw, `"object_type":"pull_request"`)
+	require.Contains(t, raw, `"object_number":22`)
+	require.Contains(t, raw, `"state":"failed"`)
+	require.Contains(t, raw, `"last_error_kind":"permission_denied"`)
+}
+
 func openTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{
@@ -228,6 +267,7 @@ func openTestDB(t *testing.T) *gorm.DB {
 		&database.TargetProjection{},
 		&database.Group{},
 		&database.GroupMember{},
+		&database.GroupCommentSyncTarget{},
 		&database.FieldDefinition{},
 		&database.FieldValue{},
 		&database.Event{},
@@ -237,6 +277,10 @@ func openTestDB(t *testing.T) *gorm.DB {
 		&database.IndexJob{},
 	))
 	return db
+}
+
+func timePtr(value time.Time) *time.Time {
+	return &value
 }
 
 func newStubGHReplica(t *testing.T) *httptest.Server {

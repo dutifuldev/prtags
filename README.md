@@ -252,12 +252,18 @@ docker run --rm --name prtags-postgres \
   pgvector/pgvector:pg16
 
 export DATABASE_URL='postgres://postgres:prtags@127.0.0.1:55432/prtags?sslmode=disable'
+export DB_MAX_OPEN_CONNS=5
+export DB_MAX_IDLE_CONNS=2
+export DB_CONN_MAX_IDLE_TIME=5m
+export DB_CONN_MAX_LIFETIME=30m
 export GHREPLICA_BASE_URL='https://ghreplica.dutiful.dev'
 export ALLOW_UNAUTH_WRITES=true
 go run ./cmd/prtags serve
 ```
 
 By default the server listens on `:8081`, runs migrations on startup, and starts the background indexing worker.
+
+If you want to test outbound group comments locally, also set `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and either `GITHUB_APP_PRIVATE_KEY_PEM` or `GITHUB_APP_PRIVATE_KEY_PATH`. In production, prefer the mounted private key path and keep the containing directory readable by the container user only.
 
 Once the server is up, these are the most useful manual operations:
 

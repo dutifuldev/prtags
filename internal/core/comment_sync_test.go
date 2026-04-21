@@ -155,13 +155,15 @@ func TestCommentSyncTriggerAndReconcileCreatesAndUpdatesComments(t *testing.T) {
 	issueComments := store.list(11)
 	require.Len(t, issueComments, 1)
 	require.Contains(t, issueComments[0].Body, "Title: Auth reliability")
+	require.Contains(t, issueComments[0].Body, "[#11*](https://github.com/acme/widgets/issues/11)")
 	require.Contains(t, issueComments[0].Body, "[#22](https://github.com/acme/widgets/pull/22)")
-	require.NotContains(t, issueComments[0].Body, "[#11]")
+	require.Contains(t, issueComments[0].Body, "* This issue")
 
 	prComments := store.list(22)
 	require.Len(t, prComments, 1)
+	require.Contains(t, prComments[0].Body, "[#22*](https://github.com/acme/widgets/pull/22)")
 	require.Contains(t, prComments[0].Body, "[#11](https://github.com/acme/widgets/issues/11)")
-	require.NotContains(t, prComments[0].Body, "[#22]")
+	require.Contains(t, prComments[0].Body, "* This PR")
 
 	require.NoError(t, db.WithContext(ctx).Model(&database.Group{}).Where("id = ?", group.ID).Updates(map[string]any{
 		"title":  "Auth reliability follow-up",
@@ -253,6 +255,112 @@ func TestCommentSyncReconcileAppliesLatestStateWhenQueuedRevisionIsStale(t *test
 	require.Equal(t, refreshed.DesiredRevision, refreshed.AppliedRevision)
 }
 
+func TestCommentSyncMarksPermissionDeniedWithoutHammeringGitHub(t *testing.T) {
+	ctx := context.Background()
+	db := openCommentSyncTestDB(t)
+	group := seedCommentSyncGroup(t, db)
+	dispatcher := &commentSyncDispatcherStub{}
+	_, client := newTestGitHubCommentClientWithHandler(t, func(w http.ResponseWriter, r *http.Request, _ *githubCommentStore) bool {
+		if strings.HasPrefix(r.URL.Path, "/repos/acme/widgets/issues/") {
+			w.WriteHeader(http.StatusForbidden)
+			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				"message": "Resource not accessible by integration",
+			}))
+			return true
+		}
+		return false
+	})
+	syncService := NewCommentSyncService(db, client, dispatcher)
+
+	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
+	require.NoError(t, err)
+
+	var row database.GroupCommentSyncTarget
+	require.NoError(t, db.WithContext(ctx).Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
+
+	require.NoError(t, syncService.Reconcile(ctx, row.ID, row.DesiredRevision, false))
+
+	require.NoError(t, db.WithContext(ctx).First(&row, row.ID).Error)
+	require.Equal(t, "permission_denied", row.LastErrorKind)
+	require.NotNil(t, row.LastErrorAt)
+	require.Contains(t, row.LastError, "Resource not accessible by integration")
+}
+
+func TestCommentSyncDeletesDuplicateManagedComments(t *testing.T) {
+	ctx := context.Background()
+	db := openCommentSyncTestDB(t)
+	group := seedCommentSyncGroup(t, db)
+	dispatcher := &commentSyncDispatcherStub{}
+	store, client := newTestGitHubCommentClient(t)
+	syncService := NewCommentSyncService(db, client, dispatcher)
+
+	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
+	require.NoError(t, err)
+
+	var row database.GroupCommentSyncTarget
+	require.NoError(t, db.WithContext(ctx).Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
+
+	marker := markerForTarget(group.PublicID, group.GitHubRepositoryID, row.ObjectType, row.ObjectNumber)
+	store.create(11, marker+"\nold duplicate a")
+	store.create(11, marker+"\nold duplicate b")
+
+	require.NoError(t, syncService.Reconcile(ctx, row.ID, row.DesiredRevision, false))
+
+	issueComments := store.list(11)
+	require.Len(t, issueComments, 1)
+	require.Contains(t, issueComments[0].Body, "Title: Auth reliability")
+	require.Contains(t, issueComments[0].Body, "* This issue")
+}
+
+func TestCommentSyncRetryableFailureSucceedsLater(t *testing.T) {
+	ctx := context.Background()
+	db := openCommentSyncTestDB(t)
+	group := seedCommentSyncGroup(t, db)
+	dispatcher := &commentSyncDispatcherStub{}
+	var failCreateOnce sync.Once
+	store, client := newTestGitHubCommentClientWithHandler(t, func(w http.ResponseWriter, r *http.Request, _ *githubCommentStore) bool {
+		if r.Method == http.MethodPost && r.URL.Path == "/repos/acme/widgets/issues/11/comments" {
+			failed := false
+			failCreateOnce.Do(func() {
+				failed = true
+			})
+			if failed {
+				w.WriteHeader(http.StatusInternalServerError)
+				require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"message": "temporary github failure"}))
+				return true
+			}
+		}
+		return false
+	})
+	syncService := NewCommentSyncService(db, client, dispatcher)
+
+	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
+	require.NoError(t, err)
+
+	var row database.GroupCommentSyncTarget
+	require.NoError(t, db.WithContext(ctx).Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
+
+	err = syncService.Reconcile(ctx, row.ID, row.DesiredRevision, false)
+	require.Error(t, err)
+
+	var failedRow database.GroupCommentSyncTarget
+	require.NoError(t, db.WithContext(ctx).First(&failedRow, row.ID).Error)
+	require.Equal(t, "", failedRow.LastErrorKind)
+	require.Contains(t, failedRow.LastError, "temporary github failure")
+	require.NotNil(t, failedRow.LastErrorAt)
+	require.Nil(t, failedRow.GitHubCommentID)
+
+	require.NoError(t, syncService.Reconcile(ctx, row.ID, row.DesiredRevision, false))
+
+	var succeededRow database.GroupCommentSyncTarget
+	require.NoError(t, db.WithContext(ctx).First(&succeededRow, row.ID).Error)
+	require.Equal(t, succeededRow.DesiredRevision, succeededRow.AppliedRevision)
+	require.Empty(t, succeededRow.LastError)
+	require.Empty(t, succeededRow.LastErrorKind)
+	require.Nil(t, succeededRow.LastErrorAt)
+	require.Len(t, store.list(11), 1)
+}
+
 func openCommentSyncTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{
@@ -329,6 +437,10 @@ func seedCommentSyncGroup(t *testing.T, db *gorm.DB) database.Group {
 }
 
 func newTestGitHubCommentClient(t *testing.T) (*githubCommentStore, *githubapi.Client) {
+	return newTestGitHubCommentClientWithHandler(t, nil)
+}
+
+func newTestGitHubCommentClientWithHandler(t *testing.T, handler func(http.ResponseWriter, *http.Request, *githubCommentStore) bool) (*githubCommentStore, *githubapi.Client) {
 	t.Helper()
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
@@ -346,6 +458,7 @@ func newTestGitHubCommentClient(t *testing.T) (*githubCommentStore, *githubapi.C
 				"token":      "installation-token",
 				"expires_at": time.Now().UTC().Add(30 * time.Minute),
 			}))
+		case handler != nil && handler(w, r, store):
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/issues/11/comments":
 			require.NoError(t, json.NewEncoder(w).Encode(store.list(11)))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/acme/widgets/issues/22/comments":

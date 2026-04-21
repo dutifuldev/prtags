@@ -451,17 +451,9 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 		return "", "", false, nil
 	}
 
-	related := make([]database.GroupMember, 0, len(members)-1)
-	objectNumbers := make([]int, 0, len(members)-1)
+	objectNumbers := make([]int, 0, len(members))
 	for _, member := range members {
-		if member.ObjectType == currentType && member.ObjectNumber == currentNumber {
-			continue
-		}
-		related = append(related, member)
 		objectNumbers = append(objectNumbers, member.ObjectNumber)
-	}
-	if len(related) == 0 {
-		return "", "", false, nil
 	}
 
 	var projections []database.TargetProjection
@@ -487,15 +479,20 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 	}
 	lines = append(lines, "", "| Number | Title |", "| --- | --- |")
 
-	for _, member := range related {
+	for _, member := range members {
 		projection, ok := projectionByKey[member.TargetKey]
-		numberCell := fmt.Sprintf("[#%d](%s)", member.ObjectNumber, issueURL(group.RepositoryOwner, group.RepositoryName, member.ObjectType, member.ObjectNumber, projection.HTMLURL))
+		numberLabel := fmt.Sprintf("#%d", member.ObjectNumber)
+		if member.ObjectType == currentType && member.ObjectNumber == currentNumber {
+			numberLabel += "*"
+		}
+		numberCell := fmt.Sprintf("[%s](%s)", numberLabel, issueURL(group.RepositoryOwner, group.RepositoryName, member.ObjectType, member.ObjectNumber, projection.HTMLURL))
 		title := "Title unavailable"
 		if ok && strings.TrimSpace(projection.Title) != "" {
 			title = projection.Title
 		}
 		lines = append(lines, fmt.Sprintf("| %s | %s |", numberCell, markdownCell(title)))
 	}
+	lines = append(lines, "", selfReferenceFootnote(currentType))
 
 	body := strings.Join(lines, "\n")
 	sum := sha256.Sum256([]byte(body))
@@ -511,18 +508,23 @@ func (s *CommentSyncService) markSyncSucceeded(ctx context.Context, row *databas
 	row.LastError = ""
 	row.LastErrorKind = ""
 	row.LastErrorAt = nil
+	updates := map[string]any{
+		"comment_body_hash": hash,
+		"applied_revision":  row.DesiredRevision,
+		"last_synced_at":    now,
+		"last_error":        "",
+		"last_error_kind":   "",
+		"last_error_at":     gorm.Expr("NULL"),
+		"updated_at":        now,
+	}
+	if commentID == nil {
+		updates["github_comment_id"] = gorm.Expr("NULL")
+	} else {
+		updates["github_comment_id"] = *commentID
+	}
 	return s.db.WithContext(ctx).Model(&database.GroupCommentSyncTarget{}).
 		Where("id = ?", row.ID).
-		Updates(map[string]any{
-			"github_comment_id": commentID,
-			"comment_body_hash": hash,
-			"applied_revision":  row.DesiredRevision,
-			"last_synced_at":    now,
-			"last_error":        "",
-			"last_error_kind":   "",
-			"last_error_at":     nil,
-			"updated_at":        now,
-		}).Error
+		Updates(updates).Error
 }
 
 func (s *CommentSyncService) markSyncFailed(ctx context.Context, row *database.GroupCommentSyncTarget, kind string, failure error) error {
@@ -570,6 +572,13 @@ func issueURL(owner, repo, targetType string, number int, fallback string) strin
 		path = "pull"
 	}
 	return fmt.Sprintf("https://github.com/%s/%s/%s/%d", owner, repo, path, number)
+}
+
+func selfReferenceFootnote(targetType string) string {
+	if targetType == "pull_request" {
+		return "* This PR"
+	}
+	return "* This issue"
 }
 
 func markdownCell(value string) string {

@@ -208,7 +208,12 @@ func openOpsService() (*core.Service, func(), error) {
 		return nil, nil, err
 	}
 
-	db, err := database.Open(cfg.DatabaseURL)
+	db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
+		MaxOpenConns:    cfg.DBMaxOpenConns,
+		MaxIdleConns:    cfg.DBMaxIdleConns,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
