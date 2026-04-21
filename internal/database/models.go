@@ -200,3 +200,23 @@ type IndexJob struct {
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
+
+type GroupCommentSyncTarget struct {
+	ID                 uint       `gorm:"primaryKey" json:"id"`
+	GitHubRepositoryID int64      `gorm:"column:github_repository_id;index:idx_group_comment_sync_repo_updated,priority:1" json:"github_repository_id"`
+	GroupID            uint       `gorm:"uniqueIndex:idx_group_comment_sync_unique,priority:1;index" json:"group_id"`
+	ObjectType         string     `gorm:"uniqueIndex:idx_group_comment_sync_unique,priority:2;index" json:"object_type"`
+	ObjectNumber       int        `gorm:"uniqueIndex:idx_group_comment_sync_unique,priority:3;index" json:"object_number"`
+	TargetKey          string     `gorm:"index" json:"target_key"`
+	DesiredRevision    int        `gorm:"index:idx_group_comment_sync_revision,priority:1" json:"desired_revision"`
+	AppliedRevision    int        `gorm:"index:idx_group_comment_sync_revision,priority:2" json:"applied_revision"`
+	DesiredDeleted     bool       `json:"desired_deleted"`
+	GitHubCommentID    *int64     `gorm:"column:github_comment_id;index" json:"github_comment_id,omitempty"`
+	CommentBodyHash    string     `json:"comment_body_hash"`
+	LastSyncedAt       *time.Time `json:"last_synced_at,omitempty"`
+	LastErrorKind      string     `json:"last_error_kind"`
+	LastError          string     `json:"last_error"`
+	LastErrorAt        *time.Time `json:"last_error_at,omitempty"`
+	CreatedAt          time.Time  `json:"created_at"`
+	UpdatedAt          time.Time  `gorm:"index:idx_group_comment_sync_repo_updated,priority:2,sort:desc" json:"updated_at"`
+}

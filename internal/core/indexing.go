@@ -499,6 +499,9 @@ func (i *Indexer) markJobFailed(ctx context.Context, jobID uint, failure error) 
 }
 
 func (s *Service) enqueueRebuildsTx(tx *gorm.DB, repository database.RepositoryProjection, target targetRef, sourceUpdatedAt time.Time) error {
+	if s.dispatcher != nil {
+		return s.dispatcher.EnqueueRebuildsTx(tx, repository, target, sourceUpdatedAt)
+	}
 	for _, kind := range []string{"search_document_rebuild", "embedding_rebuild"} {
 		var existing database.IndexJob
 		err := tx.Where("kind = ? AND github_repository_id = ? AND target_type = ? AND target_key = ? AND status IN ?", kind, repository.GitHubRepositoryID, target.TargetType, target.TargetKey, []string{"pending", "processing"}).First(&existing).Error

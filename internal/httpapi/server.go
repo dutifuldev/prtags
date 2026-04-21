@@ -61,6 +61,7 @@ func (s *Server) registerRoutes() {
 	s.echo.PATCH("/v1/groups/:id", s.handleUpdateGroup)
 	s.echo.POST("/v1/groups/:id/members", s.handleAddGroupMember)
 	s.echo.DELETE("/v1/groups/:id/members/:member_id", s.handleRemoveGroupMember)
+	s.echo.POST("/v1/groups/:id/sync-comments", s.handleSyncGroupComments)
 
 	s.echo.POST("/v1/repos/:owner/:repo/pulls/:number/annotations", s.handleSetPullRequestAnnotations)
 	s.echo.GET("/v1/repos/:owner/:repo/pulls/:number/annotations", s.handleGetPullRequestAnnotations)
@@ -218,6 +219,14 @@ func (s *Server) handleRemoveGroupMember(c echo.Context) error {
 		return s.renderError(c, err)
 	}
 	return c.JSON(http.StatusOK, jsend.Success(map[string]any{"removed": true}))
+}
+
+func (s *Server) handleSyncGroupComments(c echo.Context) error {
+	result, err := s.service.SyncGroupComments(c.Request().Context(), s.actorFromRequest(c), c.Param("id"))
+	if err != nil {
+		return s.renderError(c, err)
+	}
+	return c.JSON(http.StatusOK, jsend.Success(result))
 }
 
 func (s *Server) handleSetPullRequestAnnotations(c echo.Context) error {

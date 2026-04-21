@@ -40,10 +40,12 @@ func (e *FailError) Error() string {
 }
 
 type Service struct {
-	db         *gorm.DB
-	ghreplica  *ghreplica.Client
-	permission permissions.Checker
-	indexer    *Indexer
+	db          *gorm.DB
+	ghreplica   *ghreplica.Client
+	permission  permissions.Checker
+	indexer     *Indexer
+	dispatcher  JobDispatcher
+	commentSync *CommentSyncService
 }
 
 type FieldDefinitionInput struct {
@@ -146,6 +148,14 @@ func NewService(db *gorm.DB, gh *ghreplica.Client, checker permissions.Checker, 
 		permission: checker,
 		indexer:    indexer,
 	}
+}
+
+func (s *Service) SetJobDispatcher(dispatcher JobDispatcher) {
+	s.dispatcher = dispatcher
+}
+
+func (s *Service) SetCommentSync(commentSync *CommentSyncService) {
+	s.commentSync = commentSync
 }
 
 func (s *Service) EnsureRepository(ctx context.Context, owner, repo string) (database.RepositoryProjection, error) {
@@ -969,6 +979,25 @@ func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor
 	})
 }
 
+func (s *Service) SyncGroupComments(ctx context.Context, actor permissions.Actor, groupPublicID string) (GroupCommentSyncResult, error) {
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
+		return GroupCommentSyncResult{}, translateDBError(err)
+	}
+	repository := database.RepositoryProjection{
+		GitHubRepositoryID: group.GitHubRepositoryID,
+		Owner:              group.RepositoryOwner,
+		Name:               group.RepositoryName,
+	}
+	if err := s.requireWrite(ctx, actor, repository); err != nil {
+		return GroupCommentSyncResult{}, err
+	}
+	if s.commentSync == nil {
+		return GroupCommentSyncResult{}, &FailError{StatusCode: 503, Message: "github comment sync is not configured"}
+	}
+	return s.commentSync.TriggerGroupSync(ctx, groupPublicID)
+}
+
 func (s *Service) SetAnnotations(ctx context.Context, actor permissions.Actor, owner, repo, targetType string, objectNumber int, groupID *uint, values map[string]any, idempotencyKey string) (AnnotationSetResult, error) {
 	repository, err := s.EnsureRepository(ctx, owner, repo)
 	if err != nil {
@@ -1459,6 +1488,27 @@ func (s *Service) enqueueTargetProjectionRefreshJobsTx(tx *gorm.DB, group databa
 }
 
 func (s *Service) enqueueTargetProjectionRefreshJobsDB(db *gorm.DB, group database.Group, targets []targetRef) error {
+	if s.dispatcher != nil {
+		seen := make(map[string]struct{}, len(targets))
+		for _, target := range targets {
+			if target.TargetType != "pull_request" && target.TargetType != "issue" {
+				continue
+			}
+			if target.TargetKey == "" {
+				continue
+			}
+			dedupeKey := target.TargetType + ":" + target.TargetKey
+			if _, ok := seen[dedupeKey]; ok {
+				continue
+			}
+			seen[dedupeKey] = struct{}{}
+			if err := s.dispatcher.EnqueueTargetProjectionRefreshTx(db, group, target); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
 	now := time.Now().UTC()
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
@@ -1653,6 +1703,11 @@ refs:
 			RefType: ref.Type,
 			RefKey:  ref.Key,
 		}).Error; err != nil {
+			return err
+		}
+	}
+	if s.dispatcher != nil && input.AggregateType == "group" {
+		if err := s.dispatcher.EnqueueGroupCommentProjectTx(tx, event.ID); err != nil {
 			return err
 		}
 	}

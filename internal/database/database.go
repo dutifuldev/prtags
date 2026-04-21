@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/riverqueue/river/riverdriver/riverdatabasesql"
+	"github.com/riverqueue/river/rivermigrate"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -97,6 +99,14 @@ func RunMigrations(db *gorm.DB) error {
 		if _, err := sqlDB.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES ($1)`, version); err != nil {
 			return err
 		}
+	}
+
+	migrator, err := rivermigrate.New(riverdatabasesql.New(sqlDB), nil)
+	if err != nil {
+		return err
+	}
+	if _, err := migrator.Migrate(ctx, rivermigrate.DirectionUp, nil); err != nil {
+		return fmt.Errorf("apply river migrations: %w", err)
 	}
 
 	return nil

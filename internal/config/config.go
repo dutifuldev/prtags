@@ -9,24 +9,34 @@ import (
 )
 
 type Config struct {
-	ListenAddr         string
-	DatabaseURL        string
-	GHReplicaBaseURL   string
-	AllowUnauthWrites  bool
-	EnableWorker       bool
-	WorkerPollInterval time.Duration
-	EmbeddingModel     string
+	ListenAddr              string
+	DatabaseURL             string
+	GHReplicaBaseURL        string
+	GitHubBaseURL           string
+	GitHubAppID             string
+	GitHubInstallationID    string
+	GitHubAppPrivateKeyPEM  string
+	GitHubAppPrivateKeyPath string
+	AllowUnauthWrites       bool
+	EnableWorker            bool
+	WorkerPollInterval      time.Duration
+	EmbeddingModel          string
 }
 
 func FromEnv() Config {
 	cfg := Config{
-		ListenAddr:         envOrDefault("LISTEN_ADDR", ":8081"),
-		DatabaseURL:        strings.TrimSpace(os.Getenv("DATABASE_URL")),
-		GHReplicaBaseURL:   envOrDefault("GHREPLICA_BASE_URL", "https://ghreplica.dutiful.dev"),
-		AllowUnauthWrites:  envBool("ALLOW_UNAUTH_WRITES", false),
-		EnableWorker:       envBool("ENABLE_BACKGROUND_WORKER", true),
-		WorkerPollInterval: envDuration("WORKER_POLL_INTERVAL", 2*time.Second),
-		EmbeddingModel:     envOrDefault("EMBEDDING_MODEL", "local-hash@1"),
+		ListenAddr:              envOrDefault("LISTEN_ADDR", ":8081"),
+		DatabaseURL:             strings.TrimSpace(os.Getenv("DATABASE_URL")),
+		GHReplicaBaseURL:        envOrDefault("GHREPLICA_BASE_URL", "https://ghreplica.dutiful.dev"),
+		GitHubBaseURL:           envOrDefault("GITHUB_BASE_URL", "https://api.github.com"),
+		GitHubAppID:             strings.TrimSpace(os.Getenv("GITHUB_APP_ID")),
+		GitHubInstallationID:    strings.TrimSpace(os.Getenv("GITHUB_APP_INSTALLATION_ID")),
+		GitHubAppPrivateKeyPEM:  strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY_PEM")),
+		GitHubAppPrivateKeyPath: strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY_PATH")),
+		AllowUnauthWrites:       envBool("ALLOW_UNAUTH_WRITES", false),
+		EnableWorker:            envBool("ENABLE_BACKGROUND_WORKER", true),
+		WorkerPollInterval:      envDuration("WORKER_POLL_INTERVAL", 2*time.Second),
+		EmbeddingModel:          envOrDefault("EMBEDDING_MODEL", "local-hash@1"),
 	}
 	return cfg
 }
@@ -44,7 +54,28 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.EmbeddingModel) == "" {
 		return errors.New("EMBEDDING_MODEL is required")
 	}
+	hasAnyGitHubAppValue := strings.TrimSpace(c.GitHubAppID) != "" ||
+		strings.TrimSpace(c.GitHubInstallationID) != "" ||
+		strings.TrimSpace(c.GitHubAppPrivateKeyPEM) != "" ||
+		strings.TrimSpace(c.GitHubAppPrivateKeyPath) != ""
+	if hasAnyGitHubAppValue {
+		if strings.TrimSpace(c.GitHubAppID) == "" {
+			return errors.New("GITHUB_APP_ID is required when GitHub App auth is configured")
+		}
+		if strings.TrimSpace(c.GitHubInstallationID) == "" {
+			return errors.New("GITHUB_APP_INSTALLATION_ID is required when GitHub App auth is configured")
+		}
+		if strings.TrimSpace(c.GitHubAppPrivateKeyPEM) == "" && strings.TrimSpace(c.GitHubAppPrivateKeyPath) == "" {
+			return errors.New("GITHUB_APP_PRIVATE_KEY_PEM or GITHUB_APP_PRIVATE_KEY_PATH is required when GitHub App auth is configured")
+		}
+	}
 	return nil
+}
+
+func (c Config) HasGitHubApp() bool {
+	return strings.TrimSpace(c.GitHubAppID) != "" &&
+		strings.TrimSpace(c.GitHubInstallationID) != "" &&
+		(strings.TrimSpace(c.GitHubAppPrivateKeyPEM) != "" || strings.TrimSpace(c.GitHubAppPrivateKeyPath) != "")
 }
 
 func envOrDefault(key, fallback string) string {

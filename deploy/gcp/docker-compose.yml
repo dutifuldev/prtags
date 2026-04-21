@@ -4,10 +4,17 @@ services:
       context: ../..
       dockerfile: Dockerfile
     command: ["serve"]
+    volumes:
+      - /home/bob/prtags/secrets:/home/bob/prtags/secrets:ro
     environment:
       LISTEN_ADDR: ":8081"
       DATABASE_URL: "postgres://${DB_IAM_USER_URLENCODED}@cloudsql-proxy:5432/${DB_NAME}?sslmode=disable"
       GHREPLICA_BASE_URL: "${GHREPLICA_BASE_URL:-https://ghreplica.dutiful.dev}"
+      GITHUB_BASE_URL: "${GITHUB_BASE_URL:-https://api.github.com}"
+      GITHUB_APP_ID: "${GITHUB_APP_ID:-}"
+      GITHUB_APP_INSTALLATION_ID: "${GITHUB_APP_INSTALLATION_ID:-}"
+      GITHUB_APP_PRIVATE_KEY_PATH: "${GITHUB_APP_PRIVATE_KEY_PATH:-}"
+      GITHUB_APP_PRIVATE_KEY_PEM: "${GITHUB_APP_PRIVATE_KEY_PEM:-}"
       ALLOW_UNAUTH_WRITES: "${ALLOW_UNAUTH_WRITES:-false}"
       ENABLE_BACKGROUND_WORKER: "${ENABLE_BACKGROUND_WORKER:-true}"
       WORKER_POLL_INTERVAL: "${WORKER_POLL_INTERVAL:-2s}"

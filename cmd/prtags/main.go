@@ -18,6 +18,7 @@ import (
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
 	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
+	"github.com/dutifuldev/prtags/internal/githubapi"
 	"github.com/dutifuldev/prtags/internal/httpapi"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/spf13/cobra"
@@ -203,15 +204,43 @@ func newServeCommand() *cobra.Command {
 			ghClient := ghreplica.NewClient(cfg.GHReplicaBaseURL)
 			indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
 			service := core.NewService(db, ghClient, checker, indexer)
+			var commentSync *core.CommentSyncService
+			if cfg.HasGitHubApp() {
+				commentSync = core.NewCommentSyncService(db, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
+					AppID:          cfg.GitHubAppID,
+					InstallationID: cfg.GitHubInstallationID,
+					PrivateKeyPEM:  cfg.GitHubAppPrivateKeyPEM,
+					PrivateKeyPath: cfg.GitHubAppPrivateKeyPath,
+				}), nil)
+			}
+			sqlDB, err := db.DB()
+			if err != nil {
+				return err
+			}
+			dispatcher, err := core.NewRiverDispatcher(sqlDB, indexer, commentSync)
+			if err != nil {
+				return err
+			}
+			service.SetJobDispatcher(dispatcher)
+			service.SetCommentSync(commentSync)
+			if commentSync != nil {
+				commentSync.SetDispatcher(dispatcher)
+			}
 			server := httpapi.NewServer(db, service, cfg.AllowUnauthWrites)
 
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
+			if err := dispatcher.ImportLegacyIndexJobs(ctx, db); err != nil {
+				return err
+			}
 			if cfg.EnableWorker {
-				go indexer.Start(ctx, cfg.WorkerPollInterval)
+				if err := dispatcher.Start(ctx); err != nil {
+					return err
+				}
 			}
 			go func() {
 				<-ctx.Done()
+				_ = dispatcher.Stop(context.Background())
 				_ = server.Echo().Shutdown(context.Background())
 			}()
 			return server.Echo().Start(cfg.ListenAddr)
@@ -222,11 +251,11 @@ func newServeCommand() *cobra.Command {
 func newWorkerCommand() *cobra.Command {
 	worker := &cobra.Command{
 		Use:   "worker",
-		Short: "Run index workers",
+		Short: "Run River workers",
 	}
 	worker.AddCommand(&cobra.Command{
-		Use:   "run-once",
-		Short: "Process one pending index job",
+		Use:   "run",
+		Short: "Run background workers",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := config.FromEnv()
 			if err := cfg.Validate(); err != nil {
@@ -243,7 +272,34 @@ func newWorkerCommand() *cobra.Command {
 				return err
 			}
 			indexer := core.NewIndexer(db, ghreplica.NewClient(cfg.GHReplicaBaseURL), embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
-			return indexer.RunOnce(context.Background())
+			var commentSync *core.CommentSyncService
+			if cfg.HasGitHubApp() {
+				commentSync = core.NewCommentSyncService(db, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
+					AppID:          cfg.GitHubAppID,
+					InstallationID: cfg.GitHubInstallationID,
+					PrivateKeyPEM:  cfg.GitHubAppPrivateKeyPEM,
+					PrivateKeyPath: cfg.GitHubAppPrivateKeyPath,
+				}), nil)
+			}
+			sqlDB, err := db.DB()
+			if err != nil {
+				return err
+			}
+			dispatcher, err := core.NewRiverDispatcher(sqlDB, indexer, commentSync)
+			if err != nil {
+				return err
+			}
+			if commentSync != nil {
+				commentSync.SetDispatcher(dispatcher)
+			}
+			if err := dispatcher.ImportLegacyIndexJobs(cmd.Context(), db); err != nil {
+				return err
+			}
+			if err := dispatcher.Start(cmd.Context()); err != nil {
+				return err
+			}
+			<-cmd.Context().Done()
+			return dispatcher.Stop(context.Background())
 		},
 	})
 	return worker
@@ -631,7 +687,15 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 		},
 	}
 
-	groups.AddCommand(create, list, get, update, addPR, addIssue)
+	syncComments := &cobra.Command{
+		Use:  "sync-comments <group-id>",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/sync-comments", nil)
+		},
+	}
+
+	groups.AddCommand(create, list, get, update, addPR, addIssue, syncComments)
 	return groups
 }
 
