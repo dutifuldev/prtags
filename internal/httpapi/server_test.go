@@ -219,20 +219,34 @@ func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 func TestAPIListGroupCommentSyncTargets(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := ghreplica.NewClient("http://127.0.0.1:1")
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
 
-	groupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
-		"kind":  "mixed",
-		"title": "Auth reliability",
-	}, http.StatusCreated)
-	groupID := extractPathString(t, groupRaw, "data.id")
+	repository := database.RepositoryProjection{
+		GitHubRepositoryID: 101,
+		Owner:              "acme",
+		Name:               "widgets",
+		FullName:           "acme/widgets",
+		HTMLURL:            "https://github.com/acme/widgets",
+		FetchedAt:          time.Now().UTC(),
+	}
+	require.NoError(t, db.WithContext(ctx).Create(&repository).Error)
 
-	var group database.Group
-	require.NoError(t, db.WithContext(ctx).Where("public_id = ?", groupID).First(&group).Error)
+	group := database.Group{
+		PublicID:           "steady-otter-k4m2",
+		GitHubRepositoryID: repository.GitHubRepositoryID,
+		RepositoryOwner:    repository.Owner,
+		RepositoryName:     repository.Name,
+		Kind:               "mixed",
+		Title:              "Auth reliability",
+		Status:             "open",
+		CreatedBy:          "tester",
+		UpdatedBy:          "tester",
+		RowVersion:         1,
+	}
+	require.NoError(t, db.WithContext(ctx).Create(&group).Error)
 	require.NoError(t, db.WithContext(ctx).Create(&database.GroupCommentSyncTarget{
 		GitHubRepositoryID: group.GitHubRepositoryID,
 		GroupID:            group.ID,
@@ -247,7 +261,7 @@ func TestAPIListGroupCommentSyncTargets(t *testing.T) {
 	}).Error)
 
 	raw := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/group-comment-sync-targets", nil, http.StatusOK)
-	require.Contains(t, raw, `"group_id":"`+groupID+`"`)
+	require.Contains(t, raw, `"group_id":"`+group.PublicID+`"`)
 	require.Contains(t, raw, `"group_title":"Auth reliability"`)
 	require.Contains(t, raw, `"object_type":"pull_request"`)
 	require.Contains(t, raw, `"object_number":22`)
