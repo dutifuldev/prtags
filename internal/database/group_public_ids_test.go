@@ -18,16 +18,7 @@ func TestEnsureGroupPublicIDsBackfillsRelatedKeys(t *testing.T) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(
-		&Group{},
-		&FieldDefinition{},
-		&FieldValue{},
-		&Event{},
-		&EventRef{},
-		&SearchDocument{},
-		&Embedding{},
-		&IndexJob{},
-	))
+	require.NoError(t, ApplyTestSchema(db))
 
 	group := Group{
 		GitHubRepositoryID: 101,

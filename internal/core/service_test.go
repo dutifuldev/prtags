@@ -504,20 +504,7 @@ func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, behavior batchBehav
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(
-		&database.RepositoryProjection{},
-		&database.RepositoryAccessGrant{},
-		&database.TargetProjection{},
-		&database.Group{},
-		&database.GroupMember{},
-		&database.FieldDefinition{},
-		&database.FieldValue{},
-		&database.Event{},
-		&database.EventRef{},
-		&database.SearchDocument{},
-		&database.Embedding{},
-		&database.IndexJob{},
-	))
+	require.NoError(t, database.ApplyTestSchema(db))
 
 	server := newTestGHReplicaServer(t, behavior)
 
