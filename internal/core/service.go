@@ -1015,9 +1015,9 @@ func (s *Service) SyncGroupComments(ctx context.Context, actor permissions.Actor
 }
 
 func (s *Service) ListGroupCommentSyncTargets(ctx context.Context, actor permissions.Actor, owner, repo string) ([]GroupCommentSyncTargetStatusView, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.lookupRepositoryProjection(ctx, owner, repo)
 	if err != nil {
-		return nil, err
+		return nil, translateDBError(err)
 	}
 	if err := s.requireWrite(ctx, actor, repository); err != nil {
 		return nil, err
@@ -1068,6 +1068,14 @@ func (s *Service) ListGroupCommentSyncTargets(ctx context.Context, actor permiss
 		})
 	}
 	return views, nil
+}
+
+func (s *Service) lookupRepositoryProjection(ctx context.Context, owner, repo string) (database.RepositoryProjection, error) {
+	var repository database.RepositoryProjection
+	err := s.db.WithContext(ctx).
+		Where("owner = ? AND name = ?", strings.TrimSpace(owner), strings.TrimSpace(repo)).
+		First(&repository).Error
+	return repository, err
 }
 
 func (s *Service) SetAnnotations(ctx context.Context, actor permissions.Actor, owner, repo, targetType string, objectNumber int, groupID *uint, values map[string]any, idempotencyKey string) (AnnotationSetResult, error) {
