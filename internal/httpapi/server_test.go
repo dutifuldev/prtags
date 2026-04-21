@@ -275,21 +275,7 @@ func openTestDB(t *testing.T) *gorm.DB {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(
-		&database.RepositoryProjection{},
-		&database.RepositoryAccessGrant{},
-		&database.TargetProjection{},
-		&database.Group{},
-		&database.GroupMember{},
-		&database.GroupCommentSyncTarget{},
-		&database.FieldDefinition{},
-		&database.FieldValue{},
-		&database.Event{},
-		&database.EventRef{},
-		&database.SearchDocument{},
-		&database.Embedding{},
-		&database.IndexJob{},
-	))
+	require.NoError(t, database.ApplyTestSchema(db))
 	return db
 }
 

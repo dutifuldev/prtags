@@ -367,12 +367,7 @@ func openCommentSyncTestDB(t *testing.T) *gorm.DB {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(
-		&database.Group{},
-		&database.GroupMember{},
-		&database.TargetProjection{},
-		&database.GroupCommentSyncTarget{},
-	))
+	require.NoError(t, database.ApplyTestSchema(db))
 	return db
 }
 

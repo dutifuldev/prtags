@@ -20,7 +20,7 @@ func TestRecoverStaleJobsRequeuesExpiredProcessingJobs(t *testing.T) {
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&database.IndexJob{}))
+	require.NoError(t, database.ApplyTestSchema(db))
 
 	stale := time.Now().UTC().Add(-10 * time.Minute)
 	require.NoError(t, db.Create(&database.IndexJob{
