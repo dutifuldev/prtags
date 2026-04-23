@@ -5,3 +5,4 @@ deploy/gcp/prtags.env
 deploy/gcp/github-oauth.env
 deploy/gcp/github-app.env
 deploy/gcp/github-app.private-key.pem
+cover.out

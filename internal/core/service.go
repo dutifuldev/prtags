@@ -2229,13 +2229,6 @@ func intValueOrZero(value *int) int {
 	return *value
 }
 
-func uintValueOrZero(value *uint) uint {
-	if value == nil {
-		return 0
-	}
-	return *value
-}
-
 func (s *Service) lookupGroupByID(ctx context.Context, groupID uint) (database.Group, error) {
 	var group database.Group
 	err := s.db.WithContext(ctx).First(&group, groupID).Error
@@ -2324,7 +2317,7 @@ func lockEventAggregateTx(tx *gorm.DB, aggregateType string, aggregateKey string
 	if tx == nil || tx.Dialector == nil {
 		return nil
 	}
-	if tx.Dialector.Name() != "postgres" {
+	if tx.Name() != "postgres" {
 		return nil
 	}
 	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))", aggregateType, aggregateKey).Error

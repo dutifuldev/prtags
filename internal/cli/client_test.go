@@ -13,7 +13,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func isolateClientAuthEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GITHUB_TOKEN", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("PRTAGS_GITHUB_TOKEN", "")
+	t.Setenv("PRTAGS_ACTOR", "")
+	t.Setenv("X_ACTOR", "")
+	t.Setenv("PRTAGS_CONFIG_DIR", t.TempDir())
+}
+
 func TestClientDoJSONAddsAuthorizationHeader(t *testing.T) {
+	isolateClientAuthEnv(t)
 	t.Setenv("GH_TOKEN", "token-123")
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -29,6 +40,7 @@ func TestClientDoJSONAddsAuthorizationHeader(t *testing.T) {
 }
 
 func TestClientDoJSONAddsActorHeaderWhenTokenMissing(t *testing.T) {
+	isolateClientAuthEnv(t)
 	t.Setenv("PRTAGS_ACTOR", "local-dev")
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -45,6 +57,7 @@ func TestClientDoJSONAddsActorHeaderWhenTokenMissing(t *testing.T) {
 }
 
 func TestClientUsesStoredTokenBeforeGenericEnvToken(t *testing.T) {
+	isolateClientAuthEnv(t)
 	tempDir := t.TempDir()
 	t.Setenv("PRTAGS_CONFIG_DIR", tempDir)
 	t.Setenv("GH_TOKEN", "env-token")
@@ -72,6 +85,7 @@ func TestClientUsesStoredTokenBeforeGenericEnvToken(t *testing.T) {
 }
 
 func TestClientPrefersExplicitPRTagsTokenOverStoredToken(t *testing.T) {
+	isolateClientAuthEnv(t)
 	tempDir := t.TempDir()
 	t.Setenv("PRTAGS_CONFIG_DIR", tempDir)
 	t.Setenv("PRTAGS_GITHUB_TOKEN", "explicit-token")

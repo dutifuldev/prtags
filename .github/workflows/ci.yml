@@ -32,7 +32,7 @@ jobs:
         run: npx --yes @simpledoc/simpledoc@0.1.6 check
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -69,6 +69,28 @@ jobs:
       - name: Run tests
         if: steps.go-files.outputs.present == 'true'
         run: go test ./...
+
+      - name: Check coverage floor
+        if: steps.go-files.outputs.present == 'true'
+        run: ./scripts/check-go-coverage.sh
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11
+          args: --timeout=5m
 
       - name: Build release artifacts in snapshot mode
         uses: goreleaser/goreleaser-action@v6

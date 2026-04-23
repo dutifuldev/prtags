@@ -87,8 +87,8 @@ func newAuthCommand() *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(cmd.OutOrStdout(), "Open %s and enter code %s\n", device.VerificationURI, device.UserCode)
-			fmt.Fprintln(cmd.OutOrStdout(), "Waiting for GitHub authorization...")
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Open %s and enter code %s\n", device.VerificationURI, device.UserCode)
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Waiting for GitHub authorization...")
 
 			token, err := cfg.PollAccessToken(
 				ctx,
@@ -123,9 +123,9 @@ func newAuthCommand() *cobra.Command {
 			if scopes == "" {
 				scopes = cfg.Scope
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", viewer.Login)
-			fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", scopes)
-			fmt.Fprintf(cmd.OutOrStdout(), "Saved token to %s\n", path)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", viewer.Login)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", scopes)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Saved token to %s\n", path)
 			return nil
 		},
 	}
@@ -139,7 +139,7 @@ func newAuthCommand() *cobra.Command {
 			token, err := auth.LoadStoredToken()
 			if err != nil {
 				if os.IsNotExist(err) {
-					fmt.Fprintln(cmd.OutOrStdout(), "Not logged in.")
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Not logged in.")
 					return nil
 				}
 				return err
@@ -148,9 +148,9 @@ func newAuthCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", token.UserLogin)
-			fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", token.Scope)
-			fmt.Fprintf(cmd.OutOrStdout(), "Token file: %s\n", path)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", token.UserLogin)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", token.Scope)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token file: %s\n", path)
 			return nil
 		},
 	}
@@ -166,7 +166,7 @@ func newAuthCommand() *cobra.Command {
 			if err := auth.DeleteStoredToken(); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Removed stored token at %s\n", path)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed stored token at %s\n", path)
 			return nil
 		},
 	}

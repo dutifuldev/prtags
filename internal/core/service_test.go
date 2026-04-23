@@ -576,10 +576,6 @@ func newTestServiceWithChecker(t *testing.T, checker permissions.Checker) (*Serv
 	return newTestServiceWithBatchBehaviorAndChecker(t, batchBehavior{}, checker)
 }
 
-func newTestServiceWithBatchFailure(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
-	return newTestServiceWithBatchOptions(t, batchBehavior{fail: true})
-}
-
 func newTestServiceWithBatchOptions(t *testing.T, behavior batchBehavior) (*Service, *gorm.DB, *httptest.Server) {
 	return newTestServiceWithBatchBehaviorAndChecker(t, behavior, permissions.AllowAllChecker{})
 }

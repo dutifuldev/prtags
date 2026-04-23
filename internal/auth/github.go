@@ -184,7 +184,9 @@ func (c Config) GetViewer(ctx context.Context, accessToken string) (Viewer, erro
 	if err != nil {
 		return Viewer{}, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -286,7 +288,9 @@ func (c Config) postFormJSON(ctx context.Context, endpoint string, form url.Valu
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

@@ -68,7 +68,9 @@ func (s *Service) SearchText(ctx context.Context, owner, repo, query string, tar
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	results := []TextSearchResult{}
 	for rows.Next() {
@@ -121,7 +123,9 @@ func (s *Service) SearchSimilar(ctx context.Context, owner, repo, query string, 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() {
+		_ = rows.Close()
+	}()
 
 	results := []TextSearchResult{}
 	for rows.Next() {
