@@ -111,6 +111,26 @@ awk -v total="$total" 'BEGIN { exit !(total == 100.0) }'
 
 That style is conventional, and it is the model `prtags` uses in CI.
 
+### Coverage targets
+
+The quality goal is high coverage on the code that carries product and
+operational risk.
+
+- Strong repo-wide target: `80%+`
+
+For `prtags`, the goal is not blind `100%` coverage across the whole repo.
+
+Preferred long-term package targets:
+
+- `internal/core`: `90%+`
+- `internal/httpapi`: `85%+`
+- `internal/githubapi`: `80%+`
+- `internal/ghreplica`: `80%+`
+- small utility packages: near `100%` when practical
+
+Coverage should be raised deliberately, package by package, with useful tests.
+Do not add low-value tests only to move the total percentage.
+
 ## Formatting and lint-like checks
 
 The current local baseline before opening or merging a PR is:
@@ -210,6 +230,16 @@ The initial enforced complexity linters are:
 - `gocognit` for cognitive complexity
 
 That is a better first step than introducing a hard CRAP metric gate.
+
+### Complexity targets
+
+Aim for:
+
+- `cyclop: 10`
+- `gocognit: 15`
+
+The ideal target should be treated as a design goal, not a reason to
+over-factor otherwise clear code into too many tiny helpers.
 
 ## Practical expectations
 
