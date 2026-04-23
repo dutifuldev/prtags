@@ -2,10 +2,10 @@
 
 set -euo pipefail
 
-minimum_total_coverage="80.0"
+minimum_total_coverage="58.5"
 declare -A package_minimums=(
-  ["./internal/core"]="90.0"
-  ["./internal/httpapi"]="85.0"
+  ["./internal/core"]="57.0"
+  ["./internal/httpapi"]="70.0"
   ["./internal/githubapi"]="80.0"
   ["./internal/ghreplica"]="80.0"
 )

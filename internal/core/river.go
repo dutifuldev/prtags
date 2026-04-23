@@ -342,37 +342,11 @@ func (d *RiverDispatcher) ImportLegacyIndexJobs(ctx context.Context, db *gorm.DB
 		}
 
 		for _, job := range jobs {
-			var insertErr error
-			switch job.Kind {
-			case indexJobKindTargetProjectionRefresh:
-				_, insertErr = d.client.InsertTx(ctx, sqlTx, TargetProjectionRefreshArgs{
-					RepositoryID: job.GitHubRepositoryID,
-					Owner:        job.RepositoryOwner,
-					Name:         job.RepositoryName,
-					TargetType:   job.TargetType,
-					TargetKey:    job.TargetKey,
-				}, &river.InsertOpts{Queue: queueTargetProjectionRefresh, UniqueOpts: uniqueActiveJobOpts()})
-			case "search_document_rebuild":
-				_, insertErr = d.client.InsertTx(ctx, sqlTx, SearchDocumentRebuildArgs{
-					RepositoryID: job.GitHubRepositoryID,
-					Owner:        job.RepositoryOwner,
-					Name:         job.RepositoryName,
-					TargetType:   job.TargetType,
-					TargetKey:    job.TargetKey,
-				}, &river.InsertOpts{Queue: queueSearchDocumentRebuild, UniqueOpts: uniqueActiveJobOpts()})
-			case "embedding_rebuild":
-				_, insertErr = d.client.InsertTx(ctx, sqlTx, EmbeddingRebuildArgs{
-					RepositoryID: job.GitHubRepositoryID,
-					Owner:        job.RepositoryOwner,
-					Name:         job.RepositoryName,
-					TargetType:   job.TargetType,
-					TargetKey:    job.TargetKey,
-				}, &river.InsertOpts{Queue: queueEmbeddingRebuild, UniqueOpts: uniqueActiveJobOpts()})
-			default:
-				continue
-			}
-			if insertErr != nil {
-				return insertErr
+			if err := d.importLegacyIndexJob(ctx, sqlTx, job); err != nil {
+				if errors.Is(err, errUnsupportedLegacyJobKind) {
+					continue
+				}
+				return err
 			}
 			if err := tx.Model(&database.IndexJob{}).
 				Where("id = ?", job.ID).
@@ -388,6 +362,42 @@ func (d *RiverDispatcher) ImportLegacyIndexJobs(ctx context.Context, db *gorm.DB
 		}
 		return nil
 	})
+}
+
+var errUnsupportedLegacyJobKind = errors.New("unsupported legacy job kind")
+
+func (d *RiverDispatcher) importLegacyIndexJob(ctx context.Context, sqlTx *sql.Tx, job database.IndexJob) error {
+	switch job.Kind {
+	case indexJobKindTargetProjectionRefresh:
+		_, err := d.client.InsertTx(ctx, sqlTx, TargetProjectionRefreshArgs{
+			RepositoryID: job.GitHubRepositoryID,
+			Owner:        job.RepositoryOwner,
+			Name:         job.RepositoryName,
+			TargetType:   job.TargetType,
+			TargetKey:    job.TargetKey,
+		}, &river.InsertOpts{Queue: queueTargetProjectionRefresh, UniqueOpts: uniqueActiveJobOpts()})
+		return err
+	case "search_document_rebuild":
+		_, err := d.client.InsertTx(ctx, sqlTx, SearchDocumentRebuildArgs{
+			RepositoryID: job.GitHubRepositoryID,
+			Owner:        job.RepositoryOwner,
+			Name:         job.RepositoryName,
+			TargetType:   job.TargetType,
+			TargetKey:    job.TargetKey,
+		}, &river.InsertOpts{Queue: queueSearchDocumentRebuild, UniqueOpts: uniqueActiveJobOpts()})
+		return err
+	case "embedding_rebuild":
+		_, err := d.client.InsertTx(ctx, sqlTx, EmbeddingRebuildArgs{
+			RepositoryID: job.GitHubRepositoryID,
+			Owner:        job.RepositoryOwner,
+			Name:         job.RepositoryName,
+			TargetType:   job.TargetType,
+			TargetKey:    job.TargetKey,
+		}, &river.InsertOpts{Queue: queueEmbeddingRebuild, UniqueOpts: uniqueActiveJobOpts()})
+		return err
+	default:
+		return errUnsupportedLegacyJobKind
+	}
 }
 
 func sqlTxFromGorm(tx *gorm.DB) (*sql.Tx, error) {

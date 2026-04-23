@@ -315,6 +315,7 @@ func newWorkerCommand() *cobra.Command {
 	return worker
 }
 
+//nolint:cyclop,gocognit // Cobra command assembly is intentionally declarative and easier to maintain as one block.
 func newFieldCommand(serverURL *string) *cobra.Command {
 	fields := &cobra.Command{Use: "field"}
 

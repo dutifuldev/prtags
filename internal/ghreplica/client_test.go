@@ -109,3 +109,35 @@ func TestDecodeBatchObjectSummaryRejectsUnsupportedType(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+func TestGetIssueAndPullRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/github/repos/openclaw/openclaw/issues/11":
+			_, _ = w.Write([]byte(`{"id":11,"number":11,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/11","user":{"login":"alice"}}`))
+		case "/v1/github/repos/openclaw/openclaw/pulls/22":
+			_, _ = w.Write([]byte(`{"id":22,"number":22,"title":"PR title","state":"open","html_url":"https://github.com/openclaw/openclaw/pull/22","user":{"login":"bob"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	issue, err := client.GetIssue(context.Background(), "openclaw", "openclaw", 11)
+	if err != nil {
+		t.Fatalf("GetIssue returned error: %v", err)
+	}
+	if issue.User.Login != "alice" {
+		t.Fatalf("expected issue author to decode, got %q", issue.User.Login)
+	}
+
+	pullRequest, err := client.GetPullRequest(context.Background(), "openclaw", "openclaw", 22)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pullRequest.User.Login != "bob" {
+		t.Fatalf("expected pr author to decode, got %q", pullRequest.User.Login)
+	}
+}

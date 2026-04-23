@@ -568,6 +568,147 @@ func TestDeleteRepositoryAccessGrantRemovesFallbackWrite(t *testing.T) {
 	require.ErrorIs(t, err, ErrForbidden)
 }
 
+func TestFieldLifecycleAndGroupUpdates(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	created, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "priority",
+		DisplayName:  "Priority",
+		ObjectScope:  "pull_request",
+		FieldType:    "enum",
+		EnumValues:   []string{"low", "high"},
+		IsFilterable: true,
+	}, "")
+	require.NoError(t, err)
+
+	fields, err := service.ListFieldDefinitions(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, fields, 1)
+	require.Equal(t, "priority", fields[0].Name)
+
+	updated, err := service.UpdateFieldDefinition(ctx, actor, "acme", "widgets", created.ID, FieldDefinitionPatchInput{
+		DisplayName:        stringPtr("Priority Score"),
+		ExpectedRowVersion: intPtr(1),
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "Priority Score", updated.DisplayName)
+	require.Equal(t, 2, updated.RowVersion)
+
+	archived, err := service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", created.ID, intPtr(2), "")
+	require.NoError(t, err)
+	require.NotNil(t, archived.ArchivedAt)
+	require.Equal(t, 3, archived.RowVersion)
+
+	exported, err := service.ExportManifest(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, exported.Fields, 1)
+	require.Equal(t, "priority", exported.Fields[0].Name)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:        "mixed",
+		Title:       "Original title",
+		Description: "first",
+	}, "")
+	require.NoError(t, err)
+
+	group, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{
+		Title:              stringPtr("Updated title"),
+		Description:        stringPtr("updated description"),
+		Status:             stringPtr("closed"),
+		ExpectedRowVersion: intPtr(1),
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "Updated title", group.Title)
+	require.Equal(t, "closed", group.Status)
+
+	_, err = service.SyncGroupComments(ctx, actor, group.PublicID)
+	require.Error(t, err)
+	var fail *FailError
+	require.ErrorAs(t, err, &fail)
+	require.Equal(t, 503, fail.StatusCode)
+	require.Equal(t, "github comment sync is not configured", fail.Message)
+}
+
+func TestGetAnnotationsForPullRequestIssueAndGroup(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "intent",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "severity",
+		ObjectScope: "issue",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "theme",
+		ObjectScope: "group",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "mixed",
+		Title: "Auth work",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"intent": "retry auth"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "issue", 11, nil, map[string]any{"severity": "critical"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "group", 0, &group.ID, map[string]any{"theme": "reliability"}, "")
+	require.NoError(t, err)
+
+	pullAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "pull_request", 22, nil)
+	require.NoError(t, err)
+	require.Equal(t, "retry auth", pullAnnotations.Annotations["intent"])
+
+	issueAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "issue", 11, nil)
+	require.NoError(t, err)
+	require.Equal(t, "critical", issueAnnotations.Annotations["severity"])
+
+	groupAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "group", 0, &group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "reliability", groupAnnotations.Annotations["theme"])
+}
+
+func TestListRepositoryAccessGrantsReturnsStoredGrants(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestServiceWithChecker(t, grantTestChecker{
+		allowed: false,
+		identity: permissions.Identity{
+			GitHubUserID: 1,
+			GitHubLogin:  "grantor",
+		},
+	})
+	defer server.Close()
+
+	_, err := service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{
+		GitHubUserID:          2,
+		GitHubLogin:           "writer",
+		Role:                  "writer",
+		GrantedByGitHubUserID: 1,
+		GrantedByGitHubLogin:  "grantor",
+	})
+	require.NoError(t, err)
+
+	grants, err := service.ListRepositoryAccessGrants(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, grants, 1)
+	require.Equal(t, "writer", grants[0].GitHubLogin)
+}
+
 func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
 	return newTestServiceWithBatchOptions(t, batchBehavior{})
 }
@@ -722,4 +863,12 @@ func drainIndexJobs(t *testing.T, ctx context.Context, db *gorm.DB, indexer *Ind
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("index jobs did not drain")
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func intPtr(value int) *int {
+	return &value
 }

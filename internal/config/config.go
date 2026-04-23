@@ -50,46 +50,16 @@ func FromEnv() Config {
 }
 
 func (c Config) Validate() error {
-	if c.DatabaseURL == "" {
-		return errors.New("DATABASE_URL is required")
+	validations := []func(Config) error{
+		validateDatabase,
+		validatePool,
+		validateReplicaAndWorker,
+		validateEmbedding,
+		validateGitHubApp,
 	}
-	if c.DBMaxOpenConns <= 0 {
-		return errors.New("DB_MAX_OPEN_CONNS must be positive")
-	}
-	if c.DBMaxIdleConns < 0 {
-		return errors.New("DB_MAX_IDLE_CONNS must be zero or positive")
-	}
-	if c.DBMaxIdleConns > c.DBMaxOpenConns {
-		return errors.New("DB_MAX_IDLE_CONNS cannot exceed DB_MAX_OPEN_CONNS")
-	}
-	if c.DBConnMaxIdleTime <= 0 {
-		return errors.New("DB_CONN_MAX_IDLE_TIME must be positive")
-	}
-	if c.DBConnMaxLifetime <= 0 {
-		return errors.New("DB_CONN_MAX_LIFETIME must be positive")
-	}
-	if strings.TrimSpace(c.GHReplicaBaseURL) == "" {
-		return errors.New("GHREPLICA_BASE_URL is required")
-	}
-	if c.WorkerPollInterval <= 0 {
-		return errors.New("WORKER_POLL_INTERVAL must be positive")
-	}
-	if strings.TrimSpace(c.EmbeddingModel) == "" {
-		return errors.New("EMBEDDING_MODEL is required")
-	}
-	hasAnyGitHubAppValue := strings.TrimSpace(c.GitHubAppID) != "" ||
-		strings.TrimSpace(c.GitHubInstallationID) != "" ||
-		strings.TrimSpace(c.GitHubAppPrivateKeyPEM) != "" ||
-		strings.TrimSpace(c.GitHubAppPrivateKeyPath) != ""
-	if hasAnyGitHubAppValue {
-		if strings.TrimSpace(c.GitHubAppID) == "" {
-			return errors.New("GITHUB_APP_ID is required when GitHub App auth is configured")
-		}
-		if strings.TrimSpace(c.GitHubInstallationID) == "" {
-			return errors.New("GITHUB_APP_INSTALLATION_ID is required when GitHub App auth is configured")
-		}
-		if strings.TrimSpace(c.GitHubAppPrivateKeyPEM) == "" && strings.TrimSpace(c.GitHubAppPrivateKeyPath) == "" {
-			return errors.New("GITHUB_APP_PRIVATE_KEY_PEM or GITHUB_APP_PRIVATE_KEY_PATH is required when GitHub App auth is configured")
+	for _, validate := range validations {
+		if err := validate(c); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -118,6 +88,70 @@ func envBool(key string, fallback bool) bool {
 		return fallback
 	}
 	return parsed
+}
+
+func validateDatabase(c Config) error {
+	if c.DatabaseURL == "" {
+		return errors.New("DATABASE_URL is required")
+	}
+	return nil
+}
+
+func validatePool(c Config) error {
+	switch {
+	case c.DBMaxOpenConns <= 0:
+		return errors.New("DB_MAX_OPEN_CONNS must be positive")
+	case c.DBMaxIdleConns < 0:
+		return errors.New("DB_MAX_IDLE_CONNS must be zero or positive")
+	case c.DBMaxIdleConns > c.DBMaxOpenConns:
+		return errors.New("DB_MAX_IDLE_CONNS cannot exceed DB_MAX_OPEN_CONNS")
+	case c.DBConnMaxIdleTime <= 0:
+		return errors.New("DB_CONN_MAX_IDLE_TIME must be positive")
+	case c.DBConnMaxLifetime <= 0:
+		return errors.New("DB_CONN_MAX_LIFETIME must be positive")
+	default:
+		return nil
+	}
+}
+
+func validateReplicaAndWorker(c Config) error {
+	if strings.TrimSpace(c.GHReplicaBaseURL) == "" {
+		return errors.New("GHREPLICA_BASE_URL is required")
+	}
+	if c.WorkerPollInterval <= 0 {
+		return errors.New("WORKER_POLL_INTERVAL must be positive")
+	}
+	return nil
+}
+
+func validateEmbedding(c Config) error {
+	if strings.TrimSpace(c.EmbeddingModel) == "" {
+		return errors.New("EMBEDDING_MODEL is required")
+	}
+	return nil
+}
+
+func validateGitHubApp(c Config) error {
+	if !hasAnyGitHubAppValue(c) {
+		return nil
+	}
+	switch {
+	case strings.TrimSpace(c.GitHubAppID) == "":
+		return errors.New("GITHUB_APP_ID is required when GitHub App auth is configured")
+	case strings.TrimSpace(c.GitHubInstallationID) == "":
+		return errors.New("GITHUB_APP_INSTALLATION_ID is required when GitHub App auth is configured")
+	case strings.TrimSpace(c.GitHubAppPrivateKeyPEM) == "" && strings.TrimSpace(c.GitHubAppPrivateKeyPath) == "":
+		return errors.New("GITHUB_APP_PRIVATE_KEY_PEM or GITHUB_APP_PRIVATE_KEY_PATH is required when GitHub App auth is configured")
+	default:
+		return nil
+	}
+}
+
+func hasAnyGitHubAppValue(c Config) bool {
+	return strings.TrimSpace(c.GitHubAppID) != "" ||
+		strings.TrimSpace(c.GitHubInstallationID) != "" ||
+		strings.TrimSpace(c.GitHubAppPrivateKeyPEM) != "" ||
+		strings.TrimSpace(c.GitHubAppPrivateKeyPath) != ""
 }
 
 func envInt(key string, fallback int) int {

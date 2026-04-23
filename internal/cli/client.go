@@ -43,28 +43,20 @@ func NewClient(baseURL string) *Client {
 }
 
 func (c *Client) DoJSON(ctx context.Context, method, path string, payload any) ([]byte, error) {
-	var body io.Reader
-	if payload != nil {
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		body = bytes.NewReader(raw)
+	body, hasPayload, err := jsonRequestBody(payload)
+	if err != nil {
+		return nil, err
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
 		return nil, err
 	}
-	if payload != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if strings.TrimSpace(c.authToken) != "" {
-		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(c.authToken))
-	} else if strings.TrimSpace(c.actorID) != "" {
-		req.Header.Set("X-Actor", strings.TrimSpace(c.actorID))
-	}
+	applyJSONHeaders(req, hasPayload, c.authToken, c.actorID)
+	return c.do(req)
+}
 
+func (c *Client) do(req *http.Request) ([]byte, error) {
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -81,6 +73,31 @@ func (c *Client) DoJSON(ctx context.Context, method, path string, payload any) (
 		return nil, fmt.Errorf("request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	return raw, nil
+}
+
+func jsonRequestBody(payload any) (io.Reader, bool, error) {
+	if payload == nil {
+		return nil, false, nil
+	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false, err
+	}
+	return bytes.NewReader(raw), true, nil
+}
+
+func applyJSONHeaders(req *http.Request, hasPayload bool, authToken, actorID string) {
+	if hasPayload {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if token := strings.TrimSpace(authToken); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+		return
+	}
+	if actor := strings.TrimSpace(actorID); actor != "" {
+		req.Header.Set("X-Actor", actor)
+	}
 }
 
 func ExtractJSendData(raw []byte) ([]byte, error) {

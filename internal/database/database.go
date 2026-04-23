@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -70,55 +71,22 @@ func RunMigrations(db *gorm.DB) error {
 	}
 
 	ctx := context.Background()
-	if _, err := sqlDB.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version TEXT PRIMARY KEY,
-			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)
-	`); err != nil {
+	if err := ensureSchemaMigrationsTable(ctx, sqlDB); err != nil {
 		return err
 	}
 
-	migrationsDir, err := migrationsDir()
+	dir, err := migrationsDir()
 	if err != nil {
 		return err
 	}
 
-	entries, err := os.ReadDir(migrationsDir)
+	versions, err := migrationVersions(dir)
 	if err != nil {
 		return err
 	}
 
-	versions := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".up.sql") {
-			continue
-		}
-		versions = append(versions, strings.TrimSuffix(name, ".up.sql"))
-	}
-	sort.Strings(versions)
-
-	for _, version := range versions {
-		var applied string
-		err := sqlDB.QueryRowContext(ctx, `SELECT version FROM schema_migrations WHERE version = $1`, version).Scan(&applied)
-		if err == nil {
-			continue
-		}
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-
-		contents, err := os.ReadFile(filepath.Join(migrationsDir, version+".up.sql"))
-		if err != nil {
-			return err
-		}
-		if _, err := sqlDB.ExecContext(ctx, string(contents)); err != nil {
-			return fmt.Errorf("apply migration %s: %w", version, err)
-		}
-		if _, err := sqlDB.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES ($1)`, version); err != nil {
-			return err
-		}
+	if err := applyPendingMigrations(ctx, sqlDB, dir, versions); err != nil {
+		return err
 	}
 
 	migrator, err := rivermigrate.New(riverdatabasesql.New(sqlDB), nil)
@@ -132,34 +100,25 @@ func RunMigrations(db *gorm.DB) error {
 	return nil
 }
 
+func applyPendingMigrations(ctx context.Context, sqlDB *sql.DB, dir string, versions []string) error {
+	for _, version := range versions {
+		applied, err := migrationApplied(ctx, sqlDB, version)
+		if err != nil {
+			return err
+		}
+		if applied {
+			continue
+		}
+		if err := applyMigration(ctx, sqlDB, dir, version); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func migrationsDir() (string, error) {
-	candidates := []string{}
-	if env := strings.TrimSpace(os.Getenv("PRTAGS_MIGRATIONS_DIR")); env != "" {
-		candidates = append(candidates, env)
-	}
-
-	if _, file, _, ok := runtime.Caller(0); ok {
-		candidates = append(candidates, filepath.Join(filepath.Dir(file), "..", "..", "migrations"))
-	}
-
-	if exe, err := os.Executable(); err == nil {
-		exeDir := filepath.Dir(exe)
-		candidates = append(candidates,
-			filepath.Join(exeDir, "migrations"),
-			filepath.Join(exeDir, "..", "migrations"),
-			filepath.Join(exeDir, "..", "..", "migrations"),
-		)
-	}
-
-	if wd, err := os.Getwd(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(wd, "migrations"),
-			filepath.Join(wd, "..", "migrations"),
-		)
-	}
-
 	seen := map[string]struct{}{}
-	for _, candidate := range candidates {
+	for _, candidate := range migrationDirCandidates() {
 		candidate = filepath.Clean(candidate)
 		if _, ok := seen[candidate]; ok {
 			continue
@@ -176,4 +135,81 @@ func migrationsDir() (string, error) {
 	}
 
 	return "", fmt.Errorf("migrations directory not found")
+}
+
+func ensureSchemaMigrationsTable(ctx context.Context, sqlDB *sql.DB) error {
+	_, err := sqlDB.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version TEXT PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`)
+	return err
+}
+
+func migrationVersions(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	versions := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".up.sql") {
+			continue
+		}
+		versions = append(versions, strings.TrimSuffix(name, ".up.sql"))
+	}
+	sort.Strings(versions)
+	return versions, nil
+}
+
+func migrationApplied(ctx context.Context, sqlDB *sql.DB, version string) (bool, error) {
+	var applied string
+	err := sqlDB.QueryRowContext(ctx, `SELECT version FROM schema_migrations WHERE version = $1`, version).Scan(&applied)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+func applyMigration(ctx context.Context, sqlDB *sql.DB, dir, version string) error {
+	contents, err := os.ReadFile(filepath.Join(dir, version+".up.sql"))
+	if err != nil {
+		return err
+	}
+	if _, err := sqlDB.ExecContext(ctx, string(contents)); err != nil {
+		return fmt.Errorf("apply migration %s: %w", version, err)
+	}
+	_, err = sqlDB.ExecContext(ctx, `INSERT INTO schema_migrations(version) VALUES ($1)`, version)
+	return err
+}
+
+func migrationDirCandidates() []string {
+	candidates := []string{}
+	if env := strings.TrimSpace(os.Getenv("PRTAGS_MIGRATIONS_DIR")); env != "" {
+		candidates = append(candidates, env)
+	}
+	if _, file, _, ok := runtime.Caller(0); ok {
+		candidates = append(candidates, filepath.Join(filepath.Dir(file), "..", "..", "migrations"))
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "migrations"),
+			filepath.Join(exeDir, "..", "migrations"),
+			filepath.Join(exeDir, "..", "..", "migrations"),
+		)
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates,
+			filepath.Join(wd, "migrations"),
+			filepath.Join(wd, "..", "migrations"),
+		)
+	}
+	return candidates
 }

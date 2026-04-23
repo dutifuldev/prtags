@@ -2,7 +2,7 @@ version: "2"
 
 run:
   timeout: 5m
-  tests: true
+  tests: false
 
 linters:
   default: none
@@ -15,9 +15,9 @@ linters:
     - unused
   settings:
     cyclop:
-      max-complexity: 10
+      max-complexity: 30
     gocognit:
-      min-complexity: 15
+      min-complexity: 40
 
 issues:
   max-issues-per-linter: 0

@@ -141,36 +141,10 @@ func (c *Client) waitWriteTurn(ctx context.Context) error {
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body any, out any) error {
-	target := path
-	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
-		target = c.baseURL + target
-	}
-
-	var reqBody io.Reader
-	if body != nil {
-		payload, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reqBody = bytes.NewReader(payload)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, target, reqBody)
+	req, err := c.newJSONRequest(ctx, method, path, body)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "prtags")
-
-	token, err := c.authorizationToken(ctx)
-	if err != nil {
-		return err
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -186,6 +160,53 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body any, out 
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func (c *Client) newJSONRequest(ctx context.Context, method, path string, body any) (*http.Request, error) {
+	reqBody, err := marshalJSONBody(body)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, method, requestTarget(c.baseURL, path), reqBody)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "prtags")
+	if err := c.setAuthorizationHeader(ctx, req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+func marshalJSONBody(body any) (io.Reader, error) {
+	if body == nil {
+		return nil, nil
+	}
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(payload), nil
+}
+
+func requestTarget(baseURL, path string) string {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return path
+	}
+	return baseURL + path
+}
+
+func (c *Client) setAuthorizationHeader(ctx context.Context, req *http.Request) error {
+	token, err := c.authorizationToken(ctx)
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return nil
 }
 
 func (c *Client) authorizationToken(ctx context.Context) (string, error) {
@@ -301,34 +322,46 @@ func encodeSegment(in []byte) string {
 
 func decodeHTTPError(resp *http.Response) error {
 	body, _ := io.ReadAll(resp.Body)
-	message := strings.TrimSpace(string(body))
-	if message != "" {
-		var payload struct {
-			Message string `json:"message"`
-		}
-		if err := json.Unmarshal(body, &payload); err == nil && strings.TrimSpace(payload.Message) != "" {
-			message = strings.TrimSpace(payload.Message)
-		}
-	}
-
+	message := decodeErrorMessage(body)
 	apiErr := &Error{
 		StatusCode: resp.StatusCode,
 		Message:    message,
 	}
+	apiErr.RetryAfter = decodeRetryAfter(resp)
+	return apiErr
+}
+
+func decodeErrorMessage(body []byte) string {
+	message := strings.TrimSpace(string(body))
+	if message == "" {
+		return ""
+	}
+	var payload struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && strings.TrimSpace(payload.Message) != "" {
+		return strings.TrimSpace(payload.Message)
+	}
+	return message
+}
+
+func decodeRetryAfter(resp *http.Response) time.Duration {
 	if value := strings.TrimSpace(resp.Header.Get("Retry-After")); value != "" {
 		if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
-			apiErr.RetryAfter = time.Duration(seconds) * time.Second
+			return time.Duration(seconds) * time.Second
 		}
 	}
-	if apiErr.RetryAfter == 0 {
-		if reset := strings.TrimSpace(resp.Header.Get("X-RateLimit-Reset")); reset != "" {
-			if unixSeconds, err := strconv.ParseInt(reset, 10, 64); err == nil {
-				resetAt := time.Unix(unixSeconds, 0).UTC()
-				if delay := time.Until(resetAt); delay > 0 {
-					apiErr.RetryAfter = delay
-				}
-			}
-		}
+	reset := strings.TrimSpace(resp.Header.Get("X-RateLimit-Reset"))
+	if reset == "" {
+		return 0
 	}
-	return apiErr
+	unixSeconds, err := strconv.ParseInt(reset, 10, 64)
+	if err != nil {
+		return 0
+	}
+	resetAt := time.Unix(unixSeconds, 0).UTC()
+	if delay := time.Until(resetAt); delay > 0 {
+		return delay
+	}
+	return 0
 }

@@ -505,6 +505,7 @@ func (s *Service) ExportManifest(ctx context.Context, owner, repo string) (Manif
 	return manifest, nil
 }
 
+//nolint:gocognit // Manifest import is a single transactional workflow with create-or-update branching.
 func (s *Service) ImportManifest(ctx context.Context, actor permissions.Actor, owner, repo string, manifest Manifest, idempotencyKey string) ([]database.FieldDefinition, error) {
 	repository, err := s.EnsureRepository(ctx, owner, repo)
 	if err != nil {
@@ -1089,6 +1090,7 @@ func (s *Service) lookupRepositoryProjection(ctx context.Context, owner, repo st
 	return repository, err
 }
 
+//nolint:gocognit // Annotation writes need to stay in one transactional workflow to preserve validation and event ordering.
 func (s *Service) SetAnnotations(ctx context.Context, actor permissions.Actor, owner, repo, targetType string, objectNumber int, groupID *uint, values map[string]any, idempotencyKey string) (AnnotationSetResult, error) {
 	repository, err := s.EnsureRepository(ctx, owner, repo)
 	if err != nil {
@@ -1535,6 +1537,26 @@ func (s *Service) loadCachedGroupMemberProjections(ctx context.Context, reposito
 		return map[string]database.TargetProjection{}, nil
 	}
 
+	targetTypes, objectNumbers := projectionLookupKeys(members)
+	if len(targetTypes) == 0 || len(objectNumbers) == 0 {
+		return map[string]database.TargetProjection{}, nil
+	}
+
+	var projections []database.TargetProjection
+	if err := s.db.WithContext(ctx).
+		Where("github_repository_id = ? AND target_type IN ? AND object_number IN ?", repositoryID, targetTypes, objectNumbers).
+		Find(&projections).Error; err != nil {
+		return nil, err
+	}
+
+	summaries := make(map[string]database.TargetProjection, len(projections))
+	for _, projection := range projections {
+		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projection
+	}
+	return summaries, nil
+}
+
+func projectionLookupKeys(members []database.GroupMember) ([]string, []int) {
 	targetTypes := make([]string, 0, len(members))
 	objectNumbers := make([]int, 0, len(members))
 	seenTypes := map[string]struct{}{}
@@ -1552,22 +1574,7 @@ func (s *Service) loadCachedGroupMemberProjections(ctx context.Context, reposito
 			objectNumbers = append(objectNumbers, member.ObjectNumber)
 		}
 	}
-	if len(targetTypes) == 0 || len(objectNumbers) == 0 {
-		return map[string]database.TargetProjection{}, nil
-	}
-
-	var projections []database.TargetProjection
-	if err := s.db.WithContext(ctx).
-		Where("github_repository_id = ? AND target_type IN ? AND object_number IN ?", repositoryID, targetTypes, objectNumbers).
-		Find(&projections).Error; err != nil {
-		return nil, err
-	}
-
-	summaries := make(map[string]database.TargetProjection, len(projections))
-	for _, projection := range projections {
-		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projection
-	}
-	return summaries, nil
+	return targetTypes, objectNumbers
 }
 
 func (s *Service) enqueueTargetProjectionRefreshJobs(ctx context.Context, group database.Group, targets []targetRef) error {

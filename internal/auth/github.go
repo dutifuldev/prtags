@@ -111,62 +111,28 @@ func (c Config) StartDeviceFlow(ctx context.Context) (DeviceCodeResponse, error)
 
 func (c Config) PollAccessToken(ctx context.Context, deviceCode string, interval time.Duration, expiresIn time.Duration) (AccessTokenResponse, error) {
 	c = c.withDefaults()
-	deadline := time.Now().UTC().Add(expiresIn)
-	if expiresIn <= 0 {
-		deadline = time.Now().UTC().Add(15 * time.Minute)
-	}
-
-	currentInterval := interval
-	if currentInterval < 0 {
-		currentInterval = 0
-	}
+	deadline := deviceFlowDeadline(expiresIn)
+	currentInterval := pollInterval(interval)
 
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := deviceFlowPreflight(ctx, deadline); err != nil {
 			return AccessTokenResponse{}, err
 		}
-		if time.Now().UTC().After(deadline) {
-			return AccessTokenResponse{}, fmt.Errorf("device authorization expired")
-		}
 
-		form := url.Values{}
-		form.Set("client_id", c.ClientID)
-		form.Set("device_code", strings.TrimSpace(deviceCode))
-		form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
-
-		var response AccessTokenResponse
-		if err := c.postFormJSON(ctx, c.OAuthBaseURL+"/login/oauth/access_token", form, &response); err != nil {
+		response, err := c.pollAccessTokenOnce(ctx, deviceCode)
+		if err != nil {
 			return AccessTokenResponse{}, err
 		}
-		switch strings.TrimSpace(response.Error) {
-		case "":
-			if strings.TrimSpace(response.AccessToken) == "" {
-				return AccessTokenResponse{}, fmt.Errorf("access token response missing access_token")
-			}
+		done, nextInterval, err := nextPollAction(response, currentInterval)
+		if err != nil {
+			return AccessTokenResponse{}, err
+		}
+		if done {
 			return response, nil
-		case "authorization_pending":
-		case "slow_down":
-			currentInterval += 5 * time.Second
-		case "expired_token":
-			return AccessTokenResponse{}, fmt.Errorf("device authorization expired")
-		case "access_denied":
-			return AccessTokenResponse{}, fmt.Errorf("device authorization denied")
-		default:
-			message := strings.TrimSpace(response.ErrorDescription)
-			if message == "" {
-				message = strings.TrimSpace(response.Error)
-			}
-			return AccessTokenResponse{}, fmt.Errorf("device authorization failed: %s", message)
 		}
-
-		if currentInterval > 0 {
-			timer := time.NewTimer(currentInterval)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return AccessTokenResponse{}, ctx.Err()
-			case <-timer.C:
-			}
+		currentInterval = nextInterval
+		if err := waitForNextPoll(ctx, currentInterval); err != nil {
+			return AccessTokenResponse{}, err
 		}
 	}
 }
@@ -312,4 +278,80 @@ func firstNonEmptyEnv(keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func deviceFlowDeadline(expiresIn time.Duration) time.Time {
+	now := time.Now().UTC()
+	if expiresIn <= 0 {
+		return now.Add(15 * time.Minute)
+	}
+	return now.Add(expiresIn)
+}
+
+func pollInterval(interval time.Duration) time.Duration {
+	if interval < 0 {
+		return 0
+	}
+	return interval
+}
+
+func deviceFlowPreflight(ctx context.Context, deadline time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if time.Now().UTC().After(deadline) {
+		return fmt.Errorf("device authorization expired")
+	}
+	return nil
+}
+
+func (c Config) pollAccessTokenOnce(ctx context.Context, deviceCode string) (AccessTokenResponse, error) {
+	form := url.Values{}
+	form.Set("client_id", c.ClientID)
+	form.Set("device_code", strings.TrimSpace(deviceCode))
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:device_code")
+
+	var response AccessTokenResponse
+	if err := c.postFormJSON(ctx, c.OAuthBaseURL+"/login/oauth/access_token", form, &response); err != nil {
+		return AccessTokenResponse{}, err
+	}
+	return response, nil
+}
+
+func nextPollAction(response AccessTokenResponse, currentInterval time.Duration) (bool, time.Duration, error) {
+	switch strings.TrimSpace(response.Error) {
+	case "":
+		if strings.TrimSpace(response.AccessToken) == "" {
+			return false, currentInterval, fmt.Errorf("access token response missing access_token")
+		}
+		return true, currentInterval, nil
+	case "authorization_pending":
+		return false, currentInterval, nil
+	case "slow_down":
+		return false, currentInterval + 5*time.Second, nil
+	case "expired_token":
+		return false, currentInterval, fmt.Errorf("device authorization expired")
+	case "access_denied":
+		return false, currentInterval, fmt.Errorf("device authorization denied")
+	default:
+		message := strings.TrimSpace(response.ErrorDescription)
+		if message == "" {
+			message = strings.TrimSpace(response.Error)
+		}
+		return false, currentInterval, fmt.Errorf("device authorization failed: %s", message)
+	}
+}
+
+func waitForNextPoll(ctx context.Context, interval time.Duration) error {
+	if interval <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

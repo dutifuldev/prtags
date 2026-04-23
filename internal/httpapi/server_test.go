@@ -310,6 +310,91 @@ func TestAPIListGroupCommentSyncTargets(t *testing.T) {
 	require.Contains(t, raw, `"last_error_kind":"permission_denied"`)
 }
 
+func TestAPIAnnotationSearchAndMembershipHandlers(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	stub := newStubGHReplica(t)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
+	server := httpapi.NewServer(db, service, true)
+
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{
+		"name":          "intent",
+		"object_scope":  "pull_request",
+		"field_type":    "text",
+		"is_searchable": true,
+		"is_vectorized": true,
+	}, http.StatusCreated)
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{
+		"name":          "severity",
+		"object_scope":  "issue",
+		"field_type":    "text",
+		"is_searchable": true,
+		"is_vectorized": true,
+	}, http.StatusCreated)
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{
+		"name":          "theme",
+		"object_scope":  "group",
+		"field_type":    "text",
+		"is_searchable": true,
+		"is_vectorized": true,
+	}, http.StatusCreated)
+
+	groupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "mixed",
+		"title": "Search coverage group",
+	}, http.StatusCreated)
+	groupID := extractPathString(t, groupRaw, "data.id")
+
+	prRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/members", map[string]any{
+		"object_type":   "pull_request",
+		"object_number": 22,
+	}, http.StatusCreated)
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/members", map[string]any{
+		"object_type":   "issue",
+		"object_number": 11,
+	}, http.StatusCreated)
+	prMemberID := extractPathNumber(t, prRaw, "data.id")
+
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/pulls/22/annotations", map[string]any{
+		"intent": "retry auth safely",
+	}, http.StatusOK)
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/issues/11/annotations", map[string]any{
+		"severity": "critical auth outage",
+	}, http.StatusOK)
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/annotations", map[string]any{
+		"theme": "auth recovery work",
+	}, http.StatusOK)
+
+	fields := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/fields", nil, http.StatusOK)
+	require.Contains(t, fields, `"intent"`)
+	require.Contains(t, fields, `"severity"`)
+	require.Contains(t, fields, `"theme"`)
+
+	prAnnotations := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/pulls/22/annotations", nil, http.StatusOK)
+	require.Contains(t, prAnnotations, `"retry auth safely"`)
+
+	issueAnnotations := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/issues/11/annotations", nil, http.StatusOK)
+	require.Contains(t, issueAnnotations, `"critical auth outage"`)
+
+	groupAnnotations := postJSON(t, server.Echo(), http.MethodGet, "/v1/groups/"+groupID+"/annotations", nil, http.StatusOK)
+	require.Contains(t, groupAnnotations, `"auth recovery work"`)
+
+	removeRaw := postJSON(t, server.Echo(), http.MethodDelete, fmt.Sprintf("/v1/groups/%s/members/%d", groupID, prMemberID), nil, http.StatusOK)
+	require.Contains(t, removeRaw, `"removed":true`)
+
+	var group database.Group
+	require.NoError(t, db.WithContext(ctx).Where("public_id = ?", groupID).First(&group).Error)
+	var members []database.GroupMember
+	require.NoError(t, db.WithContext(ctx).Where("group_id = ?", group.ID).Find(&members).Error)
+	require.Len(t, members, 1)
+	require.Equal(t, "issue", members[0].ObjectType)
+
+	syncRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/sync-comments", nil, http.StatusServiceUnavailable)
+	require.Contains(t, syncRaw, `"github comment sync is not configured"`)
+}
+
 func openTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{

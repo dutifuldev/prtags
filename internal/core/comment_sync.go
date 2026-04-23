@@ -144,6 +144,7 @@ func (s *CommentSyncService) Repair(ctx context.Context, groupID uint) error {
 	})
 }
 
+//nolint:cyclop,gocognit // This is the top-level sync state machine; splitting it further obscures the reconcile flow.
 func (s *CommentSyncService) Reconcile(ctx context.Context, syncTargetID uint, desiredRevision int, verify bool) error {
 	if !s.Enabled() {
 		return nil
@@ -374,15 +375,10 @@ func (s *CommentSyncService) projectGroupTx(tx *gorm.DB, groupID uint) (int, err
 
 func (s *CommentSyncService) reconcileDelete(ctx context.Context, group database.Group, row *database.GroupCommentSyncTarget) error {
 	if row.GitHubCommentID != nil {
-		if err := s.github.DeleteIssueComment(ctx, group.RepositoryOwner, group.RepositoryName, *row.GitHubCommentID); err != nil {
-			var apiErr *githubapi.Error
-			if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
-				row.GitHubCommentID = nil
-			} else if isPermissionDenied(apiErr, false) {
-				return s.markPermissionDenied(ctx, row, err)
-			} else {
-				_ = s.markSyncFailed(ctx, row, "", err)
-				return err
+		err := s.github.DeleteIssueComment(ctx, group.RepositoryOwner, group.RepositoryName, *row.GitHubCommentID)
+		if err != nil {
+			if handled, markErr := s.handleDeleteCommentError(ctx, row, err); handled {
+				return markErr
 			}
 		}
 	}
@@ -405,6 +401,19 @@ func (s *CommentSyncService) reconcileDelete(ctx context.Context, group database
 		return err
 	}
 	return s.markSyncSucceeded(ctx, row, nil, "")
+}
+
+func (s *CommentSyncService) handleDeleteCommentError(ctx context.Context, row *database.GroupCommentSyncTarget, err error) (bool, error) {
+	var apiErr *githubapi.Error
+	if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
+		row.GitHubCommentID = nil
+		return false, nil
+	}
+	if isPermissionDenied(apiErr, false) {
+		return true, s.markPermissionDenied(ctx, row, err)
+	}
+	_ = s.markSyncFailed(ctx, row, "", err)
+	return true, err
 }
 
 func (s *CommentSyncService) findManagedComments(ctx context.Context, group database.Group, issueNumber int, marker string) (*githubapi.IssueComment, []githubapi.IssueComment, error) {
@@ -439,14 +448,10 @@ func (s *CommentSyncService) deleteExtraComments(ctx context.Context, group data
 }
 
 func (s *CommentSyncService) renderCommentBody(ctx context.Context, group database.Group, currentType string, currentNumber int) (string, string, bool, error) {
-	var members []database.GroupMember
-	if err := s.db.WithContext(ctx).
-		Where("group_id = ? AND github_repository_id = ? AND object_type IN ?", group.ID, group.GitHubRepositoryID, []string{"issue", "pull_request"}).
-		Order("object_number ASC, id ASC").
-		Find(&members).Error; err != nil {
+	members, err := s.commentMembers(ctx, group)
+	if err != nil {
 		return "", "", false, err
 	}
-
 	if len(members) <= 1 {
 		return "", "", false, nil
 	}
@@ -467,24 +472,11 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 		projectionByKey[objectTargetKey(group.GitHubRepositoryID, projection.TargetType, projection.ObjectNumber)] = projection
 	}
 
-	lines := []string{
-		markerForTarget(group.PublicID, group.GitHubRepositoryID, currentType, currentNumber),
-		"",
-		fmt.Sprintf("Related work from PRtags group `%s`", group.PublicID),
-		"",
-		"Title: " + markdownCell(group.Title),
-	}
-	if status := strings.TrimSpace(group.Status); status != "" && !strings.EqualFold(status, "open") {
-		lines = append(lines, "Status: "+markdownCell(status))
-	}
-	lines = append(lines, "", "| Number | Title |", "| --- | --- |")
+	lines := commentHeaderLines(group, currentType, currentNumber)
 
 	for _, member := range members {
 		projection, ok := projectionByKey[member.TargetKey]
-		numberLabel := fmt.Sprintf("#%d", member.ObjectNumber)
-		if member.ObjectType == currentType && member.ObjectNumber == currentNumber {
-			numberLabel += "*"
-		}
+		numberLabel := commentNumberLabel(member, currentType, currentNumber)
 		numberCell := fmt.Sprintf("[%s](%s)", numberLabel, issueURL(group.RepositoryOwner, group.RepositoryName, member.ObjectType, member.ObjectNumber, projection.HTMLURL))
 		title := "Title unavailable"
 		if ok && strings.TrimSpace(projection.Title) != "" {
@@ -497,6 +489,37 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 	body := strings.Join(lines, "\n")
 	sum := sha256.Sum256([]byte(body))
 	return body, hex.EncodeToString(sum[:]), true, nil
+}
+
+func (s *CommentSyncService) commentMembers(ctx context.Context, group database.Group) ([]database.GroupMember, error) {
+	var members []database.GroupMember
+	err := s.db.WithContext(ctx).
+		Where("group_id = ? AND github_repository_id = ? AND object_type IN ?", group.ID, group.GitHubRepositoryID, []string{"issue", "pull_request"}).
+		Order("object_number ASC, id ASC").
+		Find(&members).Error
+	return members, err
+}
+
+func commentHeaderLines(group database.Group, currentType string, currentNumber int) []string {
+	lines := []string{
+		markerForTarget(group.PublicID, group.GitHubRepositoryID, currentType, currentNumber),
+		"",
+		fmt.Sprintf("Related work from PRtags group `%s`", group.PublicID),
+		"",
+		"Title: " + markdownCell(group.Title),
+	}
+	if status := strings.TrimSpace(group.Status); status != "" && !strings.EqualFold(status, "open") {
+		lines = append(lines, "Status: "+markdownCell(status))
+	}
+	return append(lines, "", "| Number | Title |", "| --- | --- |")
+}
+
+func commentNumberLabel(member database.GroupMember, currentType string, currentNumber int) string {
+	label := fmt.Sprintf("#%d", member.ObjectNumber)
+	if member.ObjectType == currentType && member.ObjectNumber == currentNumber {
+		return label + "*"
+	}
+	return label
 }
 
 func (s *CommentSyncService) markSyncSucceeded(ctx context.Context, row *database.GroupCommentSyncTarget, commentID *int64, hash string) error {
