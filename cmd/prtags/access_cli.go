@@ -30,12 +30,20 @@ func newAccessGrantCommand() *cobra.Command {
 	}
 
 	var repo string
+	grants.AddCommand(
+		newAccessGrantUpsertCommand(&repo),
+		newAccessGrantListCommand(&repo),
+		newAccessGrantRevokeCommand(&repo),
+	)
+	return grants
+}
 
+func newAccessGrantUpsertCommand(repo *string) *cobra.Command {
 	upsert := &cobra.Command{
 		Use:   "upsert",
 		Short: "Create or update a repository access grant",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			owner, name, err := splitRepo(repo)
+			owner, name, err := splitRepo(*repo)
 			if err != nil {
 				return err
 			}
@@ -62,20 +70,18 @@ func newAccessGrantCommand() *cobra.Command {
 			return printJSendSuccess(cmd.OutOrStdout(), grant)
 		},
 	}
-	upsert.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
-	_ = upsert.MarkFlagRequired("repo")
-	upsert.Flags().Int64("github-user-id", 0, "GitHub user ID to grant")
-	upsert.Flags().String("github-login", "", "GitHub login to grant")
+	configureAccessRepoFlags(upsert, repo)
+	configureAccessSubjectFlags(upsert)
 	upsert.Flags().String("role", "writer", "grant role")
-	upsert.Flags().Int64("granted-by-github-user-id", 0, "GitHub user ID that granted this access")
-	upsert.Flags().String("granted-by-github-login", "", "GitHub login that granted this access")
-	upsert.Flags().Bool("self", false, "use the stored prtags GitHub login as both the subject and granter")
+	return upsert
+}
 
+func newAccessGrantListCommand(repo *string) *cobra.Command {
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List repository access grants",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			owner, name, err := splitRepo(repo)
+			owner, name, err := splitRepo(*repo)
 			if err != nil {
 				return err
 			}
@@ -92,14 +98,16 @@ func newAccessGrantCommand() *cobra.Command {
 			return printJSendSuccess(cmd.OutOrStdout(), grants)
 		},
 	}
-	list.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
-	_ = list.MarkFlagRequired("repo")
+	configureAccessRepoFlags(list, repo)
+	return list
+}
 
+func newAccessGrantRevokeCommand(repo *string) *cobra.Command {
 	revoke := &cobra.Command{
 		Use:   "revoke",
 		Short: "Delete a repository access grant",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			owner, name, err := splitRepo(repo)
+			owner, name, err := splitRepo(*repo)
 			if err != nil {
 				return err
 			}
@@ -118,7 +126,7 @@ func newAccessGrantCommand() *cobra.Command {
 			}
 			return printJSendSuccess(cmd.OutOrStdout(), map[string]any{
 				"revoked":            true,
-				"github_repository":  strings.TrimSpace(repo),
+				"github_repository":  strings.TrimSpace(*repo),
 				"github_user_id":     subject.userID,
 				"github_login":       subject.login,
 				"granted_by_user_id": subject.grantedByUserID,
@@ -126,16 +134,22 @@ func newAccessGrantCommand() *cobra.Command {
 			})
 		},
 	}
-	revoke.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
-	_ = revoke.MarkFlagRequired("repo")
-	revoke.Flags().Int64("github-user-id", 0, "GitHub user ID to revoke")
-	revoke.Flags().String("github-login", "", "GitHub login to revoke")
-	revoke.Flags().Int64("granted-by-github-user-id", 0, "GitHub user ID that granted this access")
-	revoke.Flags().String("granted-by-github-login", "", "GitHub login that granted this access")
-	revoke.Flags().Bool("self", false, "use the stored prtags GitHub login as both the subject and granter")
+	configureAccessRepoFlags(revoke, repo)
+	configureAccessSubjectFlags(revoke)
+	return revoke
+}
 
-	grants.AddCommand(upsert, list, revoke)
-	return grants
+func configureAccessRepoFlags(cmd *cobra.Command, repo *string) {
+	cmd.Flags().StringVarP(repo, "repo", "R", "", "repo in owner/name form")
+	_ = cmd.MarkFlagRequired("repo")
+}
+
+func configureAccessSubjectFlags(cmd *cobra.Command) {
+	cmd.Flags().Int64("github-user-id", 0, "GitHub user ID to grant")
+	cmd.Flags().String("github-login", "", "GitHub login to grant")
+	cmd.Flags().Int64("granted-by-github-user-id", 0, "GitHub user ID that granted this access")
+	cmd.Flags().String("granted-by-github-login", "", "GitHub login that granted this access")
+	cmd.Flags().Bool("self", false, "use the stored prtags GitHub login as both the subject and granter")
 }
 
 type grantSubject struct {

@@ -66,6 +66,29 @@ func TestResolveGrantSubjectUsesExplicitGrantorFlags(t *testing.T) {
 	require.Equal(t, "operator", subject.grantedByLogin)
 }
 
+func TestAccessGrantCommandsReachServiceOpen(t *testing.T) {
+	tempDir := t.TempDir()
+	t.Setenv("PRTAGS_CONFIG_DIR", tempDir)
+	writeStoredToken(t, tempDir, auth.StoredToken{
+		Version:     "v1",
+		Provider:    "github",
+		AccessToken: "gho_test",
+		UserLogin:   "dutifulbob",
+		UserID:      7937614,
+	})
+	t.Setenv("GHREPLICA_BASE_URL", "https://ghreplica.example")
+	t.Setenv("DATABASE_URL", "")
+
+	_, _, err := runCLI(t, "https://prtags.dutiful.dev", "access", "grant", "list", "-R", "acme/widgets")
+	require.ErrorContains(t, err, "DATABASE_URL is required")
+
+	_, _, err = runCLI(t, "https://prtags.dutiful.dev", "access", "grant", "upsert", "-R", "acme/widgets", "--github-user-id", "123", "--github-login", "writer")
+	require.ErrorContains(t, err, "DATABASE_URL is required")
+
+	_, _, err = runCLI(t, "https://prtags.dutiful.dev", "access", "grant", "revoke", "-R", "acme/widgets", "--github-user-id", "123", "--github-login", "writer")
+	require.ErrorContains(t, err, "DATABASE_URL is required")
+}
+
 func newGrantSubjectCommand() *cobra.Command {
 	cmd := &cobra.Command{Use: "grant"}
 	cmd.Flags().Int64("github-user-id", 0, "")

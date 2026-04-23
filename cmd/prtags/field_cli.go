@@ -144,30 +144,31 @@ func (d desiredFieldDefinition) createPayload() map[string]any {
 
 func diffFieldDefinition(existing fieldDefinitionView, desired desiredFieldDefinition) map[string]any {
 	patch := map[string]any{}
-	if desired.ExplicitDisplay && strings.TrimSpace(existing.DisplayName) != desired.DisplayName {
-		patch["display_name"] = desired.DisplayName
-	}
-	if existing.IsRequired != desired.IsRequired {
-		patch["is_required"] = desired.IsRequired
-	}
-	if existing.IsFilterable != desired.IsFilterable {
-		patch["is_filterable"] = desired.IsFilterable
-	}
-	if existing.IsSearchable != desired.IsSearchable {
-		patch["is_searchable"] = desired.IsSearchable
-	}
-	if existing.IsVectorized != desired.IsVectorized {
-		patch["is_vectorized"] = desired.IsVectorized
-	}
-	if desired.ExplicitSortOrder && existing.SortOrder != desired.SortOrder {
-		patch["sort_order"] = desired.SortOrder
-	}
-	if desired.ExplicitEnumValues && (existing.FieldType == "enum" || existing.FieldType == "multi_enum") {
-		if !stringSlicesEqual(normalizeEnumValuesCLI(existing.EnumValuesJSON), desired.EnumValues) {
-			patch["enum_values"] = desired.EnumValues
-		}
-	}
+
+	addFieldPatch(patch, desired.ExplicitDisplay && strings.TrimSpace(existing.DisplayName) != desired.DisplayName, "display_name", desired.DisplayName)
+	addFieldPatch(patch, existing.IsRequired != desired.IsRequired, "is_required", desired.IsRequired)
+	addFieldPatch(patch, existing.IsFilterable != desired.IsFilterable, "is_filterable", desired.IsFilterable)
+	addFieldPatch(patch, existing.IsSearchable != desired.IsSearchable, "is_searchable", desired.IsSearchable)
+	addFieldPatch(patch, existing.IsVectorized != desired.IsVectorized, "is_vectorized", desired.IsVectorized)
+	addFieldPatch(patch, desired.ExplicitSortOrder && existing.SortOrder != desired.SortOrder, "sort_order", desired.SortOrder)
+	addFieldPatch(patch, shouldPatchEnumValues(existing, desired), "enum_values", desired.EnumValues)
 	return patch
+}
+
+func shouldPatchEnumValues(existing fieldDefinitionView, desired desiredFieldDefinition) bool {
+	if !desired.ExplicitEnumValues {
+		return false
+	}
+	if existing.FieldType != "enum" && existing.FieldType != "multi_enum" {
+		return false
+	}
+	return !stringSlicesEqual(normalizeEnumValuesCLI(existing.EnumValuesJSON), desired.EnumValues)
+}
+
+func addFieldPatch(patch map[string]any, include bool, key string, value any) {
+	if include {
+		patch[key] = value
+	}
 }
 
 func filterFieldDefinitions(fields []fieldDefinitionView, filters fieldListFilters) []fieldDefinitionView {

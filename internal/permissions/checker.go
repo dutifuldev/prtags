@@ -66,16 +66,11 @@ func NewGitHubChecker(ttl time.Duration) *GitHubChecker {
 }
 
 func (c *GitHubChecker) CanWrite(ctx context.Context, actor Actor, owner, repo string) (bool, error) {
-	token := strings.TrimSpace(actor.Token)
-	if token == "" {
+	if actorToken(actor) == "" {
 		return false, nil
 	}
 
-	cacheKey := actor.ID
-	if cacheKey == "" {
-		cacheKey = token
-	}
-	cacheKey += "|" + owner + "/" + repo
+	cacheKey := permissionCacheKey(actor, owner, repo)
 	now := time.Now().UTC()
 
 	c.mu.Lock()
@@ -91,7 +86,7 @@ func (c *GitHubChecker) CanWrite(ctx context.Context, actor Actor, owner, repo s
 	}
 	repository, resp, err := client.Repositories.Get(ctx, owner, repo)
 	if err != nil {
-		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) {
+		if isPermissionDeniedResponse(resp) {
 			return false, nil
 		}
 		return false, err
@@ -113,15 +108,11 @@ func (c *GitHubChecker) CanWrite(ctx context.Context, actor Actor, owner, repo s
 }
 
 func (c *GitHubChecker) ResolveIdentity(ctx context.Context, actor Actor) (Identity, error) {
-	token := strings.TrimSpace(actor.Token)
-	if token == "" {
+	if actorToken(actor) == "" {
 		return Identity{}, nil
 	}
 
-	cacheKey := actor.ID
-	if cacheKey == "" {
-		cacheKey = token
-	}
+	cacheKey := actorCacheKey(actor)
 	now := time.Now().UTC()
 
 	c.mu.Lock()
@@ -137,7 +128,7 @@ func (c *GitHubChecker) ResolveIdentity(ctx context.Context, actor Actor) (Ident
 	}
 	viewer, resp, err := client.Users.Get(ctx, "")
 	if err != nil {
-		if resp != nil && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound) {
+		if isPermissionDeniedResponse(resp) {
 			return Identity{}, nil
 		}
 		return Identity{}, err
@@ -159,7 +150,7 @@ func (c *GitHubChecker) ResolveIdentity(ctx context.Context, actor Actor) (Ident
 }
 
 func (c *GitHubChecker) clientForActor(ctx context.Context, actor Actor) (*github.Client, error) {
-	httpClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: strings.TrimSpace(actor.Token)}))
+	httpClient := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: actorToken(actor)}))
 	client := github.NewClient(httpClient)
 	if baseURL := strings.TrimSpace(os.Getenv("GITHUB_API_URL")); baseURL != "" {
 		enterpriseClient, err := client.WithEnterpriseURLs(baseURL, baseURL)
@@ -169,4 +160,31 @@ func (c *GitHubChecker) clientForActor(ctx context.Context, actor Actor) (*githu
 		client = enterpriseClient
 	}
 	return client, nil
+}
+
+func actorToken(actor Actor) string {
+	return strings.TrimSpace(actor.Token)
+}
+
+func actorCacheKey(actor Actor) string {
+	if strings.TrimSpace(actor.ID) != "" {
+		return actor.ID
+	}
+	return actorToken(actor)
+}
+
+func permissionCacheKey(actor Actor, owner, repo string) string {
+	return actorCacheKey(actor) + "|" + owner + "/" + repo
+}
+
+func isPermissionDeniedResponse(resp *github.Response) bool {
+	if resp == nil {
+		return false
+	}
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound:
+		return true
+	default:
+		return false
+	}
 }

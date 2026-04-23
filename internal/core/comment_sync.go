@@ -144,6 +144,7 @@ func (s *CommentSyncService) Repair(ctx context.Context, groupID uint) error {
 	})
 }
 
+//nolint:cyclop,gocognit // This is the top-level sync state machine; splitting it further obscures the reconcile flow.
 func (s *CommentSyncService) Reconcile(ctx context.Context, syncTargetID uint, desiredRevision int, verify bool) error {
 	if !s.Enabled() {
 		return nil
@@ -251,16 +252,46 @@ func (s *CommentSyncService) projectGroupTx(tx *gorm.DB, groupID uint) (int, err
 		return 0, nil
 	}
 
-	group, err := s.groupByIDTx(tx, groupID)
+	group, members, existing, err := s.loadGroupProjectionState(tx, groupID)
 	if err != nil {
 		return 0, err
 	}
-
-	var members []database.GroupMember
-	if err := tx.Where("group_id = ?", group.ID).Order("object_number ASC, id ASC").Find(&members).Error; err != nil {
-		return 0, err
+	current, currentOrder := commentSyncMembersByKey(group, members)
+	existingByKey := commentSyncTargetsByKey(existing)
+	now := time.Now().UTC()
+	scheduledAt := now.Add(commentSyncDebounce)
+	if len(current) <= 1 {
+		return s.markAllCommentSyncTargetsDeleted(tx, existing, now, scheduledAt)
 	}
 
+	affected, err := s.upsertCommentSyncTargets(tx, current, currentOrder, existingByKey, now, scheduledAt)
+	if err != nil {
+		return 0, err
+	}
+	removed, err := s.deleteMissingCommentSyncTargets(tx, current, existing, now, scheduledAt)
+	if err != nil {
+		return 0, err
+	}
+	return affected + removed, nil
+}
+
+func (s *CommentSyncService) loadGroupProjectionState(tx *gorm.DB, groupID uint) (database.Group, []database.GroupMember, []database.GroupCommentSyncTarget, error) {
+	group, err := s.groupByIDTx(tx, groupID)
+	if err != nil {
+		return database.Group{}, nil, nil, err
+	}
+	var members []database.GroupMember
+	if err := tx.Where("group_id = ?", group.ID).Order("object_number ASC, id ASC").Find(&members).Error; err != nil {
+		return database.Group{}, nil, nil, err
+	}
+	var existing []database.GroupCommentSyncTarget
+	if err := tx.Where("group_id = ?", group.ID).Find(&existing).Error; err != nil {
+		return database.Group{}, nil, nil, err
+	}
+	return group, members, existing, nil
+}
+
+func commentSyncMembersByKey(group database.Group, members []database.GroupMember) (map[string]database.GroupMember, []string) {
 	current := make(map[string]database.GroupMember)
 	currentOrder := make([]string, 0, len(members))
 	for _, member := range members {
@@ -270,119 +301,118 @@ func (s *CommentSyncService) projectGroupTx(tx *gorm.DB, groupID uint) (int, err
 		if member.ObjectType != "issue" && member.ObjectType != "pull_request" {
 			continue
 		}
-		key := member.ObjectType + ":" + strconv.Itoa(member.ObjectNumber)
+		key := commentSyncTargetIdentity(member.ObjectType, member.ObjectNumber)
 		current[key] = member
 		currentOrder = append(currentOrder, key)
 	}
+	return current, currentOrder
+}
 
-	var existing []database.GroupCommentSyncTarget
-	if err := tx.Where("group_id = ?", group.ID).Find(&existing).Error; err != nil {
-		return 0, err
-	}
-	existingByKey := make(map[string]database.GroupCommentSyncTarget, len(existing))
+func commentSyncTargetsByKey(existing []database.GroupCommentSyncTarget) map[string]database.GroupCommentSyncTarget {
+	index := make(map[string]database.GroupCommentSyncTarget, len(existing))
 	for _, row := range existing {
-		existingByKey[row.ObjectType+":"+strconv.Itoa(row.ObjectNumber)] = row
+		index[commentSyncTargetIdentity(row.ObjectType, row.ObjectNumber)] = row
 	}
+	return index
+}
 
-	now := time.Now().UTC()
-	scheduledAt := now.Add(commentSyncDebounce)
+func (s *CommentSyncService) markAllCommentSyncTargetsDeleted(tx *gorm.DB, existing []database.GroupCommentSyncTarget, now, scheduledAt time.Time) (int, error) {
 	affected := 0
-
-	if len(current) <= 1 {
-		for _, row := range existing {
-			nextRevision := row.DesiredRevision + 1
-			if err := tx.Model(&database.GroupCommentSyncTarget{}).
-				Where("id = ?", row.ID).
-				Updates(map[string]any{
-					"desired_revision": nextRevision,
-					"desired_deleted":  true,
-					"updated_at":       now,
-				}).Error; err != nil {
-				return 0, err
-			}
-			if err := s.dispatcher.EnqueueGroupCommentReconcileTx(tx, row.ID, nextRevision, scheduledAt, false); err != nil {
-				return 0, err
-			}
-			affected++
+	for _, row := range existing {
+		if err := s.updateCommentSyncTarget(tx, row.ID, row.DesiredRevision+1, true, row.TargetKey, now, scheduledAt); err != nil {
+			return 0, err
 		}
-		return affected, nil
+		affected++
 	}
+	return affected, nil
+}
 
+func (s *CommentSyncService) upsertCommentSyncTargets(
+	tx *gorm.DB,
+	current map[string]database.GroupMember,
+	currentOrder []string,
+	existingByKey map[string]database.GroupCommentSyncTarget,
+	now, scheduledAt time.Time,
+) (int, error) {
+	affected := 0
 	for _, key := range currentOrder {
 		member := current[key]
 		if existing, ok := existingByKey[key]; ok {
-			nextRevision := existing.DesiredRevision + 1
-			if err := tx.Model(&database.GroupCommentSyncTarget{}).
-				Where("id = ?", existing.ID).
-				Updates(map[string]any{
-					"desired_revision": nextRevision,
-					"desired_deleted":  false,
-					"target_key":       member.TargetKey,
-					"updated_at":       now,
-				}).Error; err != nil {
-				return 0, err
-			}
-			if err := s.dispatcher.EnqueueGroupCommentReconcileTx(tx, existing.ID, nextRevision, scheduledAt, false); err != nil {
+			if err := s.updateCommentSyncTarget(tx, existing.ID, existing.DesiredRevision+1, false, member.TargetKey, now, scheduledAt); err != nil {
 				return 0, err
 			}
 			affected++
 			continue
 		}
-
-		row := database.GroupCommentSyncTarget{
-			GitHubRepositoryID: group.GitHubRepositoryID,
-			GroupID:            group.ID,
-			ObjectType:         member.ObjectType,
-			ObjectNumber:       member.ObjectNumber,
-			TargetKey:          member.TargetKey,
-			DesiredRevision:    1,
-			AppliedRevision:    0,
-			DesiredDeleted:     false,
-		}
-		if err := tx.Create(&row).Error; err != nil {
-			return 0, err
-		}
-		if err := s.dispatcher.EnqueueGroupCommentReconcileTx(tx, row.ID, row.DesiredRevision, scheduledAt, false); err != nil {
+		if err := s.createCommentSyncTarget(tx, member, now, scheduledAt); err != nil {
 			return 0, err
 		}
 		affected++
 	}
+	return affected, nil
+}
 
+func (s *CommentSyncService) deleteMissingCommentSyncTargets(
+	tx *gorm.DB,
+	current map[string]database.GroupMember,
+	existing []database.GroupCommentSyncTarget,
+	now, scheduledAt time.Time,
+) (int, error) {
+	affected := 0
 	for _, row := range existing {
-		key := row.ObjectType + ":" + strconv.Itoa(row.ObjectNumber)
+		key := commentSyncTargetIdentity(row.ObjectType, row.ObjectNumber)
 		if _, ok := current[key]; ok {
 			continue
 		}
-		nextRevision := row.DesiredRevision + 1
-		if err := tx.Model(&database.GroupCommentSyncTarget{}).
-			Where("id = ?", row.ID).
-			Updates(map[string]any{
-				"desired_revision": nextRevision,
-				"desired_deleted":  true,
-				"updated_at":       now,
-			}).Error; err != nil {
-			return 0, err
-		}
-		if err := s.dispatcher.EnqueueGroupCommentReconcileTx(tx, row.ID, nextRevision, scheduledAt, false); err != nil {
+		if err := s.updateCommentSyncTarget(tx, row.ID, row.DesiredRevision+1, true, row.TargetKey, now, scheduledAt); err != nil {
 			return 0, err
 		}
 		affected++
 	}
-
 	return affected, nil
+}
+
+func (s *CommentSyncService) createCommentSyncTarget(tx *gorm.DB, member database.GroupMember, now, scheduledAt time.Time) error {
+	row := database.GroupCommentSyncTarget{
+		GitHubRepositoryID: member.GitHubRepositoryID,
+		GroupID:            member.GroupID,
+		ObjectType:         member.ObjectType,
+		ObjectNumber:       member.ObjectNumber,
+		TargetKey:          member.TargetKey,
+		DesiredRevision:    1,
+		AppliedRevision:    0,
+		DesiredDeleted:     false,
+	}
+	if err := tx.Create(&row).Error; err != nil {
+		return err
+	}
+	return s.dispatcher.EnqueueGroupCommentReconcileTx(tx, row.ID, row.DesiredRevision, scheduledAt, false)
+}
+
+func (s *CommentSyncService) updateCommentSyncTarget(tx *gorm.DB, rowID uint, desiredRevision int, desiredDeleted bool, targetKey string, now, scheduledAt time.Time) error {
+	if err := tx.Model(&database.GroupCommentSyncTarget{}).
+		Where("id = ?", rowID).
+		Updates(map[string]any{
+			"desired_revision": desiredRevision,
+			"desired_deleted":  desiredDeleted,
+			"target_key":       targetKey,
+			"updated_at":       now,
+		}).Error; err != nil {
+		return err
+	}
+	return s.dispatcher.EnqueueGroupCommentReconcileTx(tx, rowID, desiredRevision, scheduledAt, false)
+}
+
+func commentSyncTargetIdentity(objectType string, objectNumber int) string {
+	return objectType + ":" + strconv.Itoa(objectNumber)
 }
 
 func (s *CommentSyncService) reconcileDelete(ctx context.Context, group database.Group, row *database.GroupCommentSyncTarget) error {
 	if row.GitHubCommentID != nil {
-		if err := s.github.DeleteIssueComment(ctx, group.RepositoryOwner, group.RepositoryName, *row.GitHubCommentID); err != nil {
-			var apiErr *githubapi.Error
-			if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
-				row.GitHubCommentID = nil
-			} else if isPermissionDenied(apiErr, false) {
-				return s.markPermissionDenied(ctx, row, err)
-			} else {
-				_ = s.markSyncFailed(ctx, row, "", err)
-				return err
+		err := s.github.DeleteIssueComment(ctx, group.RepositoryOwner, group.RepositoryName, *row.GitHubCommentID)
+		if err != nil {
+			if handled, markErr := s.handleDeleteCommentError(ctx, row, err); handled {
+				return markErr
 			}
 		}
 	}
@@ -405,6 +435,19 @@ func (s *CommentSyncService) reconcileDelete(ctx context.Context, group database
 		return err
 	}
 	return s.markSyncSucceeded(ctx, row, nil, "")
+}
+
+func (s *CommentSyncService) handleDeleteCommentError(ctx context.Context, row *database.GroupCommentSyncTarget, err error) (bool, error) {
+	var apiErr *githubapi.Error
+	if errors.As(err, &apiErr) && apiErr.StatusCode == 404 {
+		row.GitHubCommentID = nil
+		return false, nil
+	}
+	if isPermissionDenied(apiErr, false) {
+		return true, s.markPermissionDenied(ctx, row, err)
+	}
+	_ = s.markSyncFailed(ctx, row, "", err)
+	return true, err
 }
 
 func (s *CommentSyncService) findManagedComments(ctx context.Context, group database.Group, issueNumber int, marker string) (*githubapi.IssueComment, []githubapi.IssueComment, error) {
@@ -439,14 +482,10 @@ func (s *CommentSyncService) deleteExtraComments(ctx context.Context, group data
 }
 
 func (s *CommentSyncService) renderCommentBody(ctx context.Context, group database.Group, currentType string, currentNumber int) (string, string, bool, error) {
-	var members []database.GroupMember
-	if err := s.db.WithContext(ctx).
-		Where("group_id = ? AND github_repository_id = ? AND object_type IN ?", group.ID, group.GitHubRepositoryID, []string{"issue", "pull_request"}).
-		Order("object_number ASC, id ASC").
-		Find(&members).Error; err != nil {
+	members, err := s.commentMembers(ctx, group)
+	if err != nil {
 		return "", "", false, err
 	}
-
 	if len(members) <= 1 {
 		return "", "", false, nil
 	}
@@ -467,24 +506,11 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 		projectionByKey[objectTargetKey(group.GitHubRepositoryID, projection.TargetType, projection.ObjectNumber)] = projection
 	}
 
-	lines := []string{
-		markerForTarget(group.PublicID, group.GitHubRepositoryID, currentType, currentNumber),
-		"",
-		fmt.Sprintf("Related work from PRtags group `%s`", group.PublicID),
-		"",
-		"Title: " + markdownCell(group.Title),
-	}
-	if status := strings.TrimSpace(group.Status); status != "" && !strings.EqualFold(status, "open") {
-		lines = append(lines, "Status: "+markdownCell(status))
-	}
-	lines = append(lines, "", "| Number | Title |", "| --- | --- |")
+	lines := commentHeaderLines(group, currentType, currentNumber)
 
 	for _, member := range members {
 		projection, ok := projectionByKey[member.TargetKey]
-		numberLabel := fmt.Sprintf("#%d", member.ObjectNumber)
-		if member.ObjectType == currentType && member.ObjectNumber == currentNumber {
-			numberLabel += "*"
-		}
+		numberLabel := commentNumberLabel(member, currentType, currentNumber)
 		numberCell := fmt.Sprintf("[%s](%s)", numberLabel, issueURL(group.RepositoryOwner, group.RepositoryName, member.ObjectType, member.ObjectNumber, projection.HTMLURL))
 		title := "Title unavailable"
 		if ok && strings.TrimSpace(projection.Title) != "" {
@@ -497,6 +523,37 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 	body := strings.Join(lines, "\n")
 	sum := sha256.Sum256([]byte(body))
 	return body, hex.EncodeToString(sum[:]), true, nil
+}
+
+func (s *CommentSyncService) commentMembers(ctx context.Context, group database.Group) ([]database.GroupMember, error) {
+	var members []database.GroupMember
+	err := s.db.WithContext(ctx).
+		Where("group_id = ? AND github_repository_id = ? AND object_type IN ?", group.ID, group.GitHubRepositoryID, []string{"issue", "pull_request"}).
+		Order("object_number ASC, id ASC").
+		Find(&members).Error
+	return members, err
+}
+
+func commentHeaderLines(group database.Group, currentType string, currentNumber int) []string {
+	lines := []string{
+		markerForTarget(group.PublicID, group.GitHubRepositoryID, currentType, currentNumber),
+		"",
+		fmt.Sprintf("Related work from PRtags group `%s`", group.PublicID),
+		"",
+		"Title: " + markdownCell(group.Title),
+	}
+	if status := strings.TrimSpace(group.Status); status != "" && !strings.EqualFold(status, "open") {
+		lines = append(lines, "Status: "+markdownCell(status))
+	}
+	return append(lines, "", "| Number | Title |", "| --- | --- |")
+}
+
+func commentNumberLabel(member database.GroupMember, currentType string, currentNumber int) string {
+	label := fmt.Sprintf("#%d", member.ObjectNumber)
+	if member.ObjectType == currentType && member.ObjectNumber == currentNumber {
+		return label + "*"
+	}
+	return label
 }
 
 func (s *CommentSyncService) markSyncSucceeded(ctx context.Context, row *database.GroupCommentSyncTarget, commentID *int64, hash string) error {

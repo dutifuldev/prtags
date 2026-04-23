@@ -53,16 +53,8 @@ func TestRequestJSONReturnsStatusError(t *testing.T) {
 func TestBatchGetObjects(t *testing.T) {
 	updatedAt := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC).Format(time.RFC3339)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("expected POST, got %s", r.Method)
-		}
-		if r.URL.Path != "/v1/github-ext/repos/openclaw/openclaw/objects/batch" {
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Fatalf("expected json content-type, got %q", got)
-		}
-		_, _ = w.Write([]byte(`{"results":[{"type":"issue","number":1,"found":true,"object":{"id":11,"number":1,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/1","updated_at":"` + updatedAt + `","user":{"login":"alice"}}},{"type":"pull_request","number":2,"found":true,"object":{"id":22,"number":2,"title":"PR title","state":"closed","html_url":"https://github.com/openclaw/openclaw/pull/2","updated_at":"` + updatedAt + `","user":{"login":"bob"}}},{"type":"issue","number":3,"found":false,"object":null}]}`))
+		assertBatchRequest(t, r)
+		_, _ = w.Write([]byte(batchObjectsResponse(updatedAt)))
 	}))
 	defer server.Close()
 
@@ -89,6 +81,23 @@ func TestBatchGetObjects(t *testing.T) {
 	}
 }
 
+func assertBatchRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Fatalf("expected POST, got %s", r.Method)
+	}
+	if r.URL.Path != "/v1/github-ext/repos/openclaw/openclaw/objects/batch" {
+		t.Fatalf("unexpected path %q", r.URL.Path)
+	}
+	if got := r.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("expected json content-type, got %q", got)
+	}
+}
+
+func batchObjectsResponse(updatedAt string) string {
+	return `{"results":[{"type":"issue","number":1,"found":true,"object":{"id":11,"number":1,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/1","updated_at":"` + updatedAt + `","user":{"login":"alice"}}},{"type":"pull_request","number":2,"found":true,"object":{"id":22,"number":2,"title":"PR title","state":"closed","html_url":"https://github.com/openclaw/openclaw/pull/2","updated_at":"` + updatedAt + `","user":{"login":"bob"}}},{"type":"issue","number":3,"found":false,"object":null}]}`
+}
+
 func TestBatchGetObjectsEmpty(t *testing.T) {
 	client := NewClient("https://example.com")
 	results, err := client.BatchGetObjects(context.Background(), "openclaw", "openclaw", nil)
@@ -107,5 +116,37 @@ func TestDecodeBatchObjectSummaryRejectsUnsupportedType(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unsupported batch object type") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestGetIssueAndPullRequest(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/github/repos/openclaw/openclaw/issues/11":
+			_, _ = w.Write([]byte(`{"id":11,"number":11,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/11","user":{"login":"alice"}}`))
+		case "/v1/github/repos/openclaw/openclaw/pulls/22":
+			_, _ = w.Write([]byte(`{"id":22,"number":22,"title":"PR title","state":"open","html_url":"https://github.com/openclaw/openclaw/pull/22","user":{"login":"bob"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL)
+	issue, err := client.GetIssue(context.Background(), "openclaw", "openclaw", 11)
+	if err != nil {
+		t.Fatalf("GetIssue returned error: %v", err)
+	}
+	if issue.User.Login != "alice" {
+		t.Fatalf("expected issue author to decode, got %q", issue.User.Login)
+	}
+
+	pullRequest, err := client.GetPullRequest(context.Background(), "openclaw", "openclaw", 22)
+	if err != nil {
+		t.Fatalf("GetPullRequest returned error: %v", err)
+	}
+	if pullRequest.User.Login != "bob" {
+		t.Fatalf("expected pr author to decode, got %q", pullRequest.User.Login)
 	}
 }

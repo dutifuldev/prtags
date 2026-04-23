@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -568,6 +570,757 @@ func TestDeleteRepositoryAccessGrantRemovesFallbackWrite(t *testing.T) {
 	require.ErrorIs(t, err, ErrForbidden)
 }
 
+func TestFieldLifecycleAndGroupUpdates(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	created, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "priority",
+		DisplayName:  "Priority",
+		ObjectScope:  "pull_request",
+		FieldType:    "enum",
+		EnumValues:   []string{"low", "high"},
+		IsFilterable: true,
+	}, "")
+	require.NoError(t, err)
+
+	fields, err := service.ListFieldDefinitions(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, fields, 1)
+	require.Equal(t, "priority", fields[0].Name)
+
+	updated, err := service.UpdateFieldDefinition(ctx, actor, "acme", "widgets", created.ID, FieldDefinitionPatchInput{
+		DisplayName:        stringPtr("Priority Score"),
+		ExpectedRowVersion: intPtr(1),
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "Priority Score", updated.DisplayName)
+	require.Equal(t, 2, updated.RowVersion)
+
+	archived, err := service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", created.ID, intPtr(2), "")
+	require.NoError(t, err)
+	require.NotNil(t, archived.ArchivedAt)
+	require.Equal(t, 3, archived.RowVersion)
+
+	exported, err := service.ExportManifest(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, exported.Fields, 1)
+	require.Equal(t, "priority", exported.Fields[0].Name)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:        "mixed",
+		Title:       "Original title",
+		Description: "first",
+	}, "")
+	require.NoError(t, err)
+
+	group, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{
+		Title:              stringPtr("Updated title"),
+		Description:        stringPtr("updated description"),
+		Status:             stringPtr("closed"),
+		ExpectedRowVersion: intPtr(1),
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "Updated title", group.Title)
+	require.Equal(t, "closed", group.Status)
+
+	_, err = service.SyncGroupComments(ctx, actor, group.PublicID)
+	require.Error(t, err)
+	var fail *FailError
+	require.ErrorAs(t, err, &fail)
+	require.Equal(t, 503, fail.StatusCode)
+	require.Equal(t, "github comment sync is not configured", fail.Message)
+}
+
+func TestGetAnnotationsForPullRequestIssueAndGroup(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "intent",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "severity",
+		ObjectScope: "issue",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "theme",
+		ObjectScope: "group",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "mixed",
+		Title: "Auth work",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"intent": "retry auth"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "issue", 11, nil, map[string]any{"severity": "critical"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "group", 0, &group.ID, map[string]any{"theme": "reliability"}, "")
+	require.NoError(t, err)
+
+	pullAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "pull_request", 22, nil)
+	require.NoError(t, err)
+	require.Equal(t, "retry auth", pullAnnotations.Annotations["intent"])
+
+	issueAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "issue", 11, nil)
+	require.NoError(t, err)
+	require.Equal(t, "critical", issueAnnotations.Annotations["severity"])
+
+	groupAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "group", 0, &group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "reliability", groupAnnotations.Annotations["theme"])
+}
+
+func TestSearchTextAndSimilarReturnIndexedResults(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "intent",
+		ObjectScope:  "pull_request",
+		FieldType:    "text",
+		IsSearchable: true,
+		IsVectorized: true,
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "severity",
+		ObjectScope:  "issue",
+		FieldType:    "text",
+		IsSearchable: true,
+		IsVectorized: true,
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "theme",
+		ObjectScope:  "group",
+		FieldType:    "text",
+		IsSearchable: true,
+		IsVectorized: true,
+	}, "")
+	require.NoError(t, err)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "mixed",
+		Title: "Auth group",
+	}, "")
+	require.NoError(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "issue", 11, "")
+	require.NoError(t, err)
+
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"intent": "retry auth safely"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "issue", 11, nil, map[string]any{"severity": "critical auth outage"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "group", 0, &group.ID, map[string]any{"theme": "auth recovery"}, "")
+	require.NoError(t, err)
+
+	drainIndexJobs(t, ctx, db, service.indexer)
+
+	textResults, err := service.SearchText(ctx, "acme", "widgets", "auth", []string{"pull_request", "issue", "group"}, 10)
+	require.NoError(t, err)
+	require.Len(t, textResults, 3)
+
+	similarResults, err := service.SearchSimilar(ctx, "acme", "widgets", "critical auth outage", []string{"pull_request", "issue", "group"}, 10)
+	require.NoError(t, err)
+	require.Len(t, similarResults, 3)
+}
+
+func TestListRepositoryAccessGrantsReturnsStoredGrants(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestServiceWithChecker(t, grantTestChecker{
+		allowed: false,
+		identity: permissions.Identity{
+			GitHubUserID: 1,
+			GitHubLogin:  "grantor",
+		},
+	})
+	defer server.Close()
+
+	_, err := service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{
+		GitHubUserID:          2,
+		GitHubLogin:           "writer",
+		Role:                  "writer",
+		GrantedByGitHubUserID: 1,
+		GrantedByGitHubLogin:  "grantor",
+	})
+	require.NoError(t, err)
+
+	grants, err := service.ListRepositoryAccessGrants(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, grants, 1)
+	require.Equal(t, "writer", grants[0].GitHubLogin)
+}
+
+func TestFieldDefinitionLifecycleMethods(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissionsActor()
+	textField, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "intent",
+		ObjectScope:  "pull_request",
+		FieldType:    "text",
+		IsSearchable: true,
+	}, "")
+	require.NoError(t, err)
+
+	enumField, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "severity",
+		ObjectScope:  "pull_request",
+		FieldType:    "enum",
+		EnumValues:   []string{"low", "high"},
+		IsFilterable: true,
+	}, "")
+	require.NoError(t, err)
+
+	fields, err := service.ListFieldDefinitions(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, fields, 2)
+
+	updated, err := service.UpdateFieldDefinition(ctx, actor, "acme", "widgets", enumField.ID, FieldDefinitionPatchInput{
+		DisplayName:        stringPtr("Severity"),
+		EnumValues:         &[]string{"low", "high", "critical"},
+		IsRequired:         boolPtr(true),
+		IsFilterable:       boolPtr(true),
+		IsSearchable:       boolPtr(true),
+		IsVectorized:       boolPtr(true),
+		SortOrder:          intPtr(7),
+		ExpectedRowVersion: intPtr(enumField.RowVersion),
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "Severity", updated.DisplayName)
+	require.Equal(t, 7, updated.SortOrder)
+
+	archived, err := service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", textField.ID, intPtr(textField.RowVersion), "")
+	require.NoError(t, err)
+	require.NotNil(t, archived.ArchivedAt)
+
+	archivedAgain, err := service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", textField.ID, nil, "")
+	require.NoError(t, err)
+	require.NotNil(t, archivedAgain.ArchivedAt)
+
+	manifest, err := service.ExportManifest(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, manifest.Fields, 2)
+	_, err = service.ImportManifest(ctx, actor, "acme", "widgets", Manifest{}, "")
+	require.Error(t, err)
+
+	var eventCount int64
+	require.NoError(t, db.WithContext(ctx).Model(&database.Event{}).Count(&eventCount).Error)
+	require.Greater(t, eventCount, int64(0))
+}
+
+func TestGroupAnnotationAndFilterMethods(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissionsActor()
+	for _, field := range []FieldDefinitionInput{
+		{Name: "intent", ObjectScope: "pull_request", FieldType: "text"},
+		{Name: "ready", ObjectScope: "pull_request", FieldType: "boolean", IsFilterable: true},
+		{Name: "count", ObjectScope: "pull_request", FieldType: "integer", IsFilterable: true},
+		{Name: "severity", ObjectScope: "pull_request", FieldType: "enum", EnumValues: []string{"low", "high"}, IsFilterable: true},
+		{Name: "labels", ObjectScope: "pull_request", FieldType: "multi_enum", EnumValues: []string{"bug", "auth"}, IsFilterable: true},
+		{Name: "theme", ObjectScope: "group", FieldType: "text"},
+	} {
+		_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", field, "")
+		require.NoError(t, err)
+	}
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "pull_request", Title: "Auth fixes"}, "")
+	require.NoError(t, err)
+	group, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{
+		Description:        stringPtr("Track auth fixes"),
+		Status:             stringPtr("closed"),
+		ExpectedRowVersion: intPtr(group.RowVersion),
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "closed", group.Status)
+
+	member, err := service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+	require.Equal(t, 22, member.ObjectNumber)
+	err = service.RemoveGroupMember(ctx, actor, group.PublicID, 999, "")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	annotations, err := service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{
+		"intent":   "retry auth safely",
+		"ready":    true,
+		"count":    int64(2),
+		"severity": "high",
+		"labels":   []any{"auth", "bug"},
+	}, "")
+	require.NoError(t, err)
+	require.Equal(t, "high", annotations.Annotations["severity"])
+
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "group", 0, &group.ID, map[string]any{
+		"theme": "reliability",
+	}, "")
+	require.NoError(t, err)
+
+	objectAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "pull_request", 22, nil)
+	require.NoError(t, err)
+	require.Equal(t, true, objectAnnotations.Annotations["ready"])
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"intent": nil}, "")
+	require.NoError(t, err)
+	objectAnnotations, err = service.GetAnnotations(ctx, "acme", "widgets", "pull_request", 22, nil)
+	require.NoError(t, err)
+	require.Nil(t, objectAnnotations.Annotations["intent"])
+	groupAnnotations, err := service.GetAnnotations(ctx, "acme", "widgets", "group", 0, &group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "reliability", groupAnnotations.Annotations["theme"])
+
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"unknown": "x"}, "")
+	require.Error(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{}, "")
+	require.Error(t, err)
+
+	for _, tc := range []struct {
+		field string
+		value string
+	}{
+		{field: "ready", value: "true"},
+		{field: "count", value: "2"},
+		{field: "severity", value: "high"},
+		{field: "labels", value: "bug"},
+	} {
+		results, err := service.FilterTargets(ctx, "acme", "widgets", "pull_request", tc.field, tc.value)
+		require.NoError(t, err)
+		require.NotEmpty(t, results)
+	}
+	_, err = service.FilterTargets(ctx, "acme", "widgets", "pull_request", "count", "bad")
+	require.Error(t, err)
+
+	statuses, err := service.ListGroupCommentSyncTargets(ctx, actor, "acme", "widgets")
+	require.NoError(t, err)
+	require.Empty(t, statuses)
+
+	_, err = service.SyncGroupComments(ctx, actor, group.PublicID)
+	var fail *FailError
+	require.ErrorAs(t, err, &fail)
+	require.Equal(t, 503, fail.StatusCode)
+
+	require.NoError(t, service.RemoveGroupMember(ctx, actor, group.PublicID, member.ID, ""))
+
+	var members int64
+	require.NoError(t, db.WithContext(ctx).Model(&database.GroupMember{}).Where("group_id = ?", group.ID).Count(&members).Error)
+	require.Zero(t, members)
+}
+
+func TestRepositoryAccessGrantLifecycleMethods(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	_, err := service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{})
+	require.Error(t, err)
+
+	grant, err := service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{
+		GitHubUserID:          2,
+		GitHubLogin:           "writer",
+		Role:                  "writer",
+		GrantedByGitHubUserID: 1,
+		GrantedByGitHubLogin:  "grantor",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "writer", grant.Role)
+
+	allowed, err := service.hasRepositoryWriteGrant(ctx, 101, 2)
+	require.NoError(t, err)
+	require.True(t, allowed)
+
+	require.NoError(t, service.DeleteRepositoryAccessGrant(ctx, "acme", "widgets", 2))
+	allowed, err = service.hasRepositoryWriteGrant(ctx, 101, 2)
+	require.NoError(t, err)
+	require.False(t, allowed)
+	require.ErrorIs(t, service.DeleteRepositoryAccessGrant(ctx, "acme", "widgets", 2), ErrNotFound)
+}
+
+func TestSyncGroupCommentsUsesCommentSyncService(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissionsActor()
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "mixed", Title: "Auth sync"}, "")
+	require.NoError(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.NoError(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "issue", 11, "")
+	require.NoError(t, err)
+
+	dispatcher := &commentSyncDispatcherStub{}
+	_, client := newTestGitHubCommentClient(t)
+	commentSync := NewCommentSyncService(db, client, dispatcher)
+	service.SetCommentSync(commentSync)
+
+	result, err := service.SyncGroupComments(ctx, actor, group.PublicID)
+	require.NoError(t, err)
+	require.Equal(t, 2, result.SyncTargetCount)
+
+	statuses, err := service.ListGroupCommentSyncTargets(ctx, actor, "acme", "widgets")
+	require.NoError(t, err)
+	require.NotEmpty(t, statuses)
+}
+
+func TestAccessGrantServiceMethods(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	_, err := service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{})
+	require.Error(t, err)
+
+	grant, err := service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{
+		GitHubUserID:          77,
+		GitHubLogin:           "writer",
+		Role:                  "",
+		GrantedByGitHubUserID: 1,
+		GrantedByGitHubLogin:  "grantor",
+	})
+	require.NoError(t, err)
+	require.Equal(t, repositoryAccessGrantRoleWriter, grant.Role)
+
+	grants, err := service.ListRepositoryAccessGrants(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, grants, 1)
+
+	allowed, err := service.hasRepositoryWriteGrant(ctx, grant.GitHubRepositoryID, grant.GitHubUserID)
+	require.NoError(t, err)
+	require.True(t, allowed)
+
+	require.NoError(t, service.DeleteRepositoryAccessGrant(ctx, "acme", "widgets", grant.GitHubUserID))
+	allowed, err = service.hasRepositoryWriteGrant(ctx, grant.GitHubRepositoryID, grant.GitHubUserID)
+	require.NoError(t, err)
+	require.False(t, allowed)
+	require.ErrorIs(t, service.DeleteRepositoryAccessGrant(ctx, "acme", "widgets", grant.GitHubUserID), ErrNotFound)
+}
+
+func TestServiceErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissionsActor()
+
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{}, "")
+	require.Error(t, err)
+
+	_, err = service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{}, "")
+	require.Error(t, err)
+
+	_, err = service.UpdateGroup(ctx, actor, "missing-group", GroupPatchInput{Title: stringPtr("Updated")}, "")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "pull_request", Title: "Auth"}, "")
+	require.NoError(t, err)
+
+	_, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{Title: stringPtr(" ")}, "")
+	require.Error(t, err)
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "issue", 11, "")
+	require.Error(t, err)
+	err = service.RemoveGroupMember(ctx, actor, group.PublicID, 99999, "")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = service.UpdateFieldDefinition(ctx, actor, "acme", "widgets", 99999, FieldDefinitionPatchInput{DisplayName: stringPtr("Nope")}, "")
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", 99999, nil, "")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = service.SyncGroupComments(ctx, actor, "missing-group")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = service.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{})
+	require.Error(t, err)
+	err = service.DeleteRepositoryAccessGrant(ctx, "acme", "widgets", 0)
+	require.Error(t, err)
+}
+
+func TestServicePermissionAndAlreadyArchivedBranches(t *testing.T) {
+	ctx := context.Background()
+	deny := grantTestChecker{}
+	service, db, server := newTestServiceWithChecker(t, deny)
+	defer server.Close()
+
+	actor := permissionsActor()
+	now := time.Now().UTC()
+	field := database.FieldDefinition{
+		GitHubRepositoryID: 101,
+		RepositoryOwner:    "acme",
+		RepositoryName:     "widgets",
+		Name:               "intent",
+		DisplayName:        "Intent",
+		ObjectScope:        "pull_request",
+		FieldType:          "text",
+		CreatedBy:          actor.ID,
+		UpdatedBy:          actor.ID,
+		RowVersion:         1,
+	}
+	require.NoError(t, db.Create(&field).Error)
+	group := database.Group{
+		PublicID:           "tender-robin-j7v2",
+		GitHubRepositoryID: 101,
+		RepositoryOwner:    "acme",
+		RepositoryName:     "widgets",
+		Kind:               "pull_request",
+		Title:              "Permission denied group",
+		Status:             "open",
+		CreatedBy:          actor.ID,
+		UpdatedBy:          actor.ID,
+		RowVersion:         1,
+	}
+	require.NoError(t, db.Create(&group).Error)
+
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "severity",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.ErrorIs(t, err, ErrForbidden)
+
+	_, err = service.UpdateFieldDefinition(ctx, actor, "acme", "widgets", field.ID, FieldDefinitionPatchInput{
+		DisplayName: stringPtr("Intent v2"),
+	}, "")
+	require.ErrorIs(t, err, ErrForbidden)
+
+	_, err = service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", field.ID, nil, "")
+	require.ErrorIs(t, err, ErrForbidden)
+
+	_, err = service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "pull_request", Title: "Denied"}, "")
+	require.ErrorIs(t, err, ErrForbidden)
+
+	_, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{Title: stringPtr("Nope")}, "")
+	require.ErrorIs(t, err, ErrForbidden)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
+	require.ErrorIs(t, err, ErrForbidden)
+	err = service.RemoveGroupMember(ctx, actor, group.PublicID, 1, "")
+	require.ErrorIs(t, err, ErrForbidden)
+
+	allowService, allowDB, allowServer := newTestService(t)
+	defer allowServer.Close()
+	archivedField := database.FieldDefinition{
+		GitHubRepositoryID: 101,
+		RepositoryOwner:    "acme",
+		RepositoryName:     "widgets",
+		Name:               "summary",
+		DisplayName:        "Summary",
+		ObjectScope:        "pull_request",
+		FieldType:          "text",
+		CreatedBy:          actor.ID,
+		UpdatedBy:          actor.ID,
+		ArchivedAt:         &now,
+		RowVersion:         3,
+	}
+	require.NoError(t, allowDB.Create(&archivedField).Error)
+	result, err := allowService.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", archivedField.ID, intPtr(3), "")
+	require.NoError(t, err)
+	require.NotNil(t, result.ArchivedAt)
+	require.Equal(t, 3, result.RowVersion)
+
+	err = allowService.DeleteRepositoryAccessGrant(ctx, "acme", "widgets", 999)
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
+}
+
+func TestCreateGroupReturnsPublicIDGenerationError(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	original := crand.Reader
+	crand.Reader = errReader{}
+	defer func() { crand.Reader = original }()
+
+	_, err := service.CreateGroup(ctx, permissionsActor(), "acme", "widgets", GroupInput{
+		Kind:  "mixed",
+		Title: "Entropy failure",
+	}, "")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "generate entropy")
+}
+
+func TestFieldAndManifestOuterMethodBranches(t *testing.T) {
+	ctx := context.Background()
+	service, _, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissionsActor()
+
+	created, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "intent",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "intent",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.Error(t, err)
+
+	_, err = service.UpdateFieldDefinition(ctx, actor, "acme", "widgets", created.ID, FieldDefinitionPatchInput{
+		DisplayName:        stringPtr("Intent"),
+		ExpectedRowVersion: intPtr(999),
+	}, "")
+	require.Error(t, err)
+
+	archived, err := service.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", created.ID, intPtr(created.RowVersion), "")
+	require.NoError(t, err)
+	require.NotNil(t, archived.ArchivedAt)
+
+	manifestFields, err := service.ImportManifest(ctx, actor, "acme", "widgets", Manifest{
+		Version: "v1",
+		Fields: []FieldDefinitionInput{
+			{Name: "priority", ObjectScope: "pull_request", FieldType: "enum", EnumValues: []string{"low", "high"}, IsFilterable: true},
+			{Name: "theme", ObjectScope: "group", FieldType: "text"},
+		},
+	}, "")
+	require.NoError(t, err)
+	require.Len(t, manifestFields, 2)
+
+	_, err = service.ImportManifest(ctx, actor, "acme", "widgets", Manifest{}, "")
+	require.Error(t, err)
+	_, err = service.ImportManifest(ctx, actor, "acme", "widgets", Manifest{
+		Version: "v1",
+		Fields:  []FieldDefinitionInput{{Name: "", ObjectScope: "pull_request", FieldType: "text"}},
+	}, "")
+	require.Error(t, err)
+
+	denyService, _, denyServer := newTestServiceWithChecker(t, grantTestChecker{})
+	defer denyServer.Close()
+	_, err = denyService.ImportManifest(ctx, actor, "acme", "widgets", Manifest{
+		Version: "v1",
+		Fields:  []FieldDefinitionInput{{Name: "intent", ObjectScope: "pull_request", FieldType: "text"}},
+	}, "")
+	require.ErrorIs(t, err, ErrForbidden)
+}
+
+func TestGetAnnotationsHelperBranches(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissionsActor()
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "mixed", Title: "Annotations"}, "")
+	require.NoError(t, err)
+
+	field, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "theme",
+		ObjectScope: "group",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+	require.NoError(t, db.Create(&database.FieldValue{
+		FieldDefinitionID:  field.ID,
+		GitHubRepositoryID: group.GitHubRepositoryID,
+		RepositoryOwner:    group.RepositoryOwner,
+		RepositoryName:     group.RepositoryName,
+		TargetType:         "group",
+		GroupID:            &group.ID,
+		TargetKey:          groupTargetKey(group.PublicID),
+		StringValue:        stringPtr("auth"),
+		UpdatedBy:          actor.ID,
+	}).Error)
+
+	annotations, err := service.getAnnotationsForTarget(ctx, "group", group.GitHubRepositoryID, 0, &group.ID)
+	require.NoError(t, err)
+	require.Equal(t, "auth", annotations["theme"])
+
+	_, err = service.getAnnotationsForTarget(ctx, "group", group.GitHubRepositoryID, 0, uintPtr(99999))
+	require.Error(t, err)
+}
+
+func TestServiceBulkOuterErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	badService := NewService(db, ghreplica.NewClient("http://127.0.0.1:1"), permissions.AllowAllChecker{}, service.indexer)
+	actor := permissionsActor()
+
+	_, err := badService.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "intent",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.Error(t, err)
+	_, err = badService.ListFieldDefinitions(ctx, "acme", "widgets")
+	require.Error(t, err)
+	_, err = badService.UpdateFieldDefinition(ctx, actor, "acme", "widgets", 1, FieldDefinitionPatchInput{DisplayName: stringPtr("Intent")}, "")
+	require.Error(t, err)
+	_, err = badService.ArchiveFieldDefinition(ctx, actor, "acme", "widgets", 1, nil, "")
+	require.Error(t, err)
+	_, err = badService.ExportManifest(ctx, "acme", "widgets")
+	require.Error(t, err)
+	_, err = badService.ImportManifest(ctx, actor, "acme", "widgets", Manifest{
+		Version: "v1",
+		Fields:  []FieldDefinitionInput{{Name: "intent", ObjectScope: "pull_request", FieldType: "text"}},
+	}, "")
+	require.Error(t, err)
+	_, err = badService.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "mixed", Title: "Broken"}, "")
+	require.Error(t, err)
+	_, err = badService.ListGroups(ctx, "acme", "widgets")
+	require.Error(t, err)
+	_, err = badService.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"intent": "x"}, "")
+	require.Error(t, err)
+	_, err = badService.GetAnnotations(ctx, "acme", "widgets", "pull_request", 22, nil)
+	require.Error(t, err)
+	_, err = badService.FilterTargets(ctx, "acme", "widgets", "pull_request", "intent", "x")
+	require.Error(t, err)
+
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{Kind: "pull_request", Title: "Group"}, "")
+	require.NoError(t, err)
+
+	_, _, _, err = service.GetGroup(ctx, "missing-group", GetGroupOptions{})
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = service.AddGroupMember(ctx, actor, "missing-group", "pull_request", 22, "")
+	require.ErrorIs(t, err, ErrNotFound)
+	err = service.RemoveGroupMember(ctx, actor, "missing-group", 1, "")
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = service.SyncGroupComments(ctx, actor, "missing-group")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	_, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{}, "")
+	require.Error(t, err)
+	_, err = service.UpdateGroup(ctx, actor, group.PublicID, GroupPatchInput{
+		Title:              stringPtr("Updated"),
+		ExpectedRowVersion: intPtr(999),
+	}, "")
+	require.Error(t, err)
+
+	_, err = service.ListGroupCommentSyncTargets(ctx, actor, "missing", "repo")
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
 func newTestService(t *testing.T) (*Service, *gorm.DB, *httptest.Server) {
 	return newTestServiceWithBatchOptions(t, batchBehavior{})
 }
@@ -609,105 +1362,125 @@ func newTestGHReplicaServer(t *testing.T, behavior batchBehavior) *httptest.Serv
 
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/github/repos/acme/widgets":
-			_, _ = w.Write([]byte(`{
-				"id": 101,
-				"name": "widgets",
-				"full_name": "acme/widgets",
-				"html_url": "https://github.com/acme/widgets",
-				"visibility": "public",
-				"private": false,
-				"owner": {"login": "acme"}
-			}`))
-		case "/v1/github/repos/acme/widgets/pulls/22":
-			if behavior.objectDelay > 0 {
-				time.Sleep(behavior.objectDelay)
-			}
-			_, _ = w.Write([]byte(`{
-				"id": 2022,
-				"number": 22,
-				"title": "Retry ACP turns safely",
-				"state": "open",
-				"html_url": "https://github.com/acme/widgets/pull/22",
-				"updated_at": "2026-04-16T12:00:00Z",
-				"user": {"login": "bob"}
-			}`))
-		case "/v1/github/repos/acme/widgets/issues/11":
-			if behavior.objectDelay > 0 {
-				time.Sleep(behavior.objectDelay)
-			}
-			_, _ = w.Write([]byte(`{
-				"id": 1111,
-				"number": 11,
-				"title": "Auth retries are flaky",
-				"state": "open",
-				"html_url": "https://github.com/acme/widgets/issues/11",
-				"updated_at": "2026-04-16T12:00:00Z",
-				"user": {"login": "alice"}
-			}`))
-		case "/v1/github-ext/repos/acme/widgets/objects/batch":
-			if behavior.calls != nil {
-				behavior.calls.Add(1)
-			}
-			if behavior.delay > 0 {
-				time.Sleep(behavior.delay)
-			}
-			if behavior.fail {
-				http.Error(w, `{"error":"batch unavailable"}`, http.StatusBadGateway)
-				return
-			}
-			var input struct {
-				Objects []ghreplica.BatchObjectRef `json:"objects"`
-			}
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
-
-			results := make([]map[string]any, 0, len(input.Objects))
-			for _, object := range input.Objects {
-				switch {
-				case object.Type == "pull_request" && object.Number == 22:
-					results = append(results, map[string]any{
-						"type":   object.Type,
-						"number": object.Number,
-						"found":  true,
-						"object": map[string]any{
-							"id":         2022,
-							"number":     22,
-							"title":      "Retry ACP turns safely (batched)",
-							"state":      "open",
-							"html_url":   "https://github.com/acme/widgets/pull/22",
-							"updated_at": "2026-04-16T13:00:00Z",
-							"user":       map[string]any{"login": "bob"},
-						},
-					})
-				case object.Type == "issue" && object.Number == 11:
-					results = append(results, map[string]any{
-						"type":   object.Type,
-						"number": object.Number,
-						"found":  true,
-						"object": map[string]any{
-							"id":         1111,
-							"number":     11,
-							"title":      "Auth retries are flaky (batched)",
-							"state":      "open",
-							"html_url":   "https://github.com/acme/widgets/issues/11",
-							"updated_at": "2026-04-16T13:00:00Z",
-							"user":       map[string]any{"login": "alice"},
-						},
-					})
-				default:
-					results = append(results, map[string]any{
-						"type":   object.Type,
-						"number": object.Number,
-						"found":  false,
-					})
-				}
-			}
-			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
-		default:
-			http.NotFound(w, r)
+		if writeTestObjectResponse(w, r.URL.Path, behavior.objectDelay) {
+			return
 		}
+		if r.URL.Path == "/v1/github-ext/repos/acme/widgets/objects/batch" {
+			writeTestBatchResponse(t, w, r, behavior)
+			return
+		}
+		http.NotFound(w, r)
 	}))
+}
+
+func writeTestObjectResponse(w http.ResponseWriter, path string, delay time.Duration) bool {
+	switch path {
+	case "/v1/github/repos/acme/widgets":
+		_, _ = w.Write([]byte(`{
+			"id": 101,
+			"name": "widgets",
+			"full_name": "acme/widgets",
+			"html_url": "https://github.com/acme/widgets",
+			"visibility": "public",
+			"private": false,
+			"owner": {"login": "acme"}
+		}`))
+		return true
+	case "/v1/github/repos/acme/widgets/pulls/22":
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		_, _ = w.Write([]byte(`{
+			"id": 2022,
+			"number": 22,
+			"title": "Retry ACP turns safely",
+			"state": "open",
+			"html_url": "https://github.com/acme/widgets/pull/22",
+			"updated_at": "2026-04-16T12:00:00Z",
+			"user": {"login": "bob"}
+		}`))
+		return true
+	case "/v1/github/repos/acme/widgets/issues/11":
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		_, _ = w.Write([]byte(`{
+			"id": 1111,
+			"number": 11,
+			"title": "Auth retries are flaky",
+			"state": "open",
+			"html_url": "https://github.com/acme/widgets/issues/11",
+			"updated_at": "2026-04-16T12:00:00Z",
+			"user": {"login": "alice"}
+		}`))
+		return true
+	default:
+		return false
+	}
+}
+
+func writeTestBatchResponse(t *testing.T, w http.ResponseWriter, r *http.Request, behavior batchBehavior) {
+	t.Helper()
+	if behavior.calls != nil {
+		behavior.calls.Add(1)
+	}
+	if behavior.delay > 0 {
+		time.Sleep(behavior.delay)
+	}
+	if behavior.fail {
+		http.Error(w, `{"error":"batch unavailable"}`, http.StatusBadGateway)
+		return
+	}
+	var input struct {
+		Objects []ghreplica.BatchObjectRef `json:"objects"`
+	}
+	require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+	results := make([]map[string]any, 0, len(input.Objects))
+	for _, object := range input.Objects {
+		results = append(results, testBatchObjectResult(object))
+	}
+	require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
+}
+
+func testBatchObjectResult(object ghreplica.BatchObjectRef) map[string]any {
+	switch {
+	case object.Type == "pull_request" && object.Number == 22:
+		return map[string]any{
+			"type":   object.Type,
+			"number": object.Number,
+			"found":  true,
+			"object": map[string]any{
+				"id":         2022,
+				"number":     22,
+				"title":      "Retry ACP turns safely (batched)",
+				"state":      "open",
+				"html_url":   "https://github.com/acme/widgets/pull/22",
+				"updated_at": "2026-04-16T13:00:00Z",
+				"user":       map[string]any{"login": "bob"},
+			},
+		}
+	case object.Type == "issue" && object.Number == 11:
+		return map[string]any{
+			"type":   object.Type,
+			"number": object.Number,
+			"found":  true,
+			"object": map[string]any{
+				"id":         1111,
+				"number":     11,
+				"title":      "Auth retries are flaky (batched)",
+				"state":      "open",
+				"html_url":   "https://github.com/acme/widgets/issues/11",
+				"updated_at": "2026-04-16T13:00:00Z",
+				"user":       map[string]any{"login": "alice"},
+			},
+		}
+	default:
+		return map[string]any{
+			"type":   object.Type,
+			"number": object.Number,
+			"found":  false,
+		}
+	}
 }
 
 func drainIndexJobs(t *testing.T, ctx context.Context, db *gorm.DB, indexer *Indexer) {
@@ -722,4 +1495,12 @@ func drainIndexJobs(t *testing.T, ctx context.Context, db *gorm.DB, indexer *Ind
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("index jobs did not drain")
+}
+
+func stringPtr(value string) *string {
+	return &value
+}
+
+func intPtr(value int) *int {
+	return &value
 }

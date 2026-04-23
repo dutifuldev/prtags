@@ -38,3 +38,46 @@ func TestValidateRejectsInvalidDatabasePoolSettings(t *testing.T) {
 	err := cfg.Validate()
 	require.ErrorContains(t, err, "DB_MAX_IDLE_CONNS cannot exceed DB_MAX_OPEN_CONNS")
 }
+
+func TestConfigHelpersAndGitHubAppValidation(t *testing.T) {
+	t.Setenv("BOOL_ENV", "true")
+	t.Setenv("INT_ENV", "17")
+	t.Setenv("DURATION_ENV", "3s")
+	require.True(t, envBool("BOOL_ENV", false))
+	require.Equal(t, 17, envInt("INT_ENV", 0))
+	require.Equal(t, 3*time.Second, envDuration("DURATION_ENV", 0))
+	require.Equal(t, "fallback", envOrDefault("MISSING_ENV", "fallback"))
+
+	cfg := Config{
+		DatabaseURL:             "sqlite:///tmp/test.db",
+		DBMaxOpenConns:          1,
+		DBMaxIdleConns:          1,
+		DBConnMaxIdleTime:       time.Minute,
+		DBConnMaxLifetime:       time.Minute,
+		GHReplicaBaseURL:        "https://ghreplica.example",
+		WorkerPollInterval:      time.Second,
+		EmbeddingModel:          "local-hash@1",
+		GitHubAppID:             "1",
+		GitHubInstallationID:    "2",
+		GitHubAppPrivateKeyPath: "/tmp/key.pem",
+	}
+	require.True(t, cfg.HasGitHubApp())
+	require.NoError(t, cfg.Validate())
+
+	cfg.GitHubAppPrivateKeyPath = ""
+	cfg.GitHubAppPrivateKeyPEM = ""
+	err := cfg.Validate()
+	require.ErrorContains(t, err, "GITHUB_APP_PRIVATE_KEY_PEM or GITHUB_APP_PRIVATE_KEY_PATH")
+
+	cfg.GitHubAppID = ""
+	require.True(t, hasAnyGitHubAppValue(cfg))
+	require.ErrorContains(t, validateGitHubApp(cfg), "GITHUB_APP_ID is required")
+}
+
+func TestConfigValidationErrors(t *testing.T) {
+	require.ErrorContains(t, validateDatabase(Config{}), "DATABASE_URL is required")
+	require.ErrorContains(t, validatePool(Config{DBMaxOpenConns: 0, DBMaxIdleConns: 0, DBConnMaxIdleTime: time.Second, DBConnMaxLifetime: time.Second}), "DB_MAX_OPEN_CONNS")
+	require.ErrorContains(t, validateReplicaAndWorker(Config{GHReplicaBaseURL: "", WorkerPollInterval: time.Second}), "GHREPLICA_BASE_URL is required")
+	require.ErrorContains(t, validateReplicaAndWorker(Config{GHReplicaBaseURL: "https://ghreplica.example"}), "WORKER_POLL_INTERVAL")
+	require.ErrorContains(t, validateEmbedding(Config{}), "EMBEDDING_MODEL is required")
+}
