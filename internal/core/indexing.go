@@ -2,8 +2,11 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log/slog"
+	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -47,49 +50,12 @@ func (s *Service) SearchText(ctx context.Context, owner, repo, query string, tar
 	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-	if len(targetTypes) == 0 {
-		targetTypes = []string{"pull_request", "issue", "group"}
-	}
-
-	rows, err := s.db.WithContext(ctx).
-		Raw(`
-			SELECT github_repository_id, target_type, target_key,
-			       ts_rank_cd(to_tsvector('simple', search_text), websearch_to_tsquery('simple', ?)) AS score
-			FROM search_documents
-			WHERE github_repository_id = ?
-			  AND target_type IN ?
-			  AND to_tsvector('simple', search_text) @@ websearch_to_tsquery('simple', ?)
-			ORDER BY score DESC, indexed_at DESC
-			LIMIT ?
-		`, query, repository.GitHubRepositoryID, targetTypes, query, limit).Rows()
+	limit, targetTypes = normalizeSearchRequest(limit, targetTypes)
+	rows, err := s.searchTextRows(ctx, repository.GitHubRepositoryID, query, targetTypes, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	results := []TextSearchResult{}
-	for rows.Next() {
-		var (
-			repoID     int64
-			targetType string
-			targetKey  string
-			score      float64
-		)
-		if err := rows.Scan(&repoID, &targetType, &targetKey, &score); err != nil {
-			return nil, err
-		}
-		result, err := s.buildSearchResult(ctx, repository.GitHubRepositoryID, targetType, targetKey, score)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-	return results, nil
+	return s.resolveSearchResults(ctx, repository.GitHubRepositoryID, rows)
 }
 
 func (s *Service) SearchSimilar(ctx context.Context, owner, repo, query string, targetTypes []string, limit int) ([]TextSearchResult, error) {
@@ -97,54 +63,16 @@ func (s *Service) SearchSimilar(ctx context.Context, owner, repo, query string, 
 	if err != nil {
 		return nil, err
 	}
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-	if len(targetTypes) == 0 {
-		targetTypes = []string{"pull_request", "issue", "group"}
-	}
-
+	limit, targetTypes = normalizeSearchRequest(limit, targetTypes)
 	vectorValues, err := s.indexer.embedding.Embed(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-	queryVector := pgvector.NewVector(vectorValues)
-
-	rows, err := s.db.WithContext(ctx).
-		Raw(`
-			SELECT github_repository_id, target_type, target_key, (1 - (embedding <=> ?)) AS score
-			FROM embeddings
-			WHERE github_repository_id = ?
-			  AND embedding_model = ?
-			  AND target_type IN ?
-			ORDER BY embedding <=> ?
-			LIMIT ?
-		`, queryVector, repository.GitHubRepositoryID, s.indexer.embedding.Model(), targetTypes, queryVector, limit).Rows()
+	rows, err := s.searchSimilarRows(ctx, repository.GitHubRepositoryID, vectorValues, targetTypes, limit)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	results := []TextSearchResult{}
-	for rows.Next() {
-		var (
-			repoID     int64
-			targetType string
-			targetKey  string
-			score      float64
-		)
-		if err := rows.Scan(&repoID, &targetType, &targetKey, &score); err != nil {
-			return nil, err
-		}
-		result, err := s.buildSearchResult(ctx, repository.GitHubRepositoryID, targetType, targetKey, score)
-		if err != nil {
-			return nil, err
-		}
-		results = append(results, result)
-	}
-	return results, nil
+	return s.resolveSearchResults(ctx, repository.GitHubRepositoryID, rows)
 }
 
 func (s *Service) buildSearchResult(ctx context.Context, repositoryID int64, targetType, targetKey string, score float64) (TextSearchResult, error) {
@@ -154,37 +82,10 @@ func (s *Service) buildSearchResult(ctx context.Context, repositoryID int64, tar
 		Score:      score,
 	}
 
-	if targetType != "group" {
-		number, ok := objectNumberFromTargetKey(targetKey)
-		if ok {
-			var projection database.TargetProjection
-			err := s.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).First(&projection).Error
-			if err == nil {
-				result.Projection = &projection
-				annotations, err := s.getAnnotationsForTarget(ctx, targetType, repositoryID, number, nil)
-				if err != nil {
-					return TextSearchResult{}, err
-				}
-				result.Annotations = annotations
-			}
-		}
-	} else {
-		groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
-		if ok {
-			group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
-			if err != nil {
-				return TextSearchResult{}, translateDBError(err)
-			}
-			annotations, err := s.getAnnotationsForTarget(ctx, "group", repositoryID, 0, &group.ID)
-			if err != nil {
-				return TextSearchResult{}, err
-			}
-			result.ID = group.PublicID
-			result.Annotations = annotations
-		}
+	if targetType == "group" {
+		return s.populateGroupSearchResult(ctx, repositoryID, targetKey, result)
 	}
-
-	return result, nil
+	return s.populateObjectSearchResult(ctx, repositoryID, targetType, targetKey, result)
 }
 
 func (i *Indexer) Start(ctx context.Context, pollInterval time.Duration) {
@@ -393,55 +294,15 @@ func (i *Indexer) rebuildEmbedding(ctx context.Context, job database.IndexJob) e
 }
 
 func (i *Indexer) buildSearchText(ctx context.Context, repositoryID int64, targetType, targetKey string) (string, time.Time, error) {
-	parts := []string{}
-	sourceUpdatedAt := time.Now().UTC()
-
-	if targetType != "group" {
-		number, ok := objectNumberFromTargetKey(targetKey)
-		if ok {
-			var projection database.TargetProjection
-			err := i.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).First(&projection).Error
-			if err == nil {
-				if strings.TrimSpace(projection.Title) != "" {
-					parts = append(parts, projection.Title)
-				}
-				sourceUpdatedAt = projection.SourceUpdatedAt
-			}
-		}
-	} else {
-		groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
-		if ok {
-			var group database.Group
-			err := i.db.WithContext(ctx).Where("public_id = ?", groupPublicID).First(&group).Error
-			if err == nil {
-				if strings.TrimSpace(group.Title) != "" {
-					parts = append(parts, group.Title)
-				}
-				if strings.TrimSpace(group.Description) != "" {
-					parts = append(parts, group.Description)
-				}
-				sourceUpdatedAt = group.UpdatedAt.UTC()
-			}
-		}
+	parts, sourceUpdatedAt, err := i.baseSearchParts(ctx, repositoryID, targetType, targetKey)
+	if err != nil {
+		return "", time.Time{}, err
 	}
-
 	values, err := i.loadFieldValues(ctx, repositoryID, targetType, targetKey)
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	for _, value := range values {
-		if value.FieldDefinition.ArchivedAt != nil || !value.FieldDefinition.IsSearchable {
-			continue
-		}
-		apiValue := fieldValueToAPI(value)
-		if apiValue == nil {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s: %v", value.FieldDefinition.Name, apiValue))
-		if value.UpdatedAt.After(sourceUpdatedAt) {
-			sourceUpdatedAt = value.UpdatedAt
-		}
-	}
+	parts, sourceUpdatedAt = appendSearchableFieldValues(parts, sourceUpdatedAt, values)
 	return strings.TrimSpace(strings.Join(parts, "\n")), sourceUpdatedAt, nil
 }
 
@@ -556,4 +417,296 @@ func groupPublicIDFromTargetKey(targetKey string) (string, bool) {
 func timePtr(value time.Time) *time.Time {
 	value = value.UTC()
 	return &value
+}
+
+type scoredSearchTarget struct {
+	TargetType string
+	TargetKey  string
+	Score      float64
+}
+
+func normalizeSearchRequest(limit int, targetTypes []string) (int, []string) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	if len(targetTypes) == 0 {
+		targetTypes = []string{"pull_request", "issue", "group"}
+	}
+	return limit, targetTypes
+}
+
+func (s *Service) searchTextRows(ctx context.Context, repositoryID int64, query string, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	if s.db.Name() == "postgres" {
+		return s.searchTextRowsPostgres(ctx, repositoryID, query, targetTypes, limit)
+	}
+	return s.searchTextRowsFallback(ctx, repositoryID, query, targetTypes, limit)
+}
+
+func (s *Service) searchTextRowsPostgres(ctx context.Context, repositoryID int64, query string, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	rows, err := s.db.WithContext(ctx).
+		Raw(`
+			SELECT github_repository_id, target_type, target_key,
+			       ts_rank_cd(to_tsvector('simple', search_text), websearch_to_tsquery('simple', ?)) AS score
+			FROM search_documents
+			WHERE github_repository_id = ?
+			  AND target_type IN ?
+			  AND to_tsvector('simple', search_text) @@ websearch_to_tsquery('simple', ?)
+			ORDER BY score DESC, indexed_at DESC
+			LIMIT ?
+		`, query, repositoryID, targetTypes, query, limit).Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanScoredSearchRows(rows)
+}
+
+func (s *Service) searchTextRowsFallback(ctx context.Context, repositoryID int64, query string, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	var documents []database.SearchDocument
+	if err := s.db.WithContext(ctx).
+		Where("github_repository_id = ? AND target_type IN ?", repositoryID, targetTypes).
+		Order("indexed_at DESC").
+		Find(&documents).Error; err != nil {
+		return nil, err
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	if query == "" {
+		return nil, nil
+	}
+	results := make([]scoredSearchTarget, 0, len(documents))
+	for _, document := range documents {
+		score := fallbackTextScore(query, document.SearchText)
+		if score <= 0 {
+			continue
+		}
+		results = append(results, scoredSearchTarget{
+			TargetType: document.TargetType,
+			TargetKey:  document.TargetKey,
+			Score:      score,
+		})
+	}
+	sortScoredSearchTargets(results)
+	return trimScoredSearchTargets(results, limit), nil
+}
+
+func (s *Service) searchSimilarRows(ctx context.Context, repositoryID int64, queryVector []float32, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	if s.db.Name() == "postgres" {
+		return s.searchSimilarRowsPostgres(ctx, repositoryID, queryVector, targetTypes, limit)
+	}
+	return s.searchSimilarRowsFallback(ctx, repositoryID, queryVector, targetTypes, limit)
+}
+
+func (s *Service) searchSimilarRowsPostgres(ctx context.Context, repositoryID int64, queryVector []float32, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	vector := pgvector.NewVector(queryVector)
+	rows, err := s.db.WithContext(ctx).
+		Raw(`
+			SELECT github_repository_id, target_type, target_key, (1 - (embedding <=> ?)) AS score
+			FROM embeddings
+			WHERE github_repository_id = ?
+			  AND embedding_model = ?
+			  AND target_type IN ?
+			ORDER BY embedding <=> ?
+			LIMIT ?
+		`, vector, repositoryID, s.indexer.embedding.Model(), targetTypes, vector, limit).Rows()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanScoredSearchRows(rows)
+}
+
+func (s *Service) searchSimilarRowsFallback(ctx context.Context, repositoryID int64, queryVector []float32, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	var embeddings []database.Embedding
+	if err := s.db.WithContext(ctx).
+		Where("github_repository_id = ? AND embedding_model = ? AND target_type IN ?", repositoryID, s.indexer.embedding.Model(), targetTypes).
+		Find(&embeddings).Error; err != nil {
+		return nil, err
+	}
+	results := make([]scoredSearchTarget, 0, len(embeddings))
+	for _, row := range embeddings {
+		score := cosineSimilarity(queryVector, row.Embedding.Slice())
+		results = append(results, scoredSearchTarget{
+			TargetType: row.TargetType,
+			TargetKey:  row.TargetKey,
+			Score:      score,
+		})
+	}
+	sortScoredSearchTargets(results)
+	return trimScoredSearchTargets(results, limit), nil
+}
+
+func scanScoredSearchRows(rows *sql.Rows) ([]scoredSearchTarget, error) {
+	results := []scoredSearchTarget{}
+	for rows.Next() {
+		var (
+			repoID     int64
+			targetType string
+			targetKey  string
+			score      float64
+		)
+		if err := rows.Scan(&repoID, &targetType, &targetKey, &score); err != nil {
+			return nil, err
+		}
+		results = append(results, scoredSearchTarget{
+			TargetType: targetType,
+			TargetKey:  targetKey,
+			Score:      score,
+		})
+	}
+	return results, nil
+}
+
+func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, rows []scoredSearchTarget) ([]TextSearchResult, error) {
+	results := make([]TextSearchResult, 0, len(rows))
+	for _, row := range rows {
+		result, err := s.buildSearchResult(ctx, repositoryID, row.TargetType, row.TargetKey, row.Score)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+func (s *Service) populateObjectSearchResult(ctx context.Context, repositoryID int64, targetType, targetKey string, result TextSearchResult) (TextSearchResult, error) {
+	number, ok := objectNumberFromTargetKey(targetKey)
+	if !ok {
+		return result, nil
+	}
+	var projection database.TargetProjection
+	err := s.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).First(&projection).Error
+	if err != nil {
+		return result, nil
+	}
+	result.Projection = &projection
+	annotations, err := s.getAnnotationsForTarget(ctx, targetType, repositoryID, number, nil)
+	if err != nil {
+		return TextSearchResult{}, err
+	}
+	result.Annotations = annotations
+	return result, nil
+}
+
+func (s *Service) populateGroupSearchResult(ctx context.Context, repositoryID int64, targetKey string, result TextSearchResult) (TextSearchResult, error) {
+	groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
+	if !ok {
+		return result, nil
+	}
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
+		return TextSearchResult{}, translateDBError(err)
+	}
+	annotations, err := s.getAnnotationsForTarget(ctx, "group", repositoryID, 0, &group.ID)
+	if err != nil {
+		return TextSearchResult{}, err
+	}
+	result.ID = group.PublicID
+	result.Annotations = annotations
+	return result, nil
+}
+
+func (i *Indexer) baseSearchParts(ctx context.Context, repositoryID int64, targetType, targetKey string) ([]string, time.Time, error) {
+	if targetType == "group" {
+		return i.groupSearchParts(ctx, targetKey)
+	}
+	return i.objectSearchParts(ctx, repositoryID, targetType, targetKey)
+}
+
+func (i *Indexer) objectSearchParts(ctx context.Context, repositoryID int64, targetType, targetKey string) ([]string, time.Time, error) {
+	number, ok := objectNumberFromTargetKey(targetKey)
+	if !ok {
+		return nil, time.Now().UTC(), nil
+	}
+	var projection database.TargetProjection
+	err := i.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).First(&projection).Error
+	if err != nil {
+		return nil, time.Now().UTC(), nil
+	}
+	parts := []string{}
+	if strings.TrimSpace(projection.Title) != "" {
+		parts = append(parts, projection.Title)
+	}
+	return parts, projection.SourceUpdatedAt, nil
+}
+
+func (i *Indexer) groupSearchParts(ctx context.Context, targetKey string) ([]string, time.Time, error) {
+	groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
+	if !ok {
+		return nil, time.Now().UTC(), nil
+	}
+	var group database.Group
+	err := i.db.WithContext(ctx).Where("public_id = ?", groupPublicID).First(&group).Error
+	if err != nil {
+		return nil, time.Now().UTC(), nil
+	}
+	parts := []string{}
+	if strings.TrimSpace(group.Title) != "" {
+		parts = append(parts, group.Title)
+	}
+	if strings.TrimSpace(group.Description) != "" {
+		parts = append(parts, group.Description)
+	}
+	return parts, group.UpdatedAt.UTC(), nil
+}
+
+func appendSearchableFieldValues(parts []string, sourceUpdatedAt time.Time, values []database.FieldValue) ([]string, time.Time) {
+	for _, value := range values {
+		if value.FieldDefinition.ArchivedAt != nil || !value.FieldDefinition.IsSearchable {
+			continue
+		}
+		apiValue := fieldValueToAPI(value)
+		if apiValue == nil {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s: %v", value.FieldDefinition.Name, apiValue))
+		if value.UpdatedAt.After(sourceUpdatedAt) {
+			sourceUpdatedAt = value.UpdatedAt
+		}
+	}
+	return parts, sourceUpdatedAt
+}
+
+func fallbackTextScore(query, text string) float64 {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if query == "" || text == "" {
+		return 0
+	}
+	return float64(strings.Count(text, query))
+}
+
+func sortScoredSearchTargets(results []scoredSearchTarget) {
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score == results[j].Score {
+			if results[i].TargetType == results[j].TargetType {
+				return results[i].TargetKey < results[j].TargetKey
+			}
+			return results[i].TargetType < results[j].TargetType
+		}
+		return results[i].Score > results[j].Score
+	})
+}
+
+func trimScoredSearchTargets(results []scoredSearchTarget, limit int) []scoredSearchTarget {
+	if limit >= len(results) {
+		return results
+	}
+	return results[:limit]
+}
+
+func cosineSimilarity(a, b []float32) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot float64
+	var normA float64
+	var normB float64
+	for i := range a {
+		dot += float64(a[i] * b[i])
+		normA += float64(a[i] * a[i])
+		normB += float64(b[i] * b[i])
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }

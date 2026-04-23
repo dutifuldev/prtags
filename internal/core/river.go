@@ -323,11 +323,8 @@ func (d *RiverDispatcher) EnqueueGroupCommentReconcileTx(tx *gorm.DB, syncTarget
 }
 
 func (d *RiverDispatcher) ImportLegacyIndexJobs(ctx context.Context, db *gorm.DB) error {
-	var jobs []database.IndexJob
-	if err := db.WithContext(ctx).
-		Where("status IN ?", []string{"pending", "processing"}).
-		Order("id ASC").
-		Find(&jobs).Error; err != nil {
+	jobs, err := legacyIndexJobs(ctx, db)
+	if err != nil {
 		return err
 	}
 	if len(jobs) == 0 {
@@ -340,28 +337,44 @@ func (d *RiverDispatcher) ImportLegacyIndexJobs(ctx context.Context, db *gorm.DB
 		if err != nil {
 			return err
 		}
-
-		for _, job := range jobs {
-			if err := d.importLegacyIndexJob(ctx, sqlTx, job); err != nil {
-				if errors.Is(err, errUnsupportedLegacyJobKind) {
-					continue
-				}
-				return err
-			}
-			if err := tx.Model(&database.IndexJob{}).
-				Where("id = ?", job.ID).
-				Updates(map[string]any{
-					"status":       "succeeded",
-					"last_error":   "migrated_to_river",
-					"lease_owner":  "",
-					"heartbeat_at": nil,
-					"updated_at":   now,
-				}).Error; err != nil {
-				return err
-			}
-		}
-		return nil
+		return d.importLegacyIndexJobsTx(ctx, tx, sqlTx, jobs, now)
 	})
+}
+
+func legacyIndexJobs(ctx context.Context, db *gorm.DB) ([]database.IndexJob, error) {
+	var jobs []database.IndexJob
+	err := db.WithContext(ctx).
+		Where("status IN ?", []string{"pending", "processing"}).
+		Order("id ASC").
+		Find(&jobs).Error
+	return jobs, err
+}
+
+func (d *RiverDispatcher) importLegacyIndexJobsTx(ctx context.Context, tx *gorm.DB, sqlTx *sql.Tx, jobs []database.IndexJob, now time.Time) error {
+	for _, job := range jobs {
+		if err := d.importLegacyIndexJob(ctx, sqlTx, job); err != nil {
+			if errors.Is(err, errUnsupportedLegacyJobKind) {
+				continue
+			}
+			return err
+		}
+		if err := markLegacyIndexJobMigrated(tx, job.ID, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func markLegacyIndexJobMigrated(tx *gorm.DB, jobID uint, now time.Time) error {
+	return tx.Model(&database.IndexJob{}).
+		Where("id = ?", jobID).
+		Updates(map[string]any{
+			"status":       "succeeded",
+			"last_error":   "migrated_to_river",
+			"lease_owner":  "",
+			"heartbeat_at": nil,
+			"updated_at":   now,
+		}).Error
 }
 
 var errUnsupportedLegacyJobKind = errors.New("unsupported legacy job kind")

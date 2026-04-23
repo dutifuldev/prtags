@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -103,4 +104,98 @@ func TestStoredTokenRoundTrip(t *testing.T) {
 	require.NoError(t, DeleteStoredToken())
 	_, err = LoadStoredToken()
 	require.Error(t, err)
+}
+
+func TestAuthHelperDefaultsAndPolling(t *testing.T) {
+	t.Setenv("PRTAGS_GITHUB_OAUTH_CLIENT_ID", "env-client")
+	t.Setenv("PRTAGS_GITHUB_OAUTH_SCOPE", "repo")
+	t.Setenv("PRTAGS_GITHUB_OAUTH_BASE_URL", "https://oauth.example")
+	t.Setenv("PRTAGS_GITHUB_API_URL", "https://api.example")
+
+	cfg := DefaultConfig()
+	require.Equal(t, "env-client", cfg.ClientID)
+	require.Equal(t, "repo", cfg.Scope)
+	require.Equal(t, "https://oauth.example", cfg.OAuthBaseURL)
+	require.Equal(t, "https://api.example", cfg.APIBaseURL)
+	require.NotNil(t, cfg.HTTPClient)
+
+	t.Setenv("LAST_ENV", "fallback")
+	require.Equal(t, "fallback", firstNonEmptyEnv("MISSING_ENV", "OTHER_ENV", "LAST_ENV"))
+
+	done, interval, err := nextPollAction(AccessTokenResponse{AccessToken: "gho"}, time.Second)
+	require.NoError(t, err)
+	require.True(t, done)
+	require.Equal(t, time.Second, interval)
+
+	done, interval, err = nextPollAction(AccessTokenResponse{Error: "slow_down"}, time.Second)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Equal(t, 6*time.Second, interval)
+
+	done, interval, err = nextPollAction(AccessTokenResponse{Error: "authorization_pending"}, 500*time.Millisecond)
+	require.NoError(t, err)
+	require.False(t, done)
+	require.Equal(t, 500*time.Millisecond, interval)
+
+	_, _, err = nextPollAction(AccessTokenResponse{Error: "access_denied", ErrorDescription: "nope"}, time.Second)
+	require.ErrorContains(t, err, "device authorization denied")
+
+	require.NoError(t, deviceFlowPreflight(context.Background(), time.Now().UTC().Add(time.Second)))
+	require.Error(t, deviceFlowPreflight(context.Background(), time.Now().UTC().Add(-time.Second)))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.Error(t, waitForNextPoll(ctx, time.Second))
+	require.NoError(t, waitForNextPoll(context.Background(), 0))
+}
+
+func TestAuthViewerAndTokenHelpers(t *testing.T) {
+	t.Run("stored token path uses config dir", func(t *testing.T) {
+		tempDir := t.TempDir()
+		t.Setenv("PRTAGS_CONFIG_DIR", tempDir)
+		path, err := StoredTokenPath()
+		require.NoError(t, err)
+		require.Equal(t, filepath.Join(tempDir, "auth.json"), path)
+	})
+
+	t.Run("load stored token rejects blank access token", func(t *testing.T) {
+		tempDir := t.TempDir()
+		t.Setenv("PRTAGS_CONFIG_DIR", tempDir)
+		raw, err := json.Marshal(StoredToken{Version: "v1"})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(tempDir, "auth.json"), raw, 0o600))
+		_, err = LoadStoredToken()
+		require.ErrorContains(t, err, "missing access_token")
+	})
+
+	t.Run("get viewer surfaces api failures", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte("upstream sad"))
+		}))
+		defer server.Close()
+
+		cfg := Config{APIBaseURL: server.URL, HTTPClient: server.Client()}.withDefaults()
+		_, err := cfg.GetViewer(context.Background(), "gho")
+		require.ErrorContains(t, err, "github user lookup failed")
+	})
+
+	t.Run("post form helper decodes errors", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("bad form"))
+		}))
+		defer server.Close()
+
+		cfg := Config{HTTPClient: server.Client()}
+		err := cfg.postFormJSON(context.Background(), server.URL, nil, &map[string]any{})
+		require.ErrorContains(t, err, "bad form")
+	})
+
+	t.Run("wait for next poll handles deadline", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		err := waitForNextPoll(ctx, time.Millisecond)
+		require.True(t, errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))
+	})
 }

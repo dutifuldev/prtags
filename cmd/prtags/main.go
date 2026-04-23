@@ -23,6 +23,7 @@ import (
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -59,37 +60,29 @@ func newAuthCommand() *cobra.Command {
 		Use:   "auth",
 		Short: "Manage PRtags GitHub authentication",
 	}
+	authCmd.AddCommand(
+		newAuthLoginCommand(),
+		newAuthStatusCommand(),
+		newAuthLogoutCommand(),
+	)
+	return authCmd
+}
 
-	var clientID string
-	var scope string
+func newAuthLoginCommand() *cobra.Command {
 	login := &cobra.Command{
 		Use:   "login",
 		Short: "Authenticate with GitHub using device flow",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := auth.DefaultConfig()
-			if cmd.Flags().Changed("client-id") {
-				cfg.ClientID = mustFlag(cmd, "client-id")
-			}
-			if cmd.Flags().Changed("scope") {
-				cfg.Scope = mustFlag(cmd, "scope")
-			}
+			cfg := authConfigFromFlags(cmd)
 			if strings.TrimSpace(cfg.ClientID) == "" {
 				return fmt.Errorf("github oauth client id is required")
 			}
-
-			ctx := cmd.Context()
-			if ctx == nil {
-				ctx = context.Background()
-			}
-
+			ctx := commandContext(cmd)
 			device, err := cfg.StartDeviceFlow(ctx)
 			if err != nil {
 				return err
 			}
-
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Open %s and enter code %s\n", device.VerificationURI, device.UserCode)
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Waiting for GitHub authorization...")
-
+			printDeviceFlowPrompt(cmd, device)
 			token, err := cfg.PollAccessToken(
 				ctx,
 				device.DeviceCode,
@@ -99,40 +92,16 @@ func newAuthCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-
-			viewer, err := cfg.GetViewer(ctx, token.AccessToken)
-			if err != nil {
-				return err
-			}
-
-			path, err := auth.SaveStoredToken(auth.StoredToken{
-				ClientID:     cfg.ClientID,
-				OAuthBaseURL: cfg.OAuthBaseURL,
-				APIBaseURL:   cfg.APIBaseURL,
-				AccessToken:  token.AccessToken,
-				TokenType:    token.TokenType,
-				Scope:        token.Scope,
-				UserLogin:    viewer.Login,
-				UserID:       viewer.ID,
-			})
-			if err != nil {
-				return err
-			}
-
-			scopes := strings.TrimSpace(token.Scope)
-			if scopes == "" {
-				scopes = cfg.Scope
-			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", viewer.Login)
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", scopes)
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Saved token to %s\n", path)
-			return nil
+			return saveViewerToken(cmd, cfg, token)
 		},
 	}
-	login.Flags().StringVar(&clientID, "client-id", auth.DefaultConfig().ClientID, "GitHub OAuth client ID")
-	login.Flags().StringVar(&scope, "scope", auth.DefaultScope, "space-delimited GitHub OAuth scopes")
+	login.Flags().String("client-id", auth.DefaultConfig().ClientID, "GitHub OAuth client ID")
+	login.Flags().String("scope", auth.DefaultScope, "space-delimited GitHub OAuth scopes")
+	return login
+}
 
-	status := &cobra.Command{
+func newAuthStatusCommand() *cobra.Command {
+	return &cobra.Command{
 		Use:   "status",
 		Short: "Show stored GitHub authentication status",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -154,8 +123,10 @@ func newAuthCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
 
-	logout := &cobra.Command{
+func newAuthLogoutCommand() *cobra.Command {
+	return &cobra.Command{
 		Use:   "logout",
 		Short: "Remove the stored GitHub authentication token",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -170,9 +141,58 @@ func newAuthCommand() *cobra.Command {
 			return nil
 		},
 	}
+}
 
-	authCmd.AddCommand(login, status, logout)
-	return authCmd
+func authConfigFromFlags(cmd *cobra.Command) auth.Config {
+	cfg := auth.DefaultConfig()
+	if cmd.Flags().Changed("client-id") {
+		cfg.ClientID = mustFlag(cmd, "client-id")
+	}
+	if cmd.Flags().Changed("scope") {
+		cfg.Scope = mustFlag(cmd, "scope")
+	}
+	return cfg
+}
+
+func commandContext(cmd *cobra.Command) context.Context {
+	ctx := cmd.Context()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func printDeviceFlowPrompt(cmd *cobra.Command, device auth.DeviceCodeResponse) {
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Open %s and enter code %s\n", device.VerificationURI, device.UserCode)
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Waiting for GitHub authorization...")
+}
+
+func saveViewerToken(cmd *cobra.Command, cfg auth.Config, token auth.AccessTokenResponse) error {
+	viewer, err := cfg.GetViewer(commandContext(cmd), token.AccessToken)
+	if err != nil {
+		return err
+	}
+	path, err := auth.SaveStoredToken(auth.StoredToken{
+		ClientID:     cfg.ClientID,
+		OAuthBaseURL: cfg.OAuthBaseURL,
+		APIBaseURL:   cfg.APIBaseURL,
+		AccessToken:  token.AccessToken,
+		TokenType:    token.TokenType,
+		Scope:        token.Scope,
+		UserLogin:    viewer.Login,
+		UserID:       viewer.ID,
+	})
+	if err != nil {
+		return err
+	}
+	scopes := strings.TrimSpace(token.Scope)
+	if scopes == "" {
+		scopes = cfg.Scope
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", viewer.Login)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", scopes)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Saved token to %s\n", path)
+	return nil
 }
 
 func newServeCommand() *cobra.Command {
@@ -180,75 +200,26 @@ func newServeCommand() *cobra.Command {
 		Use:   "serve",
 		Short: "Run the PRtags HTTP server",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := config.FromEnv()
-			if err := cfg.Validate(); err != nil {
-				return err
-			}
-
-			db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
-				MaxOpenConns:    cfg.DBMaxOpenConns,
-				MaxIdleConns:    cfg.DBMaxIdleConns,
-				ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
-				ConnMaxLifetime: cfg.DBConnMaxLifetime,
-			})
+			cfg, runtime, err := openServeRuntime()
 			if err != nil {
 				return err
 			}
-			if err := database.RunMigrations(db); err != nil {
-				return err
-			}
-			if err := database.EnsureGroupPublicIDs(context.Background(), db); err != nil {
-				return err
-			}
-
-			checker := permissions.Checker(permissions.AllowAllChecker{})
-			if !cfg.AllowUnauthWrites {
-				checker = permissions.NewGitHubChecker(0)
-			}
-
-			ghClient := ghreplica.NewClient(cfg.GHReplicaBaseURL)
-			indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
-			service := core.NewService(db, ghClient, checker, indexer)
-			var commentSync *core.CommentSyncService
-			if cfg.HasGitHubApp() {
-				commentSync = core.NewCommentSyncService(db, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
-					AppID:          cfg.GitHubAppID,
-					InstallationID: cfg.GitHubInstallationID,
-					PrivateKeyPEM:  cfg.GitHubAppPrivateKeyPEM,
-					PrivateKeyPath: cfg.GitHubAppPrivateKeyPath,
-				}), nil)
-			}
-			sqlDB, err := db.DB()
-			if err != nil {
-				return err
-			}
-			dispatcher, err := core.NewRiverDispatcher(sqlDB, indexer, commentSync)
-			if err != nil {
-				return err
-			}
-			service.SetJobDispatcher(dispatcher)
-			service.SetCommentSync(commentSync)
-			if commentSync != nil {
-				commentSync.SetDispatcher(dispatcher)
-			}
-			server := httpapi.NewServer(db, service, cfg.AllowUnauthWrites)
-
 			ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			if err := dispatcher.ImportLegacyIndexJobs(ctx, db); err != nil {
+			if err := runtime.dispatcher.ImportLegacyIndexJobs(ctx, runtime.db); err != nil {
 				return err
 			}
 			if cfg.EnableWorker {
-				if err := dispatcher.Start(ctx); err != nil {
+				if err := runtime.dispatcher.Start(ctx); err != nil {
 					return err
 				}
 			}
 			go func() {
 				<-ctx.Done()
-				_ = dispatcher.Stop(context.Background())
-				_ = server.Echo().Shutdown(context.Background())
+				_ = runtime.dispatcher.Stop(context.Background())
+				_ = runtime.server.Echo().Shutdown(context.Background())
 			}()
-			return server.Echo().Start(cfg.ListenAddr)
+			return runtime.server.Echo().Start(cfg.ListenAddr)
 		},
 	}
 }
@@ -258,61 +229,107 @@ func newWorkerCommand() *cobra.Command {
 		Use:   "worker",
 		Short: "Run River workers",
 	}
-	worker.AddCommand(&cobra.Command{
+	worker.AddCommand(newWorkerRunCommand())
+	return worker
+}
+
+type serveRuntime struct {
+	db         *gorm.DB
+	dispatcher *core.RiverDispatcher
+	server     *httpapi.Server
+}
+
+func newWorkerRunCommand() *cobra.Command {
+	return &cobra.Command{
 		Use:   "run",
 		Short: "Run background workers",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cfg := config.FromEnv()
-			if err := cfg.Validate(); err != nil {
-				return err
-			}
-			db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
-				MaxOpenConns:    cfg.DBMaxOpenConns,
-				MaxIdleConns:    cfg.DBMaxIdleConns,
-				ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
-				ConnMaxLifetime: cfg.DBConnMaxLifetime,
-			})
+			_, runtime, err := openServeRuntime()
 			if err != nil {
 				return err
 			}
-			if err := database.RunMigrations(db); err != nil {
+			if err := runtime.dispatcher.ImportLegacyIndexJobs(cmd.Context(), runtime.db); err != nil {
 				return err
 			}
-			if err := database.EnsureGroupPublicIDs(context.Background(), db); err != nil {
-				return err
-			}
-			indexer := core.NewIndexer(db, ghreplica.NewClient(cfg.GHReplicaBaseURL), embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
-			var commentSync *core.CommentSyncService
-			if cfg.HasGitHubApp() {
-				commentSync = core.NewCommentSyncService(db, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
-					AppID:          cfg.GitHubAppID,
-					InstallationID: cfg.GitHubInstallationID,
-					PrivateKeyPEM:  cfg.GitHubAppPrivateKeyPEM,
-					PrivateKeyPath: cfg.GitHubAppPrivateKeyPath,
-				}), nil)
-			}
-			sqlDB, err := db.DB()
-			if err != nil {
-				return err
-			}
-			dispatcher, err := core.NewRiverDispatcher(sqlDB, indexer, commentSync)
-			if err != nil {
-				return err
-			}
-			if commentSync != nil {
-				commentSync.SetDispatcher(dispatcher)
-			}
-			if err := dispatcher.ImportLegacyIndexJobs(cmd.Context(), db); err != nil {
-				return err
-			}
-			if err := dispatcher.Start(cmd.Context()); err != nil {
+			if err := runtime.dispatcher.Start(cmd.Context()); err != nil {
 				return err
 			}
 			<-cmd.Context().Done()
-			return dispatcher.Stop(context.Background())
+			return runtime.dispatcher.Stop(context.Background())
 		},
+	}
+}
+
+func openServeRuntime() (config.Config, serveRuntime, error) {
+	cfg := config.FromEnv()
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, serveRuntime{}, err
+	}
+	db, err := openConfiguredDatabase(cfg)
+	if err != nil {
+		return config.Config{}, serveRuntime{}, err
+	}
+	checker := permissions.Checker(permissions.AllowAllChecker{})
+	if !cfg.AllowUnauthWrites {
+		checker = permissions.NewGitHubChecker(0)
+	}
+	ghClient := ghreplica.NewClient(cfg.GHReplicaBaseURL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, checker, indexer)
+	commentSync := buildCommentSyncService(db, cfg)
+	dispatcher, err := newRiverDispatcherForDB(db, indexer, commentSync)
+	if err != nil {
+		return config.Config{}, serveRuntime{}, err
+	}
+	service.SetJobDispatcher(dispatcher)
+	service.SetCommentSync(commentSync)
+	if commentSync != nil {
+		commentSync.SetDispatcher(dispatcher)
+	}
+	return cfg, serveRuntime{
+		db:         db,
+		dispatcher: dispatcher,
+		server:     httpapi.NewServer(db, service, cfg.AllowUnauthWrites),
+	}, nil
+}
+
+func openConfiguredDatabase(cfg config.Config) (*gorm.DB, error) {
+	db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
+		MaxOpenConns:    cfg.DBMaxOpenConns,
+		MaxIdleConns:    cfg.DBMaxIdleConns,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
 	})
-	return worker
+	if err != nil {
+		return nil, err
+	}
+	if err := database.RunMigrations(db); err != nil {
+		return nil, err
+	}
+	if err := database.EnsureGroupPublicIDs(context.Background(), db); err != nil {
+		return nil, err
+	}
+	return db, nil
+}
+
+func buildCommentSyncService(db *gorm.DB, cfg config.Config) *core.CommentSyncService {
+	if !cfg.HasGitHubApp() {
+		return nil
+	}
+	return core.NewCommentSyncService(db, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
+		AppID:          cfg.GitHubAppID,
+		InstallationID: cfg.GitHubInstallationID,
+		PrivateKeyPEM:  cfg.GitHubAppPrivateKeyPEM,
+		PrivateKeyPath: cfg.GitHubAppPrivateKeyPath,
+	}), nil)
+}
+
+func newRiverDispatcherForDB(db *gorm.DB, indexer *core.Indexer, commentSync *core.CommentSyncService) (*core.RiverDispatcher, error) {
+	sqlDB, err := db.DB()
+	if err != nil {
+		return nil, err
+	}
+	return core.NewRiverDispatcher(sqlDB, indexer, commentSync)
 }
 
 //nolint:cyclop,gocognit // Cobra command assembly is intentionally declarative and easier to maintain as one block.
@@ -584,24 +601,36 @@ func newFieldCommand(serverURL *string) *cobra.Command {
 func newGroupCommand(serverURL *string) *cobra.Command {
 	groups := &cobra.Command{Use: "group"}
 	var repo string
+	groups.AddCommand(
+		newGroupCreateCommand(serverURL, &repo),
+		newGroupListCommand(serverURL, &repo),
+		newGroupGetCommand(serverURL),
+		newGroupUpdateCommand(serverURL),
+		newGroupAddMemberCommand(serverURL, "add-pr", "pull_request"),
+		newGroupAddMemberCommand(serverURL, "add-issue", "issue"),
+		newGroupSyncCommentsCommand(serverURL),
+		newGroupListCommentSyncTargetsCommand(serverURL, &repo),
+	)
+	return groups
+}
 
+func newGroupCreateCommand(serverURL *string, repo *string) *cobra.Command {
 	create := &cobra.Command{
 		Use: "create",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			owner, name, err := splitRepo(repo)
+			owner, name, err := splitRepo(*repo)
 			if err != nil {
 				return err
 			}
-			payload := map[string]any{
+			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/groups", owner, name), map[string]any{
 				"kind":        mustFlag(cmd, "kind"),
 				"title":       mustFlag(cmd, "title"),
 				"description": cmd.Flag("description").Value.String(),
 				"status":      cmd.Flag("status").Value.String(),
-			}
-			return doPrintJSON(context.Background(), *serverURL, "POST", fmt.Sprintf("/v1/repos/%s/%s/groups", owner, name), payload)
+			})
 		},
 	}
-	create.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	create.Flags().StringVarP(repo, "repo", "R", "", "repo in owner/name form")
 	_ = create.MarkFlagRequired("repo")
 	create.Flags().String("kind", "", "group kind")
 	create.Flags().String("title", "", "group title")
@@ -609,20 +638,26 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 	create.Flags().String("status", "open", "group status")
 	_ = create.MarkFlagRequired("kind")
 	_ = create.MarkFlagRequired("title")
+	return create
+}
 
+func newGroupListCommand(serverURL *string, repo *string) *cobra.Command {
 	list := &cobra.Command{
 		Use: "list",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			owner, name, err := splitRepo(repo)
+			owner, name, err := splitRepo(*repo)
 			if err != nil {
 				return err
 			}
 			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/groups", owner, name), nil)
 		},
 	}
-	list.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
+	list.Flags().StringVarP(repo, "repo", "R", "", "repo in owner/name form")
 	_ = list.MarkFlagRequired("repo")
+	return list
+}
 
+func newGroupGetCommand(serverURL *string) *cobra.Command {
 	get := &cobra.Command{
 		Use:  "get <group-id>",
 		Args: cobra.ExactArgs(1),
@@ -639,7 +674,10 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 		},
 	}
 	get.Flags().Bool("include-metadata", false, "include cached object metadata for group members")
+	return get
+}
 
+func newGroupUpdateCommand(serverURL *string) *cobra.Command {
 	update := &cobra.Command{
 		Use:  "update <group-id>",
 		Args: cobra.ExactArgs(1),
@@ -667,9 +705,16 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 	update.Flags().String("description", "", "new group description")
 	update.Flags().String("status", "", "new group status")
 	update.Flags().Int("row-version", 0, "expected current row version")
+	return update
+}
 
-	addPR := &cobra.Command{
-		Use:  "add-pr <group-id> <pr-number>",
+func newGroupAddMemberCommand(serverURL *string, use, objectType string) *cobra.Command {
+	numberLabel := "pr-number"
+	if objectType == "issue" {
+		numberLabel = "issue-number"
+	}
+	return &cobra.Command{
+		Use:  fmt.Sprintf("%s <group-id> <%s>", use, numberLabel),
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			number, err := strconv.Atoi(args[1])
@@ -677,51 +722,38 @@ func newGroupCommand(serverURL *string) *cobra.Command {
 				return err
 			}
 			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/members", map[string]any{
-				"object_type":   "pull_request",
+				"object_type":   objectType,
 				"object_number": number,
 			})
 		},
 	}
+}
 
-	addIssue := &cobra.Command{
-		Use:  "add-issue <group-id> <issue-number>",
-		Args: cobra.ExactArgs(2),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			number, err := strconv.Atoi(args[1])
-			if err != nil {
-				return err
-			}
-			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/members", map[string]any{
-				"object_type":   "issue",
-				"object_number": number,
-			})
-		},
-	}
-
-	syncComments := &cobra.Command{
+func newGroupSyncCommentsCommand(serverURL *string) *cobra.Command {
+	return &cobra.Command{
 		Use:  "sync-comments <group-id>",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return doPrintJSON(context.Background(), *serverURL, "POST", "/v1/groups/"+args[0]+"/sync-comments", nil)
 		},
 	}
+}
 
-	listCommentSyncTargets := &cobra.Command{
+func newGroupListCommentSyncTargetsCommand(serverURL *string, repo *string) *cobra.Command {
+	list := &cobra.Command{
 		Use:   "list-comment-sync-targets",
 		Short: "List group comment sync targets that need operator attention",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			owner, name, err := splitRepo(repo)
+			owner, name, err := splitRepo(*repo)
 			if err != nil {
 				return err
 			}
 			return doPrintJSON(context.Background(), *serverURL, "GET", fmt.Sprintf("/v1/repos/%s/%s/group-comment-sync-targets", owner, name), nil)
 		},
 	}
-	listCommentSyncTargets.Flags().StringVarP(&repo, "repo", "R", "", "repo in owner/name form")
-	_ = listCommentSyncTargets.MarkFlagRequired("repo")
-
-	groups.AddCommand(create, list, get, update, addPR, addIssue, syncComments, listCommentSyncTargets)
-	return groups
+	list.Flags().StringVarP(repo, "repo", "R", "", "repo in owner/name form")
+	_ = list.MarkFlagRequired("repo")
+	return list
 }
 
 func newAnnotationCommand(serverURL *string) *cobra.Command {
@@ -931,38 +963,49 @@ func parseAnnotationPairs(pairs []string) (map[string]any, error) {
 	}
 	out := map[string]any{}
 	for _, pair := range pairs {
-		parts := strings.SplitN(pair, "=", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid annotation %q", pair)
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		if key == "" {
-			return nil, fmt.Errorf("annotation key is required")
-		}
-		if strings.EqualFold(value, "null") {
-			out[key] = nil
-			continue
-		}
-		if value == "true" || value == "false" {
-			out[key] = value == "true"
-			continue
-		}
-		if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
-			var items []any
-			if err := json.Unmarshal([]byte(value), &items); err != nil {
-				return nil, err
-			}
-			out[key] = items
-			continue
-		}
-		if number, err := strconv.ParseInt(value, 10, 64); err == nil {
-			out[key] = number
-			continue
+		key, value, err := parseAnnotationPair(pair)
+		if err != nil {
+			return nil, err
 		}
 		out[key] = value
 	}
 	return out, nil
+}
+
+func parseAnnotationPair(pair string) (string, any, error) {
+	parts := strings.SplitN(pair, "=", 2)
+	if len(parts) != 2 {
+		return "", nil, fmt.Errorf("invalid annotation %q", pair)
+	}
+	key := strings.TrimSpace(parts[0])
+	if key == "" {
+		return "", nil, fmt.Errorf("annotation key is required")
+	}
+	value, err := parseAnnotationValue(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return "", nil, err
+	}
+	return key, value, nil
+}
+
+func parseAnnotationValue(value string) (any, error) {
+	if strings.EqualFold(value, "null") {
+		return nil, nil
+	}
+	if value == "true" || value == "false" {
+		return value == "true", nil
+	}
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		var items []any
+		if err := json.Unmarshal([]byte(value), &items); err != nil {
+			return nil, err
+		}
+		return items, nil
+	}
+	if number, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return number, nil
+	}
+	return value, nil
 }
 
 func parseAnnotationKeys(keys []string) (map[string]any, error) {

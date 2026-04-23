@@ -322,90 +322,13 @@ func (s *Service) UpdateFieldDefinition(ctx context.Context, actor permissions.A
 	if err := ensureExpectedRowVersion(field.RowVersion, input.ExpectedRowVersion); err != nil {
 		return database.FieldDefinition{}, err
 	}
-
-	updates := map[string]any{
-		"updated_by":  actor.ID,
-		"updated_at":  time.Now().UTC(),
-		"row_version": gorm.Expr("row_version + 1"),
-	}
-	if input.DisplayName != nil {
-		value := strings.TrimSpace(*input.DisplayName)
-		if value == "" {
-			return database.FieldDefinition{}, &FailError{StatusCode: 400, Message: "display_name cannot be blank"}
-		}
-		updates["display_name"] = value
-	}
-	if input.IsRequired != nil {
-		updates["is_required"] = *input.IsRequired
-	}
-	if input.IsFilterable != nil {
-		updates["is_filterable"] = *input.IsFilterable
-	}
-	if input.IsSearchable != nil {
-		updates["is_searchable"] = *input.IsSearchable
-	}
-	if input.IsVectorized != nil {
-		updates["is_vectorized"] = *input.IsVectorized
-	}
-	if input.SortOrder != nil {
-		updates["sort_order"] = *input.SortOrder
-	}
-	if input.EnumValues != nil {
-		if field.FieldType != "enum" && field.FieldType != "multi_enum" {
-			return database.FieldDefinition{}, &FailError{StatusCode: 400, Message: "enum_values can only be updated for enum fields"}
-		}
-		enumValues := normalizeEnumValues(*input.EnumValues)
-		if len(enumValues) == 0 {
-			return database.FieldDefinition{}, &FailError{StatusCode: 400, Message: "enum_values are required"}
-		}
-		if err := s.ensureEnumValuesCompatible(ctx, field, enumValues); err != nil {
-			return database.FieldDefinition{}, err
-		}
-		raw, _ := json.Marshal(enumValues)
-		updates["enum_values_json"] = datatypes.JSON(raw)
+	updates, err := s.fieldDefinitionUpdates(ctx, actor, field, input)
+	if err != nil {
+		return database.FieldDefinition{}, err
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx.Model(&database.FieldDefinition{}).Where("id = ?", field.ID)
-		if input.ExpectedRowVersion != nil {
-			query = query.Where("row_version = ?", *input.ExpectedRowVersion)
-		}
-		result := query.Updates(updates)
-		if result.Error != nil {
-			return result.Error
-		}
-		if input.ExpectedRowVersion != nil && result.RowsAffected == 0 {
-			return staleRowVersionError(tx, &database.FieldDefinition{}, field.ID, *input.ExpectedRowVersion)
-		}
-		if err := tx.First(&field, field.ID).Error; err != nil {
-			return err
-		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   repository.GitHubRepositoryID,
-			AggregateType:  "field_definition",
-			AggregateKey:   fieldAggregateKey(repository.GitHubRepositoryID, field.Name, field.ObjectScope),
-			EventType:      "field_definition.updated",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"field_definition_id": field.ID,
-				"name":                field.Name,
-				"object_scope":        field.ObjectScope,
-			},
-		}); err != nil {
-			return err
-		}
-
-		var targets []targetRef
-		if err := s.collectTargetsForFieldTx(tx, field.ID, &targets); err != nil {
-			return err
-		}
-		for _, target := range targets {
-			if err := s.enqueueRebuildsTx(tx, repository, target, time.Now().UTC()); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.updateFieldDefinitionTx(tx, &field, repository, actor, input.ExpectedRowVersion, updates, idempotencyKey)
 	})
 	if err != nil {
 		return database.FieldDefinition{}, translateDBError(err)
@@ -437,56 +360,144 @@ func (s *Service) ArchiveFieldDefinition(ctx context.Context, actor permissions.
 
 	now := time.Now().UTC()
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx.Model(&database.FieldDefinition{}).Where("id = ?", field.ID)
-		if expectedRowVersion != nil {
-			query = query.Where("row_version = ?", *expectedRowVersion)
-		}
-		result := query.Updates(map[string]any{
-			"archived_at": now,
-			"updated_by":  actor.ID,
-			"updated_at":  now,
-			"row_version": gorm.Expr("row_version + 1"),
-		})
-		if result.Error != nil {
-			return result.Error
-		}
-		if expectedRowVersion != nil && result.RowsAffected == 0 {
-			return staleRowVersionError(tx, &database.FieldDefinition{}, field.ID, *expectedRowVersion)
-		}
-		if err := tx.First(&field, field.ID).Error; err != nil {
-			return err
-		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   repository.GitHubRepositoryID,
-			AggregateType:  "field_definition",
-			AggregateKey:   fieldAggregateKey(repository.GitHubRepositoryID, field.Name, field.ObjectScope),
-			EventType:      "field_definition.archived",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"field_definition_id": field.ID,
-				"name":                field.Name,
-				"object_scope":        field.ObjectScope,
-			},
-		}); err != nil {
-			return err
-		}
-
-		var targets []targetRef
-		if err := s.collectTargetsForFieldTx(tx, field.ID, &targets); err != nil {
-			return err
-		}
-		for _, target := range targets {
-			if err := s.enqueueRebuildsTx(tx, repository, target, now); err != nil {
-				return err
-			}
-		}
-		return nil
+		return s.archiveFieldDefinitionTx(tx, &field, repository, actor, expectedRowVersion, idempotencyKey, now)
 	})
 	if err != nil {
 		return database.FieldDefinition{}, translateDBError(err)
 	}
 	return field, nil
+}
+
+func (s *Service) fieldDefinitionUpdates(ctx context.Context, actor permissions.Actor, field database.FieldDefinition, input FieldDefinitionPatchInput) (map[string]any, error) {
+	updates := map[string]any{
+		"updated_by":  actor.ID,
+		"updated_at":  time.Now().UTC(),
+		"row_version": gorm.Expr("row_version + 1"),
+	}
+	if err := applyFieldDisplayNameUpdate(updates, input.DisplayName); err != nil {
+		return nil, err
+	}
+	applyOptionalFieldUpdate(updates, "is_required", input.IsRequired)
+	applyOptionalFieldUpdate(updates, "is_filterable", input.IsFilterable)
+	applyOptionalFieldUpdate(updates, "is_searchable", input.IsSearchable)
+	applyOptionalFieldUpdate(updates, "is_vectorized", input.IsVectorized)
+	applyOptionalFieldUpdate(updates, "sort_order", input.SortOrder)
+	if err := s.applyFieldEnumUpdate(ctx, updates, field, input.EnumValues); err != nil {
+		return nil, err
+	}
+	return updates, nil
+}
+
+func applyFieldDisplayNameUpdate(updates map[string]any, displayName *string) error {
+	if displayName == nil {
+		return nil
+	}
+	value := strings.TrimSpace(*displayName)
+	if value == "" {
+		return &FailError{StatusCode: 400, Message: "display_name cannot be blank"}
+	}
+	updates["display_name"] = value
+	return nil
+}
+
+func applyOptionalFieldUpdate[T any](updates map[string]any, key string, value *T) {
+	if value != nil {
+		updates[key] = *value
+	}
+}
+
+func (s *Service) applyFieldEnumUpdate(ctx context.Context, updates map[string]any, field database.FieldDefinition, enumValues *[]string) error {
+	if enumValues == nil {
+		return nil
+	}
+	if field.FieldType != "enum" && field.FieldType != "multi_enum" {
+		return &FailError{StatusCode: 400, Message: "enum_values can only be updated for enum fields"}
+	}
+	normalized := normalizeEnumValues(*enumValues)
+	if len(normalized) == 0 {
+		return &FailError{StatusCode: 400, Message: "enum_values are required"}
+	}
+	if err := s.ensureEnumValuesCompatible(ctx, field, normalized); err != nil {
+		return err
+	}
+	raw, _ := json.Marshal(normalized)
+	updates["enum_values_json"] = datatypes.JSON(raw)
+	return nil
+}
+
+func (s *Service) updateFieldDefinitionTx(tx *gorm.DB, field *database.FieldDefinition, repository database.RepositoryProjection, actor permissions.Actor, expectedRowVersion *int, updates map[string]any, idempotencyKey string) error {
+	if err := applyFieldDefinitionUpdatesTx(tx, field.ID, expectedRowVersion, updates); err != nil {
+		return err
+	}
+	if err := tx.First(field, field.ID).Error; err != nil {
+		return err
+	}
+	if err := s.appendFieldDefinitionEventTx(tx, repository.GitHubRepositoryID, "field_definition.updated", actor, idempotencyKey, *field); err != nil {
+		return err
+	}
+	return s.enqueueFieldTargetRebuildsTx(tx, repository, field.ID, time.Now().UTC())
+}
+
+func (s *Service) archiveFieldDefinitionTx(tx *gorm.DB, field *database.FieldDefinition, repository database.RepositoryProjection, actor permissions.Actor, expectedRowVersion *int, idempotencyKey string, now time.Time) error {
+	if err := applyFieldDefinitionUpdatesTx(tx, field.ID, expectedRowVersion, map[string]any{
+		"archived_at": now,
+		"updated_by":  actor.ID,
+		"updated_at":  now,
+		"row_version": gorm.Expr("row_version + 1"),
+	}); err != nil {
+		return err
+	}
+	if err := tx.First(field, field.ID).Error; err != nil {
+		return err
+	}
+	if err := s.appendFieldDefinitionEventTx(tx, repository.GitHubRepositoryID, "field_definition.archived", actor, idempotencyKey, *field); err != nil {
+		return err
+	}
+	return s.enqueueFieldTargetRebuildsTx(tx, repository, field.ID, now)
+}
+
+func applyFieldDefinitionUpdatesTx(tx *gorm.DB, fieldID uint, expectedRowVersion *int, updates map[string]any) error {
+	query := tx.Model(&database.FieldDefinition{}).Where("id = ?", fieldID)
+	if expectedRowVersion != nil {
+		query = query.Where("row_version = ?", *expectedRowVersion)
+	}
+	result := query.Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if expectedRowVersion != nil && result.RowsAffected == 0 {
+		return staleRowVersionError(tx, &database.FieldDefinition{}, fieldID, *expectedRowVersion)
+	}
+	return nil
+}
+
+func (s *Service) appendFieldDefinitionEventTx(tx *gorm.DB, repositoryID int64, eventType string, actor permissions.Actor, idempotencyKey string, field database.FieldDefinition) error {
+	return s.appendEventTx(tx, eventInput{
+		RepositoryID:   repositoryID,
+		AggregateType:  "field_definition",
+		AggregateKey:   fieldAggregateKey(repositoryID, field.Name, field.ObjectScope),
+		EventType:      eventType,
+		Actor:          actor,
+		IdempotencyKey: idempotencyKey,
+		Payload: map[string]any{
+			"field_definition_id": field.ID,
+			"name":                field.Name,
+			"object_scope":        field.ObjectScope,
+		},
+	})
+}
+
+func (s *Service) enqueueFieldTargetRebuildsTx(tx *gorm.DB, repository database.RepositoryProjection, fieldDefinitionID uint, sourceUpdatedAt time.Time) error {
+	var targets []targetRef
+	if err := s.collectTargetsForFieldTx(tx, fieldDefinitionID, &targets); err != nil {
+		return err
+	}
+	for _, target := range targets {
+		if err := s.enqueueRebuildsTx(tx, repository, target, sourceUpdatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) ExportManifest(ctx context.Context, owner, repo string) (Manifest, error) {
@@ -527,121 +538,133 @@ func (s *Service) ImportManifest(ctx context.Context, actor permissions.Actor, o
 	var out []database.FieldDefinition
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, input := range manifest.Fields {
-			name := normalizeFieldName(input.Name)
-			var existing database.FieldDefinition
-			err := tx.Where("github_repository_id = ? AND name = ? AND object_scope = ?", repository.GitHubRepositoryID, name, input.ObjectScope).First(&existing).Error
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			existing, found, err := loadManifestFieldTx(tx, repository.GitHubRepositoryID, input)
+			if err != nil {
 				return err
 			}
-
-			enumValues, _ := json.Marshal(normalizeEnumValues(input.EnumValues))
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				model := database.FieldDefinition{
-					GitHubRepositoryID: repository.GitHubRepositoryID,
-					RepositoryOwner:    repository.Owner,
-					RepositoryName:     repository.Name,
-					Name:               name,
-					DisplayName:        displayName(input),
-					ObjectScope:        input.ObjectScope,
-					FieldType:          input.FieldType,
-					EnumValuesJSON:     datatypes.JSON(enumValues),
-					IsRequired:         input.IsRequired,
-					IsFilterable:       input.IsFilterable,
-					IsSearchable:       input.IsSearchable,
-					IsVectorized:       input.IsVectorized,
-					SortOrder:          input.SortOrder,
-					CreatedBy:          actor.ID,
-					UpdatedBy:          actor.ID,
-					RowVersion:         1,
-				}
-				if err := tx.Create(&model).Error; err != nil {
-					return err
-				}
-				out = append(out, model)
-				if err := s.appendEventTx(tx, eventInput{
-					RepositoryID:   repository.GitHubRepositoryID,
-					AggregateType:  "field_definition",
-					AggregateKey:   fieldAggregateKey(repository.GitHubRepositoryID, model.Name, model.ObjectScope),
-					EventType:      "field_definition.created",
-					Actor:          actor,
-					IdempotencyKey: idempotencyKey,
-					Payload: map[string]any{
-						"field_definition_id": model.ID,
-						"name":                model.Name,
-						"object_scope":        model.ObjectScope,
-					},
-				}); err != nil {
-					return err
-				}
-				continue
-			}
-
-			if existing.FieldType != input.FieldType {
-				return &FailError{
-					StatusCode: 409,
-					Message:    "field_type cannot change for an existing field",
-					Data: map[string]any{
-						"field":              existing.Name,
-						"object_scope":       existing.ObjectScope,
-						"current_field_type": existing.FieldType,
-						"requested_type":     input.FieldType,
-					},
-				}
-			}
-
-			if existing.FieldType == "enum" || existing.FieldType == "multi_enum" {
-				if err := s.ensureEnumValuesCompatible(ctx, existing, normalizeEnumValues(input.EnumValues)); err != nil {
-					return err
-				}
-			}
-
-			updates := map[string]any{
-				"display_name":     displayName(input),
-				"enum_values_json": datatypes.JSON(enumValues),
-				"is_required":      input.IsRequired,
-				"is_filterable":    input.IsFilterable,
-				"is_searchable":    input.IsSearchable,
-				"is_vectorized":    input.IsVectorized,
-				"sort_order":       input.SortOrder,
-				"updated_by":       actor.ID,
-				"row_version":      gorm.Expr("row_version + 1"),
-			}
-			if err := tx.Model(&database.FieldDefinition{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+			model, err := s.applyManifestFieldTx(ctx, tx, repository, actor, input, existing, found, idempotencyKey)
+			if err != nil {
 				return err
 			}
-			if err := tx.First(&existing, existing.ID).Error; err != nil {
-				return err
-			}
-			out = append(out, existing)
-			if err := s.appendEventTx(tx, eventInput{
-				RepositoryID:   repository.GitHubRepositoryID,
-				AggregateType:  "field_definition",
-				AggregateKey:   fieldAggregateKey(repository.GitHubRepositoryID, existing.Name, existing.ObjectScope),
-				EventType:      "field_definition.updated",
-				Actor:          actor,
-				IdempotencyKey: idempotencyKey,
-				Payload: map[string]any{
-					"field_definition_id": existing.ID,
-					"name":                existing.Name,
-					"object_scope":        existing.ObjectScope,
-				},
-			}); err != nil {
-				return err
-			}
-
-			var targets []targetRef
-			if err := s.collectTargetsForFieldTx(tx, existing.ID, &targets); err != nil {
-				return err
-			}
-			for _, target := range targets {
-				if err := s.enqueueRebuildsTx(tx, repository, target, time.Now().UTC()); err != nil {
-					return err
-				}
-			}
+			out = append(out, model)
 		}
 		return nil
 	})
 	return out, err
+}
+
+func loadManifestFieldTx(tx *gorm.DB, repositoryID int64, input FieldDefinitionInput) (database.FieldDefinition, bool, error) {
+	name := normalizeFieldName(input.Name)
+	var existing database.FieldDefinition
+	err := tx.Where("github_repository_id = ? AND name = ? AND object_scope = ?", repositoryID, name, input.ObjectScope).First(&existing).Error
+	switch {
+	case err == nil:
+		return existing, true, nil
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return database.FieldDefinition{}, false, nil
+	default:
+		return database.FieldDefinition{}, false, err
+	}
+}
+
+func (s *Service) applyManifestFieldTx(ctx context.Context, tx *gorm.DB, repository database.RepositoryProjection, actor permissions.Actor, input FieldDefinitionInput, existing database.FieldDefinition, found bool, idempotencyKey string) (database.FieldDefinition, error) {
+	if !found {
+		return s.createManifestFieldTx(tx, repository, actor, input, idempotencyKey)
+	}
+	return s.updateManifestFieldTx(ctx, tx, repository, actor, input, existing, idempotencyKey)
+}
+
+func (s *Service) createManifestFieldTx(tx *gorm.DB, repository database.RepositoryProjection, actor permissions.Actor, input FieldDefinitionInput, idempotencyKey string) (database.FieldDefinition, error) {
+	enumValuesJSON := manifestEnumValuesJSON(input)
+	model := database.FieldDefinition{
+		GitHubRepositoryID: repository.GitHubRepositoryID,
+		RepositoryOwner:    repository.Owner,
+		RepositoryName:     repository.Name,
+		Name:               normalizeFieldName(input.Name),
+		DisplayName:        displayName(input),
+		ObjectScope:        input.ObjectScope,
+		FieldType:          input.FieldType,
+		EnumValuesJSON:     enumValuesJSON,
+		IsRequired:         input.IsRequired,
+		IsFilterable:       input.IsFilterable,
+		IsSearchable:       input.IsSearchable,
+		IsVectorized:       input.IsVectorized,
+		SortOrder:          input.SortOrder,
+		CreatedBy:          actor.ID,
+		UpdatedBy:          actor.ID,
+		RowVersion:         1,
+	}
+	if err := tx.Create(&model).Error; err != nil {
+		return database.FieldDefinition{}, err
+	}
+	if err := s.appendFieldDefinitionEventTx(tx, repository.GitHubRepositoryID, "field_definition.created", actor, idempotencyKey, model); err != nil {
+		return database.FieldDefinition{}, err
+	}
+	return model, nil
+}
+
+func (s *Service) updateManifestFieldTx(ctx context.Context, tx *gorm.DB, repository database.RepositoryProjection, actor permissions.Actor, input FieldDefinitionInput, existing database.FieldDefinition, idempotencyKey string) (database.FieldDefinition, error) {
+	if err := validateManifestFieldType(existing, input.FieldType); err != nil {
+		return database.FieldDefinition{}, err
+	}
+	if err := s.ensureManifestEnumCompatibility(ctx, existing, input); err != nil {
+		return database.FieldDefinition{}, err
+	}
+	if err := tx.Model(&database.FieldDefinition{}).Where("id = ?", existing.ID).Updates(manifestFieldUpdates(actor, input)).Error; err != nil {
+		return database.FieldDefinition{}, err
+	}
+	if err := tx.First(&existing, existing.ID).Error; err != nil {
+		return database.FieldDefinition{}, err
+	}
+	if err := s.appendFieldDefinitionEventTx(tx, repository.GitHubRepositoryID, "field_definition.updated", actor, idempotencyKey, existing); err != nil {
+		return database.FieldDefinition{}, err
+	}
+	if err := s.enqueueFieldTargetRebuildsTx(tx, repository, existing.ID, time.Now().UTC()); err != nil {
+		return database.FieldDefinition{}, err
+	}
+	return existing, nil
+}
+
+func manifestEnumValuesJSON(input FieldDefinitionInput) datatypes.JSON {
+	raw, _ := json.Marshal(normalizeEnumValues(input.EnumValues))
+	return datatypes.JSON(raw)
+}
+
+func validateManifestFieldType(existing database.FieldDefinition, requestedType string) error {
+	if existing.FieldType == requestedType {
+		return nil
+	}
+	return &FailError{
+		StatusCode: 409,
+		Message:    "field_type cannot change for an existing field",
+		Data: map[string]any{
+			"field":              existing.Name,
+			"object_scope":       existing.ObjectScope,
+			"current_field_type": existing.FieldType,
+			"requested_type":     requestedType,
+		},
+	}
+}
+
+func (s *Service) ensureManifestEnumCompatibility(ctx context.Context, existing database.FieldDefinition, input FieldDefinitionInput) error {
+	if existing.FieldType != "enum" && existing.FieldType != "multi_enum" {
+		return nil
+	}
+	return s.ensureEnumValuesCompatible(ctx, existing, normalizeEnumValues(input.EnumValues))
+}
+
+func manifestFieldUpdates(actor permissions.Actor, input FieldDefinitionInput) map[string]any {
+	return map[string]any{
+		"display_name":     displayName(input),
+		"enum_values_json": manifestEnumValuesJSON(input),
+		"is_required":      input.IsRequired,
+		"is_filterable":    input.IsFilterable,
+		"is_searchable":    input.IsSearchable,
+		"is_vectorized":    input.IsVectorized,
+		"sort_order":       input.SortOrder,
+		"updated_by":       actor.ID,
+		"row_version":      gorm.Expr("row_version + 1"),
+	}
 }
 
 func (s *Service) CreateGroup(ctx context.Context, actor permissions.Actor, owner, repo string, input GroupInput, idempotencyKey string) (database.Group, error) {
@@ -668,41 +691,13 @@ func (s *Service) CreateGroup(ctx context.Context, actor permissions.Actor, owne
 		UpdatedBy:          actor.ID,
 		RowVersion:         1,
 	}
-
 	for attempts := 0; attempts < 20; attempts++ {
 		group.PublicID, err = publicid.NewGroupID()
 		if err != nil {
 			return database.Group{}, err
 		}
-
 		err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Create(&group).Error; err != nil {
-				return err
-			}
-			if err := s.appendEventTx(tx, eventInput{
-				RepositoryID:   repository.GitHubRepositoryID,
-				AggregateType:  "group",
-				AggregateKey:   groupTargetKey(group.PublicID),
-				EventType:      "group.created",
-				Actor:          actor,
-				IdempotencyKey: idempotencyKey,
-				Payload: map[string]any{
-					"group_id":        group.ID,
-					"group_public_id": group.PublicID,
-					"title":           group.Title,
-					"kind":            group.Kind,
-				},
-			}); err != nil {
-				return err
-			}
-			return s.enqueueRebuildsTx(tx, repository, targetRef{
-				RepositoryID: repository.GitHubRepositoryID,
-				Owner:        repository.Owner,
-				Name:         repository.Name,
-				TargetType:   "group",
-				TargetKey:    groupTargetKey(group.PublicID),
-				GroupID:      &group.ID,
-			}, time.Now().UTC())
+			return s.createGroupTx(tx, &group, repository, actor, idempotencyKey)
 		})
 		if err == nil {
 			return group, nil
@@ -735,68 +730,13 @@ func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, grou
 		return database.Group{}, err
 	}
 
-	updates := map[string]any{
-		"updated_by":  actor.ID,
-		"updated_at":  time.Now().UTC(),
-		"row_version": gorm.Expr("row_version + 1"),
-	}
-	if input.Title != nil {
-		value := strings.TrimSpace(*input.Title)
-		if value == "" {
-			return database.Group{}, &FailError{StatusCode: 400, Message: "group title is required"}
-		}
-		updates["title"] = value
-	}
-	if input.Description != nil {
-		updates["description"] = strings.TrimSpace(*input.Description)
-	}
-	if input.Status != nil {
-		value := strings.TrimSpace(*input.Status)
-		if value == "" {
-			return database.Group{}, &FailError{StatusCode: 400, Message: "group status is required"}
-		}
-		updates["status"] = value
+	updates, err := groupUpdates(actor, input)
+	if err != nil {
+		return database.Group{}, err
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		query := tx.Model(&database.Group{}).Where("id = ?", group.ID)
-		if input.ExpectedRowVersion != nil {
-			query = query.Where("row_version = ?", *input.ExpectedRowVersion)
-		}
-		result := query.Updates(updates)
-		if result.Error != nil {
-			return result.Error
-		}
-		if input.ExpectedRowVersion != nil && result.RowsAffected == 0 {
-			return staleRowVersionError(tx, &database.Group{}, group.ID, *input.ExpectedRowVersion)
-		}
-		if err := tx.First(&group, group.ID).Error; err != nil {
-			return err
-		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   group.GitHubRepositoryID,
-			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.PublicID),
-			EventType:      "group.updated",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"group_id":        group.ID,
-				"group_public_id": group.PublicID,
-				"title":           group.Title,
-				"status":          group.Status,
-			},
-		}); err != nil {
-			return err
-		}
-		return s.enqueueRebuildsTx(tx, repository, targetRef{
-			RepositoryID: group.GitHubRepositoryID,
-			Owner:        group.RepositoryOwner,
-			Name:         group.RepositoryName,
-			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.PublicID),
-			GroupID:      &group.ID,
-		}, time.Now().UTC())
+		return s.updateGroupTx(tx, &group, repository, actor, input.ExpectedRowVersion, updates, idempotencyKey)
 	})
 	if err != nil {
 		return database.Group{}, translateDBError(err)
@@ -892,69 +832,153 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 	}
 
 	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		const memberInsertSavepoint = "group_member_insert"
-		if err := tx.SavePoint(memberInsertSavepoint).Error; err != nil {
-			return err
-		}
-		if err := tx.Create(&member).Error; err != nil {
-			if isGroupMemberConflict(err) {
-				if rollbackErr := tx.RollbackTo(memberInsertSavepoint).Error; rollbackErr != nil {
-					return rollbackErr
-				}
-				return s.translateGroupMemberConflictTx(tx, group, member)
-			}
-			return err
-		}
-		if err := s.appendEventTx(tx, eventInput{
-			RepositoryID:   group.GitHubRepositoryID,
-			AggregateType:  "group",
-			AggregateKey:   groupTargetKey(group.PublicID),
-			EventType:      "group.member_added",
-			Actor:          actor,
-			IdempotencyKey: idempotencyKey,
-			Payload: map[string]any{
-				"group_id":        group.ID,
-				"group_public_id": group.PublicID,
-				"object_type":     objectType,
-				"object_number":   objectNumber,
-			},
-			Refs: []eventRefInput{{Role: "member", Type: objectType, Key: member.TargetKey}},
-		}); err != nil {
-			return err
-		}
-		if err := s.enqueueRebuildsTx(tx, repository, targetRef{
-			RepositoryID: group.GitHubRepositoryID,
-			Owner:        group.RepositoryOwner,
-			Name:         group.RepositoryName,
-			TargetType:   "group",
-			TargetKey:    groupTargetKey(group.PublicID),
-			GroupID:      &group.ID,
-		}, time.Now().UTC()); err != nil {
-			return err
-		}
-		if err := s.enqueueTargetProjectionRefreshJobsTx(tx, group, []targetRef{{
-			RepositoryID: group.GitHubRepositoryID,
-			Owner:        group.RepositoryOwner,
-			Name:         group.RepositoryName,
-			TargetType:   objectType,
-			TargetKey:    member.TargetKey,
-			ObjectNumber: objectNumber,
-		}}); err != nil {
-			return err
-		}
-		if err := s.enqueueRebuildsTx(tx, repository, targetRef{
-			RepositoryID: group.GitHubRepositoryID,
-			Owner:        group.RepositoryOwner,
-			Name:         group.RepositoryName,
-			TargetType:   objectType,
-			TargetKey:    member.TargetKey,
-			ObjectNumber: objectNumber,
-		}, time.Now().UTC()); err != nil {
-			return err
-		}
-		return nil
+		return s.addGroupMemberTx(tx, group, repository, actor, &member, idempotencyKey)
 	})
 	return member, translateDBError(err)
+}
+
+func (s *Service) createGroupTx(tx *gorm.DB, group *database.Group, repository database.RepositoryProjection, actor permissions.Actor, idempotencyKey string) error {
+	if err := tx.Create(group).Error; err != nil {
+		return err
+	}
+	if err := s.appendGroupEventTx(tx, repository.GitHubRepositoryID, "group.created", actor, idempotencyKey, *group, map[string]any{
+		"group_id":        group.ID,
+		"group_public_id": group.PublicID,
+		"title":           group.Title,
+		"kind":            group.Kind,
+	}, nil); err != nil {
+		return err
+	}
+	return s.enqueueRebuildsTx(tx, repository, groupTargetRef(*group), time.Now().UTC())
+}
+
+func groupUpdates(actor permissions.Actor, input GroupPatchInput) (map[string]any, error) {
+	updates := map[string]any{
+		"updated_by":  actor.ID,
+		"updated_at":  time.Now().UTC(),
+		"row_version": gorm.Expr("row_version + 1"),
+	}
+	if input.Title != nil {
+		value := strings.TrimSpace(*input.Title)
+		if value == "" {
+			return nil, &FailError{StatusCode: 400, Message: "group title is required"}
+		}
+		updates["title"] = value
+	}
+	if input.Description != nil {
+		updates["description"] = strings.TrimSpace(*input.Description)
+	}
+	if input.Status != nil {
+		value := strings.TrimSpace(*input.Status)
+		if value == "" {
+			return nil, &FailError{StatusCode: 400, Message: "group status is required"}
+		}
+		updates["status"] = value
+	}
+	return updates, nil
+}
+
+func (s *Service) updateGroupTx(tx *gorm.DB, group *database.Group, repository database.RepositoryProjection, actor permissions.Actor, expectedRowVersion *int, updates map[string]any, idempotencyKey string) error {
+	if err := applyGroupUpdatesTx(tx, group.ID, expectedRowVersion, updates); err != nil {
+		return err
+	}
+	if err := tx.First(group, group.ID).Error; err != nil {
+		return err
+	}
+	if err := s.appendGroupEventTx(tx, group.GitHubRepositoryID, "group.updated", actor, idempotencyKey, *group, map[string]any{
+		"group_id":        group.ID,
+		"group_public_id": group.PublicID,
+		"title":           group.Title,
+		"status":          group.Status,
+	}, nil); err != nil {
+		return err
+	}
+	return s.enqueueRebuildsTx(tx, repository, groupTargetRef(*group), time.Now().UTC())
+}
+
+func applyGroupUpdatesTx(tx *gorm.DB, groupID uint, expectedRowVersion *int, updates map[string]any) error {
+	query := tx.Model(&database.Group{}).Where("id = ?", groupID)
+	if expectedRowVersion != nil {
+		query = query.Where("row_version = ?", *expectedRowVersion)
+	}
+	result := query.Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if expectedRowVersion != nil && result.RowsAffected == 0 {
+		return staleRowVersionError(tx, &database.Group{}, groupID, *expectedRowVersion)
+	}
+	return nil
+}
+
+func (s *Service) addGroupMemberTx(tx *gorm.DB, group database.Group, repository database.RepositoryProjection, actor permissions.Actor, member *database.GroupMember, idempotencyKey string) error {
+	if err := insertGroupMemberTx(tx, group, member, s.translateGroupMemberConflictTx); err != nil {
+		return err
+	}
+	memberRef := targetRef{
+		RepositoryID: group.GitHubRepositoryID,
+		Owner:        group.RepositoryOwner,
+		Name:         group.RepositoryName,
+		TargetType:   member.ObjectType,
+		TargetKey:    member.TargetKey,
+		ObjectNumber: member.ObjectNumber,
+	}
+	if err := s.appendGroupEventTx(tx, group.GitHubRepositoryID, "group.member_added", actor, idempotencyKey, group, map[string]any{
+		"group_id":        group.ID,
+		"group_public_id": group.PublicID,
+		"object_type":     member.ObjectType,
+		"object_number":   member.ObjectNumber,
+	}, []eventRefInput{{Role: "member", Type: member.ObjectType, Key: member.TargetKey}}); err != nil {
+		return err
+	}
+	if err := s.enqueueRebuildsTx(tx, repository, groupTargetRef(group), time.Now().UTC()); err != nil {
+		return err
+	}
+	if err := s.enqueueTargetProjectionRefreshJobsTx(tx, group, []targetRef{memberRef}); err != nil {
+		return err
+	}
+	return s.enqueueRebuildsTx(tx, repository, memberRef, time.Now().UTC())
+}
+
+func insertGroupMemberTx(tx *gorm.DB, group database.Group, member *database.GroupMember, conflictTranslator func(*gorm.DB, database.Group, database.GroupMember) error) error {
+	const memberInsertSavepoint = "group_member_insert"
+	if err := tx.SavePoint(memberInsertSavepoint).Error; err != nil {
+		return err
+	}
+	if err := tx.Create(member).Error; err != nil {
+		if isGroupMemberConflict(err) {
+			if rollbackErr := tx.RollbackTo(memberInsertSavepoint).Error; rollbackErr != nil {
+				return rollbackErr
+			}
+			return conflictTranslator(tx, group, *member)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Service) appendGroupEventTx(tx *gorm.DB, repositoryID int64, eventType string, actor permissions.Actor, idempotencyKey string, group database.Group, payload map[string]any, refs []eventRefInput) error {
+	return s.appendEventTx(tx, eventInput{
+		RepositoryID:   repositoryID,
+		AggregateType:  "group",
+		AggregateKey:   groupTargetKey(group.PublicID),
+		EventType:      eventType,
+		Actor:          actor,
+		IdempotencyKey: idempotencyKey,
+		Payload:        payload,
+		Refs:           refs,
+	})
+}
+
+func groupTargetRef(group database.Group) targetRef {
+	return targetRef{
+		RepositoryID: group.GitHubRepositoryID,
+		Owner:        group.RepositoryOwner,
+		Name:         group.RepositoryName,
+		TargetType:   "group",
+		TargetKey:    groupTargetKey(group.PublicID),
+		GroupID:      &group.ID,
+	}
 }
 
 func (s *Service) RemoveGroupMember(ctx context.Context, actor permissions.Actor, groupPublicID string, memberID uint, idempotencyKey string) error {
@@ -1117,105 +1141,9 @@ func (s *Service) SetAnnotations(ctx context.Context, actor permissions.Actor, o
 		if err != nil {
 			return err
 		}
-		byName := map[string]database.FieldDefinition{}
-		for _, definition := range definitions {
-			byName[definition.Name] = definition
-		}
-
+		byName := fieldDefinitionsByName(definitions)
 		for rawField, rawValue := range values {
-			fieldName := normalizeFieldName(rawField)
-			definition, ok := byName[fieldName]
-			if !ok {
-				return &FailError{StatusCode: 400, Message: "unknown field", Data: map[string]any{"field": fieldName}}
-			}
-
-			converted, clearValue, err := convertAnnotationValue(definition, rawValue)
-			if err != nil {
-				return err
-			}
-
-			if clearValue {
-				if err := tx.Where("field_definition_id = ? AND target_type = ? AND target_key = ?", definition.ID, target.TargetType, target.TargetKey).
-					Delete(&database.FieldValue{}).Error; err != nil {
-					return err
-				}
-				result.Annotations[fieldName] = nil
-				if err := s.appendEventTx(tx, eventInput{
-					RepositoryID:   repository.GitHubRepositoryID,
-					AggregateType:  target.TargetType,
-					AggregateKey:   target.TargetKey,
-					EventType:      "field_value.cleared",
-					Actor:          actor,
-					IdempotencyKey: idempotencyKey,
-					Payload: map[string]any{
-						"field_definition_id": definition.ID,
-						"field_name":          definition.Name,
-					},
-					Refs: []eventRefInput{{Role: "field_definition", Type: "field_definition", Key: fieldAggregateKey(repository.GitHubRepositoryID, definition.Name, definition.ObjectScope)}},
-				}); err != nil {
-					return err
-				}
-				continue
-			}
-
-			model := database.FieldValue{
-				FieldDefinitionID:  definition.ID,
-				GitHubRepositoryID: repository.GitHubRepositoryID,
-				RepositoryOwner:    repository.Owner,
-				RepositoryName:     repository.Name,
-				TargetType:         target.TargetType,
-				ObjectNumber:       target.ObjectNumberPtr(),
-				GroupID:            target.GroupID,
-				TargetKey:          target.TargetKey,
-				UpdatedBy:          actor.ID,
-				StringValue:        converted.StringValue,
-				TextValue:          converted.TextValue,
-				BoolValue:          converted.BoolValue,
-				IntValue:           converted.IntValue,
-				EnumValue:          converted.EnumValue,
-				MultiEnumJSON:      converted.MultiEnumJSON,
-			}
-
-			var existing database.FieldValue
-			err = tx.Where("field_definition_id = ? AND target_type = ? AND target_key = ?", definition.ID, target.TargetType, target.TargetKey).First(&existing).Error
-			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-				return err
-			}
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				if err := tx.Create(&model).Error; err != nil {
-					return err
-				}
-			} else {
-				updates := map[string]any{
-					"updated_by":      actor.ID,
-					"string_value":    converted.StringValue,
-					"text_value":      converted.TextValue,
-					"bool_value":      converted.BoolValue,
-					"int_value":       converted.IntValue,
-					"enum_value":      converted.EnumValue,
-					"multi_enum_json": converted.MultiEnumJSON,
-					"updated_at":      time.Now().UTC(),
-				}
-				if err := tx.Model(&database.FieldValue{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
-					return err
-				}
-			}
-
-			result.Annotations[fieldName] = converted.APIValue
-			if err := s.appendEventTx(tx, eventInput{
-				RepositoryID:   repository.GitHubRepositoryID,
-				AggregateType:  target.TargetType,
-				AggregateKey:   target.TargetKey,
-				EventType:      "field_value.set",
-				Actor:          actor,
-				IdempotencyKey: idempotencyKey,
-				Payload: map[string]any{
-					"field_definition_id": definition.ID,
-					"field_name":          definition.Name,
-					"value":               converted.APIValue,
-				},
-				Refs: []eventRefInput{{Role: "field_definition", Type: "field_definition", Key: fieldAggregateKey(repository.GitHubRepositoryID, definition.Name, definition.ObjectScope)}},
-			}); err != nil {
+			if err := s.applyAnnotationValueTx(tx, repository, target, actor, byName, rawField, rawValue, idempotencyKey, result.Annotations); err != nil {
 				return err
 			}
 		}
@@ -1226,6 +1154,139 @@ func (s *Service) SetAnnotations(ctx context.Context, actor permissions.Actor, o
 		return AnnotationSetResult{}, translateDBError(err)
 	}
 	return result, nil
+}
+
+func fieldDefinitionsByName(definitions []database.FieldDefinition) map[string]database.FieldDefinition {
+	byName := make(map[string]database.FieldDefinition, len(definitions))
+	for _, definition := range definitions {
+		byName[definition.Name] = definition
+	}
+	return byName
+}
+
+func (s *Service) applyAnnotationValueTx(
+	tx *gorm.DB,
+	repository database.RepositoryProjection,
+	target targetRef,
+	actor permissions.Actor,
+	byName map[string]database.FieldDefinition,
+	rawField string,
+	rawValue any,
+	idempotencyKey string,
+	annotations map[string]any,
+) error {
+	fieldName := normalizeFieldName(rawField)
+	definition, ok := byName[fieldName]
+	if !ok {
+		return &FailError{StatusCode: 400, Message: "unknown field", Data: map[string]any{"field": fieldName}}
+	}
+	converted, clearValue, err := convertAnnotationValue(definition, rawValue)
+	if err != nil {
+		return err
+	}
+	if clearValue {
+		return s.clearAnnotationValueTx(tx, repository, target, actor, definition, fieldName, idempotencyKey, annotations)
+	}
+	return s.setAnnotationValueTx(tx, repository, target, actor, definition, converted, fieldName, idempotencyKey, annotations)
+}
+
+func (s *Service) clearAnnotationValueTx(
+	tx *gorm.DB,
+	repository database.RepositoryProjection,
+	target targetRef,
+	actor permissions.Actor,
+	definition database.FieldDefinition,
+	fieldName string,
+	idempotencyKey string,
+	annotations map[string]any,
+) error {
+	if err := tx.Where("field_definition_id = ? AND target_type = ? AND target_key = ?", definition.ID, target.TargetType, target.TargetKey).
+		Delete(&database.FieldValue{}).Error; err != nil {
+		return err
+	}
+	annotations[fieldName] = nil
+	return s.appendFieldValueEventTx(tx, repository.GitHubRepositoryID, target, actor, "field_value.cleared", definition, nil, idempotencyKey)
+}
+
+func (s *Service) setAnnotationValueTx(
+	tx *gorm.DB,
+	repository database.RepositoryProjection,
+	target targetRef,
+	actor permissions.Actor,
+	definition database.FieldDefinition,
+	converted convertedValue,
+	fieldName string,
+	idempotencyKey string,
+	annotations map[string]any,
+) error {
+	model := annotationFieldValueModel(repository, target, actor, definition.ID, converted)
+	if err := upsertAnnotationFieldValueTx(tx, model, converted, actor.ID); err != nil {
+		return err
+	}
+	annotations[fieldName] = converted.APIValue
+	return s.appendFieldValueEventTx(tx, repository.GitHubRepositoryID, target, actor, "field_value.set", definition, converted.APIValue, idempotencyKey)
+}
+
+func annotationFieldValueModel(repository database.RepositoryProjection, target targetRef, actor permissions.Actor, fieldDefinitionID uint, converted convertedValue) database.FieldValue {
+	return database.FieldValue{
+		FieldDefinitionID:  fieldDefinitionID,
+		GitHubRepositoryID: repository.GitHubRepositoryID,
+		RepositoryOwner:    repository.Owner,
+		RepositoryName:     repository.Name,
+		TargetType:         target.TargetType,
+		ObjectNumber:       target.ObjectNumberPtr(),
+		GroupID:            target.GroupID,
+		TargetKey:          target.TargetKey,
+		UpdatedBy:          actor.ID,
+		StringValue:        converted.StringValue,
+		TextValue:          converted.TextValue,
+		BoolValue:          converted.BoolValue,
+		IntValue:           converted.IntValue,
+		EnumValue:          converted.EnumValue,
+		MultiEnumJSON:      converted.MultiEnumJSON,
+	}
+}
+
+func upsertAnnotationFieldValueTx(tx *gorm.DB, model database.FieldValue, converted convertedValue, actorID string) error {
+	var existing database.FieldValue
+	err := tx.Where("field_definition_id = ? AND target_type = ? AND target_key = ?", model.FieldDefinitionID, model.TargetType, model.TargetKey).First(&existing).Error
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return tx.Create(&model).Error
+	case err != nil:
+		return err
+	default:
+		return tx.Model(&database.FieldValue{}).Where("id = ?", existing.ID).Updates(map[string]any{
+			"updated_by":      actorID,
+			"string_value":    converted.StringValue,
+			"text_value":      converted.TextValue,
+			"bool_value":      converted.BoolValue,
+			"int_value":       converted.IntValue,
+			"enum_value":      converted.EnumValue,
+			"multi_enum_json": converted.MultiEnumJSON,
+			"updated_at":      time.Now().UTC(),
+		}).Error
+	}
+}
+
+func (s *Service) appendFieldValueEventTx(tx *gorm.DB, repositoryID int64, target targetRef, actor permissions.Actor, eventType string, definition database.FieldDefinition, value any, idempotencyKey string) error {
+	payload := map[string]any{
+		"field_definition_id": definition.ID,
+		"field_name":          definition.Name,
+	}
+	if eventType == "field_value.set" {
+		payload["value"] = value
+	}
+	return s.appendEventTx(tx, eventInput{
+		RepositoryID:   repositoryID,
+		AggregateType:  target.TargetType,
+		AggregateKey:   target.TargetKey,
+		EventType:      eventType,
+		Actor:          actor,
+		IdempotencyKey: idempotencyKey,
+		Payload:        payload,
+		Refs:           []eventRefInput{{Role: "field_definition", Type: "field_definition", Key: fieldAggregateKey(repositoryID, definition.Name, definition.ObjectScope)}},
+	})
 }
 
 func (s *Service) GetAnnotations(ctx context.Context, owner, repo, targetType string, objectNumber int, groupID *uint) (AnnotationSetResult, error) {
@@ -1252,93 +1313,132 @@ func (s *Service) FilterTargets(ctx context.Context, owner, repo, targetType, fi
 	if err != nil {
 		return nil, err
 	}
-	fieldName = normalizeFieldName(fieldName)
-
-	var definition database.FieldDefinition
-	err = s.db.WithContext(ctx).
-		Where("github_repository_id = ? AND name = ? AND archived_at IS NULL AND is_filterable = ? AND object_scope = ?", repository.GitHubRepositoryID, fieldName, true, targetType).
-		First(&definition).Error
+	definition, filterValue, err := s.filterDefinition(ctx, repository.GitHubRepositoryID, targetType, fieldName, rawValue)
 	if err != nil {
-		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, err
-		}
-		if err := s.db.WithContext(ctx).
-			Where("github_repository_id = ? AND name = ? AND archived_at IS NULL AND is_filterable = ? AND object_scope = ?", repository.GitHubRepositoryID, fieldName, true, "all").
-			First(&definition).Error; err != nil {
-			return nil, translateDBError(err)
-		}
+		return nil, err
 	}
+	values, err := s.filteredFieldValues(ctx, definition, targetType, filterValue)
+	if err != nil {
+		return nil, err
+	}
+	return s.buildFilteredTargets(ctx, repository.GitHubRepositoryID, definition.FieldType, filterValue, values)
+}
 
-	query := s.db.WithContext(ctx).Model(&database.FieldValue{}).Where("field_definition_id = ? AND target_type = ?", definition.ID, targetType)
-	filterValue := strings.TrimSpace(rawValue)
+func (s *Service) filterDefinition(ctx context.Context, repositoryID int64, targetType, fieldName, rawValue string) (database.FieldDefinition, string, error) {
+	name := normalizeFieldName(fieldName)
+	definition, err := s.lookupFilterDefinition(ctx, repositoryID, name, targetType)
+	if err != nil {
+		return database.FieldDefinition{}, "", err
+	}
+	return definition, strings.TrimSpace(rawValue), nil
+}
 
-	switch definition.FieldType {
+func (s *Service) lookupFilterDefinition(ctx context.Context, repositoryID int64, fieldName, targetType string) (database.FieldDefinition, error) {
+	definition, err := s.lookupScopedFilterDefinition(ctx, repositoryID, fieldName, targetType)
+	if err == nil || !errors.Is(err, gorm.ErrRecordNotFound) {
+		return definition, translateDBError(err)
+	}
+	return s.lookupScopedFilterDefinition(ctx, repositoryID, fieldName, "all")
+}
+
+func (s *Service) lookupScopedFilterDefinition(ctx context.Context, repositoryID int64, fieldName, scope string) (database.FieldDefinition, error) {
+	var definition database.FieldDefinition
+	err := s.db.WithContext(ctx).
+		Where("github_repository_id = ? AND name = ? AND archived_at IS NULL AND is_filterable = ? AND object_scope = ?", repositoryID, fieldName, true, scope).
+		First(&definition).Error
+	return definition, err
+}
+
+func (s *Service) filteredFieldValues(ctx context.Context, definition database.FieldDefinition, targetType, filterValue string) ([]database.FieldValue, error) {
+	query, err := applyFieldValueFilter(s.db.WithContext(ctx).Model(&database.FieldValue{}).Where("field_definition_id = ? AND target_type = ?", definition.ID, targetType), definition.FieldType, filterValue)
+	if err != nil {
+		return nil, err
+	}
+	var values []database.FieldValue
+	if err := query.Order("target_key ASC").Find(&values).Error; err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+func applyFieldValueFilter(query *gorm.DB, fieldType, filterValue string) (*gorm.DB, error) {
+	switch fieldType {
 	case "boolean":
-		value := strings.EqualFold(filterValue, "true")
-		query = query.Where("bool_value = ?", value)
+		return query.Where("bool_value = ?", strings.EqualFold(filterValue, "true")), nil
 	case "integer":
 		parsed, err := strconv.ParseInt(filterValue, 10, 64)
 		if err != nil {
 			return nil, &FailError{StatusCode: 400, Message: "invalid integer filter"}
 		}
-		query = query.Where("int_value = ?", parsed)
+		return query.Where("int_value = ?", parsed), nil
 	case "enum":
-		query = query.Where("enum_value = ?", filterValue)
+		return query.Where("enum_value = ?", filterValue), nil
 	case "multi_enum":
-		// JSON containment differs across SQLite test runs and Postgres production,
-		// so keep the initial query broad and filter the decoded values below.
+		return query, nil
 	default:
-		query = query.Where("COALESCE(string_value, text_value, enum_value, '') = ?", filterValue)
+		return query.Where("COALESCE(string_value, text_value, enum_value, '') = ?", filterValue), nil
 	}
+}
 
-	var values []database.FieldValue
-	if err := query.Order("target_key ASC").Find(&values).Error; err != nil {
-		return nil, err
-	}
-
+func (s *Service) buildFilteredTargets(ctx context.Context, repositoryID int64, fieldType, filterValue string, values []database.FieldValue) ([]TargetFilterResult, error) {
 	results := make([]TargetFilterResult, 0, len(values))
 	for _, value := range values {
-		if definition.FieldType == "multi_enum" {
-			matches, err := multiEnumContains(value.MultiEnumJSON, filterValue)
-			if err != nil {
-				return nil, err
-			}
-			if !matches {
-				continue
-			}
-		}
-
-		annotations, err := s.getAnnotationsForTarget(ctx, value.TargetType, repository.GitHubRepositoryID, intValueOrZero(value.ObjectNumber), value.GroupID)
+		result, ok, err := s.filteredTargetResult(ctx, repositoryID, fieldType, filterValue, value)
 		if err != nil {
 			return nil, err
 		}
-
-		var projection *database.TargetProjection
-		if value.TargetType != "group" && value.ObjectNumber != nil {
-			var stored database.TargetProjection
-			err := s.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repository.GitHubRepositoryID, value.TargetType, *value.ObjectNumber).First(&stored).Error
-			if err == nil {
-				projection = &stored
-			}
-		}
-
-		results = append(results, TargetFilterResult{
-			TargetType:   value.TargetType,
-			ObjectNumber: intValueOrZero(value.ObjectNumber),
-			ID:           "",
-			TargetKey:    value.TargetKey,
-			Projection:   projection,
-			Annotations:  annotations,
-		})
-		if value.TargetType == "group" && value.GroupID != nil {
-			group, err := s.lookupGroupByID(ctx, *value.GroupID)
-			if err != nil {
-				return nil, translateDBError(err)
-			}
-			results[len(results)-1].ID = group.PublicID
+		if ok {
+			results = append(results, result)
 		}
 	}
 	return results, nil
+}
+
+func (s *Service) filteredTargetResult(ctx context.Context, repositoryID int64, fieldType, filterValue string, value database.FieldValue) (TargetFilterResult, bool, error) {
+	if fieldType == "multi_enum" {
+		matches, err := multiEnumContains(value.MultiEnumJSON, filterValue)
+		if err != nil || !matches {
+			return TargetFilterResult{}, false, err
+		}
+	}
+	annotations, err := s.getAnnotationsForTarget(ctx, value.TargetType, repositoryID, intValueOrZero(value.ObjectNumber), value.GroupID)
+	if err != nil {
+		return TargetFilterResult{}, false, err
+	}
+	projection, err := s.filteredTargetProjection(ctx, repositoryID, value)
+	if err != nil {
+		return TargetFilterResult{}, false, err
+	}
+	result := TargetFilterResult{
+		TargetType:   value.TargetType,
+		ObjectNumber: intValueOrZero(value.ObjectNumber),
+		TargetKey:    value.TargetKey,
+		Projection:   projection,
+		Annotations:  annotations,
+	}
+	if value.TargetType == "group" && value.GroupID != nil {
+		group, err := s.lookupGroupByID(ctx, *value.GroupID)
+		if err != nil {
+			return TargetFilterResult{}, false, translateDBError(err)
+		}
+		result.ID = group.PublicID
+	}
+	return result, true, nil
+}
+
+func (s *Service) filteredTargetProjection(ctx context.Context, repositoryID int64, value database.FieldValue) (*database.TargetProjection, error) {
+	if value.TargetType == "group" || value.ObjectNumber == nil {
+		return nil, nil
+	}
+	var stored database.TargetProjection
+	err := s.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, value.TargetType, *value.ObjectNumber).First(&stored).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &stored, nil
 }
 
 func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string, repositoryID int64, objectNumber int, groupID *uint) (map[string]any, error) {
@@ -1587,19 +1687,7 @@ func (s *Service) enqueueTargetProjectionRefreshJobsTx(tx *gorm.DB, group databa
 
 func (s *Service) enqueueTargetProjectionRefreshJobsDB(db *gorm.DB, group database.Group, targets []targetRef) error {
 	if s.dispatcher != nil {
-		seen := make(map[string]struct{}, len(targets))
-		for _, target := range targets {
-			if target.TargetType != "pull_request" && target.TargetType != "issue" {
-				continue
-			}
-			if target.TargetKey == "" {
-				continue
-			}
-			dedupeKey := target.TargetType + ":" + target.TargetKey
-			if _, ok := seen[dedupeKey]; ok {
-				continue
-			}
-			seen[dedupeKey] = struct{}{}
+		for _, target := range dedupeProjectionRefreshTargets(targets) {
 			if err := s.dispatcher.EnqueueTargetProjectionRefreshTx(db, group, target); err != nil {
 				return err
 			}
@@ -1608,12 +1696,19 @@ func (s *Service) enqueueTargetProjectionRefreshJobsDB(db *gorm.DB, group databa
 	}
 
 	now := time.Now().UTC()
-	seen := make(map[string]struct{}, len(targets))
-	for _, target := range targets {
-		if target.TargetType != "pull_request" && target.TargetType != "issue" {
-			continue
+	for _, target := range dedupeProjectionRefreshTargets(targets) {
+		if err := s.createProjectionRefreshJob(db, group, target, now); err != nil {
+			return err
 		}
-		if target.TargetKey == "" {
+	}
+	return nil
+}
+
+func dedupeProjectionRefreshTargets(targets []targetRef) []targetRef {
+	seen := make(map[string]struct{}, len(targets))
+	filtered := make([]targetRef, 0, len(targets))
+	for _, target := range targets {
+		if !isProjectionRefreshTarget(target) {
 			continue
 		}
 		dedupeKey := target.TargetType + ":" + target.TargetKey
@@ -1621,36 +1716,49 @@ func (s *Service) enqueueTargetProjectionRefreshJobsDB(db *gorm.DB, group databa
 			continue
 		}
 		seen[dedupeKey] = struct{}{}
-
-		var existing database.IndexJob
-		err := db.
-			Where("kind = ? AND github_repository_id = ? AND target_type = ? AND target_key = ? AND status IN ?", indexJobKindTargetProjectionRefresh, group.GitHubRepositoryID, target.TargetType, target.TargetKey, []string{"pending", "processing"}).
-			First(&existing).Error
-		if err == nil {
-			continue
-		}
-		if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-
-		job := database.IndexJob{
-			Kind:               indexJobKindTargetProjectionRefresh,
-			Status:             "pending",
-			GitHubRepositoryID: group.GitHubRepositoryID,
-			RepositoryOwner:    group.RepositoryOwner,
-			RepositoryName:     group.RepositoryName,
-			TargetType:         target.TargetType,
-			TargetKey:          target.TargetKey,
-			NextAttemptAt:      timePtr(now),
-		}
-		if target.Projection != nil {
-			job.SourceUpdatedAt = timePtr(target.Projection.SourceUpdatedAt)
-		}
-		if err := db.Create(&job).Error; err != nil {
-			return err
-		}
+		filtered = append(filtered, target)
 	}
-	return nil
+	return filtered
+}
+
+func isProjectionRefreshTarget(target targetRef) bool {
+	return (target.TargetType == "pull_request" || target.TargetType == "issue") && target.TargetKey != ""
+}
+
+func (s *Service) createProjectionRefreshJob(db *gorm.DB, group database.Group, target targetRef, now time.Time) error {
+	exists, err := projectionRefreshJobExists(db, group.GitHubRepositoryID, target)
+	if err != nil || exists {
+		return err
+	}
+	job := database.IndexJob{
+		Kind:               indexJobKindTargetProjectionRefresh,
+		Status:             "pending",
+		GitHubRepositoryID: group.GitHubRepositoryID,
+		RepositoryOwner:    group.RepositoryOwner,
+		RepositoryName:     group.RepositoryName,
+		TargetType:         target.TargetType,
+		TargetKey:          target.TargetKey,
+		NextAttemptAt:      timePtr(now),
+	}
+	if target.Projection != nil {
+		job.SourceUpdatedAt = timePtr(target.Projection.SourceUpdatedAt)
+	}
+	return db.Create(&job).Error
+}
+
+func projectionRefreshJobExists(db *gorm.DB, repositoryID int64, target targetRef) (bool, error) {
+	var existing database.IndexJob
+	err := db.
+		Where("kind = ? AND github_repository_id = ? AND target_type = ? AND target_key = ? AND status IN ?", indexJobKindTargetProjectionRefresh, repositoryID, target.TargetType, target.TargetKey, []string{"pending", "processing"}).
+		First(&existing).Error
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 func groupMemberViewFromModel(member database.GroupMember, resolution groupMemberResolution) GroupMemberView {
@@ -1751,61 +1859,90 @@ func (s *Service) appendEventTx(tx *gorm.DB, input eventInput) error {
 	if err := lockEventAggregateTx(tx, input.AggregateType, input.AggregateKey); err != nil {
 		return err
 	}
-	var event database.Event
-	for attempts := 0; attempts < 5; attempts++ {
-		var nextSequence int
-		if err := tx.Model(&database.Event{}).
-			Select("COALESCE(MAX(sequence_no), 0) + 1").
-			Where("aggregate_type = ? AND aggregate_key = ?", input.AggregateType, input.AggregateKey).
-			Scan(&nextSequence).Error; err != nil {
-			return err
-		}
-
-		event = database.Event{
-			GitHubRepositoryID: input.RepositoryID,
-			AggregateType:      input.AggregateType,
-			AggregateKey:       input.AggregateKey,
-			SequenceNo:         nextSequence,
-			EventType:          input.EventType,
-			ActorType:          input.Actor.Type,
-			ActorID:            input.Actor.ID,
-			RequestID:          input.RequestID,
-			IdempotencyKey:     input.IdempotencyKey,
-			SchemaVersion:      1,
-			PayloadJSON:        datatypes.JSON(payloadJSON),
-			MetadataJSON:       datatypes.JSON(metadataJSON),
-			OccurredAt:         time.Now().UTC(),
-		}
-		savepoint := fmt.Sprintf("event_sequence_retry_%d", attempts)
-		if err := tx.SavePoint(savepoint).Error; err != nil {
-			return err
-		}
-		if err := tx.Create(&event).Error; err != nil {
-			if isEventSequenceConflict(err) {
-				if rollbackErr := tx.RollbackTo(savepoint).Error; rollbackErr != nil {
-					return rollbackErr
-				}
-				continue
-			}
-			return err
-		}
-		goto refs
+	event, err := s.insertEventWithSequenceRetry(tx, input, payloadJSON, metadataJSON)
+	if err != nil {
+		return err
 	}
-	return &FailError{StatusCode: 409, Message: "event sequence conflict"}
+	if err := insertEventRefs(tx, event.ID, input.Refs); err != nil {
+		return err
+	}
+	if s.dispatcher != nil && input.AggregateType == "group" {
+		return s.dispatcher.EnqueueGroupCommentProjectTx(tx, event.ID)
+	}
+	return nil
+}
 
-refs:
-	for _, ref := range input.Refs {
+func (s *Service) insertEventWithSequenceRetry(tx *gorm.DB, input eventInput, payloadJSON, metadataJSON []byte) (database.Event, error) {
+	for attempts := 0; attempts < 5; attempts++ {
+		nextSequence, err := nextEventSequence(tx, input.AggregateType, input.AggregateKey)
+		if err != nil {
+			return database.Event{}, err
+		}
+		event := newEventRecord(input, nextSequence, payloadJSON, metadataJSON)
+		inserted, retry, err := insertEventWithSavepoint(tx, attempts, event)
+		if err != nil {
+			return database.Event{}, err
+		}
+		if retry {
+			continue
+		}
+		return inserted, nil
+	}
+	return database.Event{}, &FailError{StatusCode: 409, Message: "event sequence conflict"}
+}
+
+func nextEventSequence(tx *gorm.DB, aggregateType, aggregateKey string) (int, error) {
+	var nextSequence int
+	err := tx.Model(&database.Event{}).
+		Select("COALESCE(MAX(sequence_no), 0) + 1").
+		Where("aggregate_type = ? AND aggregate_key = ?", aggregateType, aggregateKey).
+		Scan(&nextSequence).Error
+	return nextSequence, err
+}
+
+func newEventRecord(input eventInput, nextSequence int, payloadJSON, metadataJSON []byte) database.Event {
+	return database.Event{
+		GitHubRepositoryID: input.RepositoryID,
+		AggregateType:      input.AggregateType,
+		AggregateKey:       input.AggregateKey,
+		SequenceNo:         nextSequence,
+		EventType:          input.EventType,
+		ActorType:          input.Actor.Type,
+		ActorID:            input.Actor.ID,
+		RequestID:          input.RequestID,
+		IdempotencyKey:     input.IdempotencyKey,
+		SchemaVersion:      1,
+		PayloadJSON:        datatypes.JSON(payloadJSON),
+		MetadataJSON:       datatypes.JSON(metadataJSON),
+		OccurredAt:         time.Now().UTC(),
+	}
+}
+
+func insertEventWithSavepoint(tx *gorm.DB, attempts int, event database.Event) (database.Event, bool, error) {
+	savepoint := fmt.Sprintf("event_sequence_retry_%d", attempts)
+	if err := tx.SavePoint(savepoint).Error; err != nil {
+		return database.Event{}, false, err
+	}
+	if err := tx.Create(&event).Error; err != nil {
+		if isEventSequenceConflict(err) {
+			if rollbackErr := tx.RollbackTo(savepoint).Error; rollbackErr != nil {
+				return database.Event{}, false, rollbackErr
+			}
+			return database.Event{}, true, nil
+		}
+		return database.Event{}, false, err
+	}
+	return event, false, nil
+}
+
+func insertEventRefs(tx *gorm.DB, eventID uint, refs []eventRefInput) error {
+	for _, ref := range refs {
 		if err := tx.Create(&database.EventRef{
-			EventID: event.ID,
+			EventID: eventID,
 			RefRole: ref.Role,
 			RefType: ref.Type,
 			RefKey:  ref.Key,
 		}).Error; err != nil {
-			return err
-		}
-	}
-	if s.dispatcher != nil && input.AggregateType == "group" {
-		if err := s.dispatcher.EnqueueGroupCommentProjectTx(tx, event.ID); err != nil {
 			return err
 		}
 	}
@@ -2003,23 +2140,8 @@ func (s *Service) ensureEnumValuesCompatible(ctx context.Context, definition dat
 		return err
 	}
 	for _, value := range values {
-		switch definition.FieldType {
-		case "enum":
-			if value.EnumValue != nil {
-				if _, ok := allowedSet[*value.EnumValue]; !ok {
-					return &FailError{StatusCode: 409, Message: "enum_values would invalidate existing annotations"}
-				}
-			}
-		case "multi_enum":
-			var existing []string
-			if err := json.Unmarshal(value.MultiEnumJSON, &existing); err != nil {
-				return err
-			}
-			for _, candidate := range existing {
-				if _, ok := allowedSet[candidate]; !ok {
-					return &FailError{StatusCode: 409, Message: "enum_values would invalidate existing annotations"}
-				}
-			}
+		if err := validateEnumCompatibility(definition.FieldType, allowedSet, value); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -2031,77 +2153,144 @@ func convertAnnotationValue(definition database.FieldDefinition, raw any) (conve
 	}
 
 	base := convertedValue{MultiEnumJSON: datatypes.JSON([]byte("[]"))}
-
 	switch definition.FieldType {
 	case "string":
-		value := strings.TrimSpace(fmt.Sprint(raw))
-		base.StringValue = &value
-		base.APIValue = value
-		return base, false, nil
+		return convertStringAnnotation(base, raw)
 	case "text":
-		value := strings.TrimSpace(fmt.Sprint(raw))
-		base.TextValue = &value
-		base.APIValue = value
-		return base, false, nil
+		return convertTextAnnotation(base, raw)
 	case "boolean":
-		boolValue, ok := raw.(bool)
-		if !ok {
-			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected boolean value"}
-		}
-		base.BoolValue = &boolValue
-		base.APIValue = boolValue
-		return base, false, nil
+		return convertBoolAnnotation(base, raw)
 	case "integer":
-		switch typed := raw.(type) {
-		case float64:
-			if math.Trunc(typed) != typed {
-				return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected integer value"}
-			}
-			value := int64(typed)
-			base.IntValue = &value
-			base.APIValue = value
-			return base, false, nil
-		case int:
-			value := int64(typed)
-			base.IntValue = &value
-			base.APIValue = value
-			return base, false, nil
-		case int64:
-			base.IntValue = &typed
-			base.APIValue = typed
-			return base, false, nil
-		default:
-			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected integer value"}
-		}
+		return convertIntegerAnnotation(base, raw)
 	case "enum":
-		value := strings.TrimSpace(fmt.Sprint(raw))
-		if !enumAllowed(definition.EnumValuesJSON, value) {
-			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "invalid enum value"}
-		}
-		base.EnumValue = &value
-		base.APIValue = value
-		return base, false, nil
+		return convertEnumAnnotation(base, definition.EnumValuesJSON, raw)
 	case "multi_enum":
-		items, ok := raw.([]any)
-		if !ok {
-			return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected array value"}
-		}
-		values := make([]string, 0, len(items))
-		for _, item := range items {
-			value := strings.TrimSpace(fmt.Sprint(item))
-			if !enumAllowed(definition.EnumValuesJSON, value) {
-				return convertedValue{}, false, &FailError{StatusCode: 400, Message: "invalid multi_enum value"}
-			}
-			values = append(values, value)
-		}
-		sort.Strings(values)
-		bytes, _ := json.Marshal(values)
-		base.MultiEnumJSON = datatypes.JSON(bytes)
-		base.APIValue = values
-		return base, false, nil
+		return convertMultiEnumAnnotation(base, definition.EnumValuesJSON, raw)
 	default:
 		return convertedValue{}, false, &FailError{StatusCode: 400, Message: "unsupported field type"}
 	}
+}
+
+func validateEnumCompatibility(fieldType string, allowedSet map[string]struct{}, value database.FieldValue) error {
+	switch fieldType {
+	case "enum":
+		return validateEnumValueCompatibility(allowedSet, value.EnumValue)
+	case "multi_enum":
+		return validateMultiEnumCompatibility(allowedSet, value.MultiEnumJSON)
+	default:
+		return nil
+	}
+}
+
+func validateEnumValueCompatibility(allowedSet map[string]struct{}, enumValue *string) error {
+	if enumValue == nil {
+		return nil
+	}
+	if _, ok := allowedSet[*enumValue]; ok {
+		return nil
+	}
+	return &FailError{StatusCode: 409, Message: "enum_values would invalidate existing annotations"}
+}
+
+func validateMultiEnumCompatibility(allowedSet map[string]struct{}, raw datatypes.JSON) error {
+	var existing []string
+	if err := json.Unmarshal(raw, &existing); err != nil {
+		return err
+	}
+	for _, candidate := range existing {
+		if _, ok := allowedSet[candidate]; !ok {
+			return &FailError{StatusCode: 409, Message: "enum_values would invalidate existing annotations"}
+		}
+	}
+	return nil
+}
+
+func convertStringAnnotation(base convertedValue, raw any) (convertedValue, bool, error) {
+	value := strings.TrimSpace(fmt.Sprint(raw))
+	base.StringValue = &value
+	base.APIValue = value
+	return base, false, nil
+}
+
+func convertTextAnnotation(base convertedValue, raw any) (convertedValue, bool, error) {
+	value := strings.TrimSpace(fmt.Sprint(raw))
+	base.TextValue = &value
+	base.APIValue = value
+	return base, false, nil
+}
+
+func convertBoolAnnotation(base convertedValue, raw any) (convertedValue, bool, error) {
+	boolValue, ok := raw.(bool)
+	if !ok {
+		return convertedValue{}, false, &FailError{StatusCode: 400, Message: "expected boolean value"}
+	}
+	base.BoolValue = &boolValue
+	base.APIValue = boolValue
+	return base, false, nil
+}
+
+func convertIntegerAnnotation(base convertedValue, raw any) (convertedValue, bool, error) {
+	value, err := annotationIntegerValue(raw)
+	if err != nil {
+		return convertedValue{}, false, err
+	}
+	base.IntValue = &value
+	base.APIValue = value
+	return base, false, nil
+}
+
+func annotationIntegerValue(raw any) (int64, error) {
+	switch typed := raw.(type) {
+	case float64:
+		if math.Trunc(typed) != typed {
+			return 0, &FailError{StatusCode: 400, Message: "expected integer value"}
+		}
+		return int64(typed), nil
+	case int:
+		return int64(typed), nil
+	case int64:
+		return typed, nil
+	default:
+		return 0, &FailError{StatusCode: 400, Message: "expected integer value"}
+	}
+}
+
+func convertEnumAnnotation(base convertedValue, allowed datatypes.JSON, raw any) (convertedValue, bool, error) {
+	value := strings.TrimSpace(fmt.Sprint(raw))
+	if !enumAllowed(allowed, value) {
+		return convertedValue{}, false, &FailError{StatusCode: 400, Message: "invalid enum value"}
+	}
+	base.EnumValue = &value
+	base.APIValue = value
+	return base, false, nil
+}
+
+func convertMultiEnumAnnotation(base convertedValue, allowed datatypes.JSON, raw any) (convertedValue, bool, error) {
+	values, err := annotationMultiEnumValues(allowed, raw)
+	if err != nil {
+		return convertedValue{}, false, err
+	}
+	bytes, _ := json.Marshal(values)
+	base.MultiEnumJSON = datatypes.JSON(bytes)
+	base.APIValue = values
+	return base, false, nil
+}
+
+func annotationMultiEnumValues(allowed datatypes.JSON, raw any) ([]string, error) {
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, &FailError{StatusCode: 400, Message: "expected array value"}
+	}
+	values := make([]string, 0, len(items))
+	for _, item := range items {
+		value := strings.TrimSpace(fmt.Sprint(item))
+		if !enumAllowed(allowed, value) {
+			return nil, &FailError{StatusCode: 400, Message: "invalid multi_enum value"}
+		}
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values, nil
 }
 
 func translateDBError(err error) error {

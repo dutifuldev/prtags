@@ -53,16 +53,8 @@ func TestRequestJSONReturnsStatusError(t *testing.T) {
 func TestBatchGetObjects(t *testing.T) {
 	updatedAt := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC).Format(time.RFC3339)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("expected POST, got %s", r.Method)
-		}
-		if r.URL.Path != "/v1/github-ext/repos/openclaw/openclaw/objects/batch" {
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Fatalf("expected json content-type, got %q", got)
-		}
-		_, _ = w.Write([]byte(`{"results":[{"type":"issue","number":1,"found":true,"object":{"id":11,"number":1,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/1","updated_at":"` + updatedAt + `","user":{"login":"alice"}}},{"type":"pull_request","number":2,"found":true,"object":{"id":22,"number":2,"title":"PR title","state":"closed","html_url":"https://github.com/openclaw/openclaw/pull/2","updated_at":"` + updatedAt + `","user":{"login":"bob"}}},{"type":"issue","number":3,"found":false,"object":null}]}`))
+		assertBatchRequest(t, r)
+		_, _ = w.Write([]byte(batchObjectsResponse(updatedAt)))
 	}))
 	defer server.Close()
 
@@ -87,6 +79,23 @@ func TestBatchGetObjects(t *testing.T) {
 	if results[2].Found || results[2].Summary != nil {
 		t.Fatalf("expected missing object to stay empty, got %#v", results[2])
 	}
+}
+
+func assertBatchRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodPost {
+		t.Fatalf("expected POST, got %s", r.Method)
+	}
+	if r.URL.Path != "/v1/github-ext/repos/openclaw/openclaw/objects/batch" {
+		t.Fatalf("unexpected path %q", r.URL.Path)
+	}
+	if got := r.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("expected json content-type, got %q", got)
+	}
+}
+
+func batchObjectsResponse(updatedAt string) string {
+	return `{"results":[{"type":"issue","number":1,"found":true,"object":{"id":11,"number":1,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/1","updated_at":"` + updatedAt + `","user":{"login":"alice"}}},{"type":"pull_request","number":2,"found":true,"object":{"id":22,"number":2,"title":"PR title","state":"closed","html_url":"https://github.com/openclaw/openclaw/pull/2","updated_at":"` + updatedAt + `","user":{"login":"bob"}}},{"type":"issue","number":3,"found":false,"object":null}]}`
 }
 
 func TestBatchGetObjectsEmpty(t *testing.T) {

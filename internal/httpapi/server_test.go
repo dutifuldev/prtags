@@ -310,6 +310,110 @@ func TestAPIListGroupCommentSyncTargets(t *testing.T) {
 	require.Contains(t, raw, `"last_error_kind":"permission_denied"`)
 }
 
+func TestAPIHandlerErrorBranches(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	stub := newStubGHReplica(t)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
+	server := httpapi.NewServer(db, service, true)
+
+	postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{
+		"name":         "intent",
+		"object_scope": "pull_request",
+		"field_type":   "text",
+	}, http.StatusCreated)
+	groupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "pull_request",
+		"title": "Auth reliability",
+	}, http.StatusCreated)
+	groupID := extractPathString(t, groupRaw, "data.id")
+	memberRaw := postJSON(t, server.Echo(), http.MethodPost, fmt.Sprintf("/v1/groups/%s/members", groupID), map[string]any{
+		"object_type":   "pull_request",
+		"object_number": 22,
+	}, http.StatusCreated)
+	memberID := extractPathNumber(t, memberRaw, "data.id")
+
+	badField := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{}, http.StatusBadRequest)
+	require.Contains(t, badField, `"field name is required"`)
+
+	notFoundArchive := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields/999/archive", map[string]any{}, http.StatusNotFound)
+	require.Contains(t, notFoundArchive, `"not found"`)
+
+	badImport := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields/import", map[string]any{"version": "v1"}, http.StatusBadRequest)
+	require.Contains(t, badImport, `"manifest has no fields"`)
+
+	badGroup := postJSON(t, server.Echo(), http.MethodPatch, fmt.Sprintf("/v1/groups/%s", groupID), map[string]any{}, http.StatusBadRequest)
+	require.Contains(t, badGroup, `"no group updates provided"`)
+
+	removeOK := postJSON(t, server.Echo(), http.MethodDelete, fmt.Sprintf("/v1/groups/%s/members/%d", groupID, memberID), nil, http.StatusOK)
+	require.Contains(t, removeOK, `"success"`)
+
+	removeMissing := postJSON(t, server.Echo(), http.MethodDelete, fmt.Sprintf("/v1/groups/%s/members/%d", groupID, memberID), nil, http.StatusNotFound)
+	require.Contains(t, removeMissing, `"not found"`)
+
+	search := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/search/text", map[string]any{
+		"query": "",
+	}, http.StatusOK)
+	require.Contains(t, search, `"status":"success"`)
+
+	require.NoError(t, db.WithContext(ctx).Model(&database.Event{}).Where("aggregate_type = ?", "group").Count(new(int64)).Error)
+}
+
+func TestAPIAdditionalHandlerBranches(t *testing.T) {
+	db := openTestDB(t)
+	stub := newStubGHReplica(t)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
+	server := httpapi.NewServer(db, service, true)
+
+	fieldRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/fields", map[string]any{
+		"name":         "theme",
+		"object_scope": "group",
+		"field_type":   "text",
+	}, http.StatusCreated)
+	fieldID := extractPathNumber(t, fieldRaw, "data.id")
+	groupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "mixed",
+		"title": "Auth reliability",
+	}, http.StatusCreated)
+	groupID := extractPathString(t, groupRaw, "data.id")
+
+	list := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/fields", nil, http.StatusOK)
+	require.Contains(t, list, `"theme"`)
+	exported := postJSON(t, server.Echo(), http.MethodGet, "/v1/repos/acme/widgets/fields/export", nil, http.StatusOK)
+	require.Contains(t, exported, `"version":"v1"`)
+
+	updated := postJSON(t, server.Echo(), http.MethodPatch, "/v1/repos/acme/widgets/fields/"+fmt.Sprint(fieldID), map[string]any{
+		"display_name":         "Theme",
+		"expected_row_version": 1,
+	}, http.StatusOK)
+	require.Contains(t, updated, `"Theme"`)
+
+	gotGroup := postJSON(t, server.Echo(), http.MethodGet, "/v1/groups/"+groupID, nil, http.StatusOK)
+	require.Contains(t, gotGroup, groupID)
+
+	groupAnnotations := postJSON(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/annotations", map[string]any{
+		"theme": "reliability",
+	}, http.StatusOK)
+	require.Contains(t, groupAnnotations, `"theme":"reliability"`)
+	fetchedGroupAnnotations := postJSON(t, server.Echo(), http.MethodGet, "/v1/groups/"+groupID+"/annotations", nil, http.StatusOK)
+	require.Contains(t, fetchedGroupAnnotations, `"theme":"reliability"`)
+
+	memberRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/members", map[string]any{
+		"object_type":   "pull_request",
+		"object_number": 22,
+	}, http.StatusCreated)
+	require.Contains(t, memberRaw, `"object_number":22`)
+
+	annotations := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/pulls/22/annotations", map[string]any{
+		"theme": nil,
+	}, http.StatusBadRequest)
+	require.Contains(t, annotations, `"unknown field"`)
+}
+
 func TestAPIAnnotationSearchAndMembershipHandlers(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -381,6 +485,24 @@ func TestAPIAnnotationSearchAndMembershipHandlers(t *testing.T) {
 	groupAnnotations := postJSON(t, server.Echo(), http.MethodGet, "/v1/groups/"+groupID+"/annotations", nil, http.StatusOK)
 	require.Contains(t, groupAnnotations, `"auth recovery work"`)
 
+	drainIndexJobs(t, ctx, db, indexer)
+
+	searchText := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/search/text", map[string]any{
+		"query":        "auth",
+		"target_types": []string{"pull_request", "issue", "group"},
+		"limit":        5,
+	}, http.StatusOK)
+	require.Contains(t, searchText, `"target_type":"pull_request"`)
+	require.Contains(t, searchText, `"target_type":"issue"`)
+	require.Contains(t, searchText, `"target_type":"group"`)
+
+	searchSimilar := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/search/similar", map[string]any{
+		"query":        "critical auth outage",
+		"target_types": []string{"pull_request", "issue", "group"},
+		"limit":        5,
+	}, http.StatusOK)
+	require.Contains(t, searchSimilar, `"target_type":"issue"`)
+
 	removeRaw := postJSON(t, server.Echo(), http.MethodDelete, fmt.Sprintf("/v1/groups/%s/members/%d", groupID, prMemberID), nil, http.StatusOK)
 	require.Contains(t, removeRaw, `"removed":true`)
 
@@ -395,6 +517,31 @@ func TestAPIAnnotationSearchAndMembershipHandlers(t *testing.T) {
 	require.Contains(t, syncRaw, `"github comment sync is not configured"`)
 }
 
+func TestAPIInvalidBodiesAndParams(t *testing.T) {
+	db := openTestDB(t)
+	stub := newStubGHReplica(t)
+	ghClient := ghreplica.NewClient(stub.URL)
+	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
+	server := httpapi.NewServer(db, service, true)
+
+	groupRaw := postJSON(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", map[string]any{
+		"kind":  "mixed",
+		"title": "Bad input coverage",
+	}, http.StatusCreated)
+	groupID := extractPathString(t, groupRaw, "data.id")
+
+	invalidBodyRequest(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/groups", "{", http.StatusBadRequest)
+	invalidBodyRequest(t, server.Echo(), http.MethodPost, "/v1/groups/"+groupID+"/annotations", "{", http.StatusBadRequest)
+	invalidBodyRequest(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/search/text", "{", http.StatusBadRequest)
+	invalidBodyRequest(t, server.Echo(), http.MethodPost, "/v1/repos/acme/widgets/search/similar", "{", http.StatusBadRequest)
+	invalidBodyRequest(t, server.Echo(), http.MethodPatch, "/v1/repos/acme/widgets/fields/not-a-number", "{}", http.StatusBadRequest)
+	invalidBodyRequest(t, server.Echo(), http.MethodDelete, "/v1/groups/"+groupID+"/members/not-a-number", "", http.StatusBadRequest)
+
+	missingGroupAnnotations := postJSON(t, server.Echo(), http.MethodGet, "/v1/groups/missing-group/annotations", nil, http.StatusNotFound)
+	require.Contains(t, missingGroupAnnotations, `"not found"`)
+}
+
 func openTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+strings.ReplaceAll(t.Name(), "/", "_")+"?mode=memory&cache=shared"), &gorm.Config{
@@ -405,6 +552,15 @@ func openTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
+func invalidBodyRequest(t *testing.T, e *echo.Echo, method, path, body string, status int) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	require.Equal(t, status, rec.Code, rec.Body.String())
+}
+
 func timePtr(value time.Time) *time.Time {
 	return &value
 }
@@ -413,89 +569,109 @@ func newStubGHReplica(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/github/repos/acme/widgets":
-			_, _ = w.Write([]byte(`{
-				"id": 101,
-				"name": "widgets",
-				"full_name": "acme/widgets",
-				"html_url": "https://github.com/acme/widgets",
-				"visibility": "public",
-				"private": false,
-				"owner": {"login": "acme"}
-			}`))
-		case "/v1/github/repos/acme/widgets/pulls/22":
-			_, _ = w.Write([]byte(`{
-				"id": 2022,
-				"number": 22,
-				"title": "Retry ACP turns safely",
-				"state": "open",
-				"html_url": "https://github.com/acme/widgets/pull/22",
-				"updated_at": "2026-04-16T12:00:00Z",
-				"user": {"login": "bob"}
-			}`))
-		case "/v1/github/repos/acme/widgets/issues/11":
-			_, _ = w.Write([]byte(`{
-				"id": 1111,
-				"number": 11,
-				"title": "Auth retries are flaky",
-				"state": "open",
-				"html_url": "https://github.com/acme/widgets/issues/11",
-				"updated_at": "2026-04-16T12:00:00Z",
-				"user": {"login": "alice"}
-			}`))
-		case "/v1/github-ext/repos/acme/widgets/objects/batch":
-			var input struct {
-				Objects []ghreplica.BatchObjectRef `json:"objects"`
-			}
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
-
-			results := make([]map[string]any, 0, len(input.Objects))
-			for _, object := range input.Objects {
-				switch {
-				case object.Type == "pull_request" && object.Number == 22:
-					results = append(results, map[string]any{
-						"type":   object.Type,
-						"number": object.Number,
-						"found":  true,
-						"object": map[string]any{
-							"id":         2022,
-							"number":     22,
-							"title":      "Retry ACP turns safely (batched)",
-							"state":      "open",
-							"html_url":   "https://github.com/acme/widgets/pull/22",
-							"updated_at": "2026-04-16T13:00:00Z",
-							"user":       map[string]any{"login": "bob"},
-						},
-					})
-				case object.Type == "issue" && object.Number == 11:
-					results = append(results, map[string]any{
-						"type":   object.Type,
-						"number": object.Number,
-						"found":  true,
-						"object": map[string]any{
-							"id":         1111,
-							"number":     11,
-							"title":      "Auth retries are flaky (batched)",
-							"state":      "open",
-							"html_url":   "https://github.com/acme/widgets/issues/11",
-							"updated_at": "2026-04-16T13:00:00Z",
-							"user":       map[string]any{"login": "alice"},
-						},
-					})
-				default:
-					results = append(results, map[string]any{
-						"type":   object.Type,
-						"number": object.Number,
-						"found":  false,
-					})
-				}
-			}
-			require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
-		default:
-			http.NotFound(w, r)
+		if writeStubObjectResponse(w, r.URL.Path) {
+			return
 		}
+		if r.URL.Path == "/v1/github-ext/repos/acme/widgets/objects/batch" {
+			writeStubBatchResponse(t, w, r)
+			return
+		}
+		http.NotFound(w, r)
 	}))
+}
+
+func writeStubObjectResponse(w http.ResponseWriter, path string) bool {
+	switch path {
+	case "/v1/github/repos/acme/widgets":
+		_, _ = w.Write([]byte(`{
+			"id": 101,
+			"name": "widgets",
+			"full_name": "acme/widgets",
+			"html_url": "https://github.com/acme/widgets",
+			"visibility": "public",
+			"private": false,
+			"owner": {"login": "acme"}
+		}`))
+		return true
+	case "/v1/github/repos/acme/widgets/pulls/22":
+		_, _ = w.Write([]byte(`{
+			"id": 2022,
+			"number": 22,
+			"title": "Retry ACP turns safely",
+			"state": "open",
+			"html_url": "https://github.com/acme/widgets/pull/22",
+			"updated_at": "2026-04-16T12:00:00Z",
+			"user": {"login": "bob"}
+		}`))
+		return true
+	case "/v1/github/repos/acme/widgets/issues/11":
+		_, _ = w.Write([]byte(`{
+			"id": 1111,
+			"number": 11,
+			"title": "Auth retries are flaky",
+			"state": "open",
+			"html_url": "https://github.com/acme/widgets/issues/11",
+			"updated_at": "2026-04-16T12:00:00Z",
+			"user": {"login": "alice"}
+		}`))
+		return true
+	default:
+		return false
+	}
+}
+
+func writeStubBatchResponse(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	var input struct {
+		Objects []ghreplica.BatchObjectRef `json:"objects"`
+	}
+	require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
+	results := make([]map[string]any, 0, len(input.Objects))
+	for _, object := range input.Objects {
+		results = append(results, stubBatchObjectResult(object))
+	}
+	require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
+}
+
+func stubBatchObjectResult(object ghreplica.BatchObjectRef) map[string]any {
+	switch {
+	case object.Type == "pull_request" && object.Number == 22:
+		return map[string]any{
+			"type":   object.Type,
+			"number": object.Number,
+			"found":  true,
+			"object": map[string]any{
+				"id":         2022,
+				"number":     22,
+				"title":      "Retry ACP turns safely (batched)",
+				"state":      "open",
+				"html_url":   "https://github.com/acme/widgets/pull/22",
+				"updated_at": "2026-04-16T13:00:00Z",
+				"user":       map[string]any{"login": "bob"},
+			},
+		}
+	case object.Type == "issue" && object.Number == 11:
+		return map[string]any{
+			"type":   object.Type,
+			"number": object.Number,
+			"found":  true,
+			"object": map[string]any{
+				"id":         1111,
+				"number":     11,
+				"title":      "Auth retries are flaky (batched)",
+				"state":      "open",
+				"html_url":   "https://github.com/acme/widgets/issues/11",
+				"updated_at": "2026-04-16T13:00:00Z",
+				"user":       map[string]any{"login": "alice"},
+			},
+		}
+	default:
+		return map[string]any{
+			"type":   object.Type,
+			"number": object.Number,
+			"found":  false,
+		}
+	}
 }
 
 func postJSON(t *testing.T, e *echo.Echo, method, path string, payload any, expectedStatus int) string {
