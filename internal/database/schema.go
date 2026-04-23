@@ -30,7 +30,8 @@ func ApplyTestSchema(db *gorm.DB) error {
 	if db == nil {
 		return errors.New("database.ApplyTestSchema requires a database handle")
 	}
-	if db.Name() != "sqlite" {
+	dialector := db.Dialector
+	if dialector == nil || dialector.Name() != "sqlite" {
 		return errors.New("database.ApplyTestSchema only supports sqlite test databases")
 	}
 	return db.AutoMigrate(schemaModels()...)

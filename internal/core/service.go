@@ -2314,10 +2314,14 @@ func lookupGroupMemberConflictTx(tx *gorm.DB, repositoryID int64, objectType str
 }
 
 func lockEventAggregateTx(tx *gorm.DB, aggregateType string, aggregateKey string) error {
-	if tx == nil || tx.Dialector == nil {
+	if tx == nil {
 		return nil
 	}
-	if tx.Name() != "postgres" {
+	dialector := tx.Dialector
+	if dialector == nil {
+		return nil
+	}
+	if dialector.Name() != "postgres" {
 		return nil
 	}
 	return tx.Exec("SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))", aggregateType, aggregateKey).Error
