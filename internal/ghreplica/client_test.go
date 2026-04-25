@@ -105,6 +105,35 @@ func TestNewSchemaClientReadsConfiguredSchema(t *testing.T) {
 	require.Equal(t, "openclaw/openclaw", repository.FullName)
 }
 
+func TestNewSchemaClientBatchGetObjectsUsesJoinedSummaries(t *testing.T) {
+	db := openMirrorTestDB(t)
+	seedMirrorRows(t, db)
+
+	client := NewSchemaClient(db, "main")
+	results, err := client.BatchGetObjects(context.Background(), 1103012935, []ObjectRef{
+		{Type: "pull_request", Number: 22},
+		{Type: "issue", Number: 11},
+		{Type: "pull_request", Number: 999},
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 3)
+	require.True(t, results[0].Found)
+	require.Equal(t, "Pull title", results[0].Summary.Title)
+	require.Equal(t, "octocat", results[0].Summary.AuthorLogin)
+	require.True(t, results[1].Found)
+	require.Equal(t, "Issue title", results[1].Summary.Title)
+	require.Equal(t, "octocat", results[1].Summary.AuthorLogin)
+	require.False(t, results[2].Found)
+}
+
+func TestNewSchemaClientBatchGetObjectsPreservesMissingRepositoryError(t *testing.T) {
+	db := openMirrorTestDB(t)
+	client := NewSchemaClient(db, "main")
+
+	_, err := client.BatchGetObjects(context.Background(), 999, []ObjectRef{{Type: "issue", Number: 11}})
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
 func openMirrorTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{

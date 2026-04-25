@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -84,6 +85,25 @@ func TestBuildSearchResultLoadsMirrorSummaryAndAnnotations(t *testing.T) {
 	require.Equal(t, "Retry ACP turns safely", result.ObjectSummary.Title)
 	require.Equal(t, "retry auth safely", result.Annotations["intent"])
 	require.Equal(t, 0.75, result.Score)
+}
+
+func TestResolveSearchResultsBatchesMirrorSummaries(t *testing.T) {
+	ctx := context.Background()
+	var batchCalls atomic.Int32
+	service, _, server := newTestServiceWithBatchOptions(t, batchBehavior{
+		calls: &batchCalls,
+	})
+	defer server.Close()
+
+	results, err := service.resolveSearchResults(ctx, 101, []scoredSearchTarget{
+		{TargetType: "pull_request", TargetKey: objectTargetKey(101, "pull_request", 22), Score: 0.75},
+		{TargetType: "issue", TargetKey: objectTargetKey(101, "issue", 11), Score: 0.5},
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 2)
+	require.Equal(t, int32(1), batchCalls.Load())
+	require.Equal(t, "Retry ACP turns safely", results[0].ObjectSummary.Title)
+	require.Equal(t, "Auth retries are flaky", results[1].ObjectSummary.Title)
 }
 
 func TestBuildSearchResultLoadsGroupAnnotations(t *testing.T) {

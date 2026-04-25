@@ -507,14 +507,45 @@ func scanScoredSearchRows(rows *sql.Rows) ([]scoredSearchTarget, error) {
 
 func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, rows []scoredSearchTarget) ([]TextSearchResult, error) {
 	results := make([]TextSearchResult, 0, len(rows))
+	summaries, err := s.searchObjectSummaries(ctx, repositoryID, rows)
+	if err != nil {
+		return nil, err
+	}
 	for _, row := range rows {
-		result, err := s.buildSearchResult(ctx, repositoryID, row.TargetType, row.TargetKey, row.Score)
+		result := TextSearchResult{
+			TargetType: row.TargetType,
+			TargetKey:  row.TargetKey,
+			Score:      row.Score,
+		}
+		if row.TargetType == "group" {
+			result, err = s.populateGroupSearchResult(ctx, repositoryID, row.TargetKey, result)
+		} else {
+			result, err = s.populateObjectSearchResultWithSummaries(ctx, repositoryID, row.TargetType, row.TargetKey, result, summaries)
+		}
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+func (s *Service) searchObjectSummaries(ctx context.Context, repositoryID int64, rows []scoredSearchTarget) (map[string]GroupMemberObjectSummary, error) {
+	refs := make([]ghreplica.ObjectRef, 0, len(rows))
+	for _, row := range rows {
+		if row.TargetType != "pull_request" && row.TargetType != "issue" {
+			continue
+		}
+		number, ok := objectNumberFromTargetKey(row.TargetKey)
+		if !ok {
+			continue
+		}
+		refs = append(refs, ghreplica.ObjectRef{Type: row.TargetType, Number: number})
+	}
+	if len(refs) == 0 {
+		return map[string]GroupMemberObjectSummary{}, nil
+	}
+	return s.mirrorObjectSummaries(ctx, repositoryID, refs)
 }
 
 func (s *Service) populateObjectSearchResult(ctx context.Context, repositoryID int64, targetType, targetKey string, result TextSearchResult) (TextSearchResult, error) {
@@ -525,6 +556,22 @@ func (s *Service) populateObjectSearchResult(ctx context.Context, repositoryID i
 	summaries, err := s.mirrorObjectSummaries(ctx, repositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: number}})
 	if err != nil {
 		return TextSearchResult{}, err
+	}
+	if summary, ok := summaries[targetKey]; ok {
+		result.ObjectSummary = &summary
+	}
+	annotations, err := s.getAnnotationsForTarget(ctx, targetType, repositoryID, number, nil)
+	if err != nil {
+		return TextSearchResult{}, err
+	}
+	result.Annotations = annotations
+	return result, nil
+}
+
+func (s *Service) populateObjectSearchResultWithSummaries(ctx context.Context, repositoryID int64, targetType, targetKey string, result TextSearchResult, summaries map[string]GroupMemberObjectSummary) (TextSearchResult, error) {
+	number, ok := objectNumberFromTargetKey(targetKey)
+	if !ok {
+		return result, nil
 	}
 	if summary, ok := summaries[targetKey]; ok {
 		result.ObjectSummary = &summary
