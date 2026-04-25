@@ -150,6 +150,34 @@ func TestFilterTargetsUsesMatchingScopeAndSupportsMultiEnum(t *testing.T) {
 	require.Equal(t, 22, labelResults[0].ObjectNumber)
 }
 
+func TestReadRepositoryProjectionResolvesRenamedRepositoryByGitHubID(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestServiceWithBatchOptions(t, batchBehavior{
+		repositoryAliases: map[string]ghreplica.Repository{
+			"renamed/widgets-renamed": testRepository("renamed", "widgets-renamed", 101),
+		},
+	})
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:        "intent",
+		ObjectScope: "pull_request",
+		FieldType:   "text",
+	}, "")
+	require.NoError(t, err)
+
+	fields, err := service.ListFieldDefinitions(ctx, "renamed", "widgets-renamed")
+	require.NoError(t, err)
+	require.Len(t, fields, 1)
+	require.Equal(t, "intent", fields[0].Name)
+
+	var stored database.RepositoryProjection
+	require.NoError(t, db.WithContext(ctx).Where("github_repository_id = ?", int64(101)).First(&stored).Error)
+	require.Equal(t, "acme", stored.Owner)
+	require.Equal(t, "widgets", stored.Name)
+}
+
 func TestSetAnnotationsRejectsFractionalInteger(t *testing.T) {
 	ctx := context.Background()
 	service, _, server := newTestService(t)
@@ -1271,31 +1299,42 @@ func newTestServiceWithBatchOptions(t *testing.T, behavior batchBehavior) (*Serv
 }
 
 type batchBehavior struct {
-	fail        bool
-	delay       time.Duration
-	objectDelay time.Duration
-	calls       *atomic.Int32
+	fail              bool
+	delay             time.Duration
+	objectDelay       time.Duration
+	calls             *atomic.Int32
+	repositoryAliases map[string]ghreplica.Repository
 }
 
 type testMirrorClient struct {
 	behavior batchBehavior
 }
 
-func (c testMirrorClient) GetRepository(context.Context, string, string) (ghreplica.Repository, error) {
+func (c testMirrorClient) GetRepository(_ context.Context, owner, repo string) (ghreplica.Repository, error) {
 	if c.behavior.fail {
 		return ghreplica.Repository{}, errors.New("mirror unavailable")
 	}
+	if repository, ok := c.behavior.repositoryAliases[owner+"/"+repo]; ok {
+		return repository, nil
+	}
+	if owner != "acme" || repo != "widgets" {
+		return ghreplica.Repository{}, gorm.ErrRecordNotFound
+	}
+	return testRepository(owner, repo, 101), nil
+}
+
+func testRepository(owner, repo string, id int64) ghreplica.Repository {
 	return ghreplica.Repository{
-		ID:         101,
-		Name:       "widgets",
-		FullName:   "acme/widgets",
-		HTMLURL:    "https://github.com/acme/widgets",
+		ID:         id,
+		Name:       repo,
+		FullName:   owner + "/" + repo,
+		HTMLURL:    "https://github.com/" + owner + "/" + repo,
 		Visibility: "public",
 		Private:    false,
 		Owner: struct {
 			Login string `json:"login"`
-		}{Login: "acme"},
-	}, nil
+		}{Login: owner},
+	}
 }
 
 func (c testMirrorClient) GetIssue(context.Context, string, string, int) (ghreplica.Issue, error) {

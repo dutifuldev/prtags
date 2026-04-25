@@ -182,16 +182,7 @@ func (s *Service) EnsureRepository(ctx context.Context, owner, repo string) (dat
 		return database.RepositoryProjection{}, err
 	}
 
-	model := database.RepositoryProjection{
-		GitHubRepositoryID: repository.ID,
-		Owner:              repository.Owner.Login,
-		Name:               repository.Name,
-		FullName:           repository.FullName,
-		HTMLURL:            repository.HTMLURL,
-		Visibility:         repository.Visibility,
-		Private:            repository.Private,
-		FetchedAt:          time.Now().UTC(),
-	}
+	model := repositoryProjectionFromMirror(repository, time.Now().UTC())
 
 	if err := s.db.WithContext(ctx).Where("github_repository_id = ?", repository.ID).Assign(model).FirstOrCreate(&model).Error; err != nil {
 		return database.RepositoryProjection{}, err
@@ -204,7 +195,34 @@ func (s *Service) readRepositoryProjection(ctx context.Context, owner, repo stri
 	defer timer.Done()
 
 	repository, err := s.lookupRepositoryProjection(ctx, owner, repo)
-	return repository, translateDBError(err)
+	if err == nil {
+		return repository, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return database.RepositoryProjection{}, err
+	}
+
+	mirrorRepository, mirrorErr := s.ghreplica.GetRepository(ctx, owner, repo)
+	if mirrorErr != nil {
+		return database.RepositoryProjection{}, ErrNotFound
+	}
+	if _, err := s.lookupRepositoryProjectionByGitHubID(ctx, mirrorRepository.ID); err != nil {
+		return database.RepositoryProjection{}, translateDBError(err)
+	}
+	return repositoryProjectionFromMirror(mirrorRepository, time.Now().UTC()), nil
+}
+
+func repositoryProjectionFromMirror(repository ghreplica.Repository, fetchedAt time.Time) database.RepositoryProjection {
+	return database.RepositoryProjection{
+		GitHubRepositoryID: repository.ID,
+		Owner:              repository.Owner.Login,
+		Name:               repository.Name,
+		FullName:           repository.FullName,
+		HTMLURL:            repository.HTMLURL,
+		Visibility:         repository.Visibility,
+		Private:            repository.Private,
+		FetchedAt:          fetchedAt,
+	}
 }
 
 func (s *Service) requireWrite(ctx context.Context, actor permissions.Actor, repo database.RepositoryProjection) error {
@@ -1122,6 +1140,14 @@ func (s *Service) lookupRepositoryProjection(ctx context.Context, owner, repo st
 	var repository database.RepositoryProjection
 	err := s.db.WithContext(ctx).
 		Where("owner = ? AND name = ?", strings.TrimSpace(owner), strings.TrimSpace(repo)).
+		First(&repository).Error
+	return repository, err
+}
+
+func (s *Service) lookupRepositoryProjectionByGitHubID(ctx context.Context, githubRepositoryID int64) (database.RepositoryProjection, error) {
+	var repository database.RepositoryProjection
+	err := s.db.WithContext(ctx).
+		Where("github_repository_id = ?", githubRepositoryID).
 		First(&repository).Error
 	return repository, err
 }
