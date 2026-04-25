@@ -42,10 +42,10 @@ func Open(databaseURL string) (*gorm.DB, error) {
 
 func OpenWithPool(databaseURL string, pool PoolConfig) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(databaseURL), &gorm.Config{
-		Logger: logger.New(log.New(os.Stdout, "\r\n", log.LstdFlags), logger.Config{
+		Logger: NewQueryMetricsLogger(logger.New(log.New(os.Stdout, "\r\n", log.LstdFlags), logger.Config{
 			LogLevel:                  logger.Warn,
 			IgnoreRecordNotFoundError: true,
-		}),
+		})),
 	})
 	if err != nil {
 		return nil, err

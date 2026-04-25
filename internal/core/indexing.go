@@ -511,6 +511,10 @@ func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, 
 	if err != nil {
 		return nil, err
 	}
+	annotations, err := s.getAnnotationsForTargetKeys(ctx, repositoryID, annotationTargetsForSearchRows(rows))
+	if err != nil {
+		return nil, err
+	}
 	for _, row := range rows {
 		result := TextSearchResult{
 			TargetType: row.TargetType,
@@ -518,9 +522,9 @@ func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, 
 			Score:      row.Score,
 		}
 		if row.TargetType == "group" {
-			result, err = s.populateGroupSearchResult(ctx, repositoryID, row.TargetKey, result)
+			result, err = s.populateGroupSearchResultWithAnnotations(ctx, row.TargetKey, result, annotations)
 		} else {
-			result, err = s.populateObjectSearchResultWithSummaries(ctx, repositoryID, row.TargetType, row.TargetKey, result, summaries)
+			result, err = s.populateObjectSearchResultWithHydration(row.TargetType, row.TargetKey, result, summaries, annotations)
 		}
 		if err != nil {
 			return nil, err
@@ -568,19 +572,14 @@ func (s *Service) populateObjectSearchResult(ctx context.Context, repositoryID i
 	return result, nil
 }
 
-func (s *Service) populateObjectSearchResultWithSummaries(ctx context.Context, repositoryID int64, targetType, targetKey string, result TextSearchResult, summaries map[string]GroupMemberObjectSummary) (TextSearchResult, error) {
-	number, ok := objectNumberFromTargetKey(targetKey)
-	if !ok {
+func (s *Service) populateObjectSearchResultWithHydration(targetType, targetKey string, result TextSearchResult, summaries map[string]GroupMemberObjectSummary, annotations map[string]map[string]any) (TextSearchResult, error) {
+	if _, ok := objectNumberFromTargetKey(targetKey); !ok {
 		return result, nil
 	}
 	if summary, ok := summaries[targetKey]; ok {
 		result.ObjectSummary = &summary
 	}
-	annotations, err := s.getAnnotationsForTarget(ctx, targetType, repositoryID, number, nil)
-	if err != nil {
-		return TextSearchResult{}, err
-	}
-	result.Annotations = annotations
+	result.Annotations = annotations[annotationMapKey(targetType, targetKey)]
 	return result, nil
 }
 
@@ -599,6 +598,20 @@ func (s *Service) populateGroupSearchResult(ctx context.Context, repositoryID in
 	}
 	result.ID = group.PublicID
 	result.Annotations = annotations
+	return result, nil
+}
+
+func (s *Service) populateGroupSearchResultWithAnnotations(ctx context.Context, targetKey string, result TextSearchResult, annotations map[string]map[string]any) (TextSearchResult, error) {
+	groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
+	if !ok {
+		return result, nil
+	}
+	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
+	if err != nil {
+		return TextSearchResult{}, translateDBError(err)
+	}
+	result.ID = group.PublicID
+	result.Annotations = annotations[annotationMapKey("group", groupTargetKey(group.PublicID))]
 	return result, nil
 }
 

@@ -1377,67 +1377,129 @@ func applyFieldValueFilter(query *gorm.DB, fieldType, filterValue string) (*gorm
 }
 
 func (s *Service) buildFilteredTargets(ctx context.Context, repositoryID int64, fieldType, filterValue string, values []database.FieldValue) ([]TargetFilterResult, error) {
-	results := make([]TargetFilterResult, 0, len(values))
-	for _, value := range values {
-		result, ok, err := s.filteredTargetResult(ctx, repositoryID, fieldType, filterValue, value)
+	matchedValues, err := matchingFieldValues(fieldType, filterValue, values)
+	if err != nil {
+		return nil, err
+	}
+	summaries, err := s.filteredTargetSummaries(ctx, repositoryID, matchedValues)
+	if err != nil {
+		return nil, err
+	}
+	annotations, err := s.getAnnotationsForTargetKeys(ctx, repositoryID, annotationTargetsForFieldValues(matchedValues))
+	if err != nil {
+		return nil, err
+	}
+	groups, err := s.groupsByID(ctx, groupIDsForFieldValues(matchedValues))
+	if err != nil {
+		return nil, err
+	}
+
+	results := make([]TargetFilterResult, 0, len(matchedValues))
+	for _, value := range matchedValues {
+		result, err := filteredTargetResultFromHydration(value, summaries, annotations, groups)
 		if err != nil {
 			return nil, err
 		}
-		if ok {
-			results = append(results, result)
-		}
+		results = append(results, result)
 	}
 	return results, nil
 }
 
 func (s *Service) filteredTargetResult(ctx context.Context, repositoryID int64, fieldType, filterValue string, value database.FieldValue) (TargetFilterResult, bool, error) {
-	if fieldType == "multi_enum" {
+	results, err := s.buildFilteredTargets(ctx, repositoryID, fieldType, filterValue, []database.FieldValue{value})
+	if err != nil {
+		return TargetFilterResult{}, false, err
+	}
+	if len(results) == 0 {
+		return TargetFilterResult{}, false, nil
+	}
+	return results[0], true, nil
+}
+
+func matchingFieldValues(fieldType, filterValue string, values []database.FieldValue) ([]database.FieldValue, error) {
+	if fieldType != "multi_enum" {
+		return values, nil
+	}
+	matched := make([]database.FieldValue, 0, len(values))
+	for _, value := range values {
 		matches, err := multiEnumContains(value.MultiEnumJSON, filterValue)
-		if err != nil || !matches {
-			return TargetFilterResult{}, false, err
+		if err != nil {
+			return nil, err
+		}
+		if matches {
+			matched = append(matched, value)
 		}
 	}
-	annotations, err := s.getAnnotationsForTarget(ctx, value.TargetType, repositoryID, intValueOrZero(value.ObjectNumber), value.GroupID)
-	if err != nil {
-		return TargetFilterResult{}, false, err
+	return matched, nil
+}
+
+func (s *Service) filteredTargetSummaries(ctx context.Context, repositoryID int64, values []database.FieldValue) (map[string]GroupMemberObjectSummary, error) {
+	refs := make([]ghreplica.ObjectRef, 0, len(values))
+	for _, value := range values {
+		if value.TargetType == "group" || value.ObjectNumber == nil {
+			continue
+		}
+		refs = append(refs, ghreplica.ObjectRef{Type: value.TargetType, Number: *value.ObjectNumber})
 	}
-	summary, err := s.filteredTargetSummary(ctx, repositoryID, value)
-	if err != nil {
-		return TargetFilterResult{}, false, err
+	if len(refs) == 0 {
+		return map[string]GroupMemberObjectSummary{}, nil
 	}
+	return s.mirrorObjectSummaries(ctx, repositoryID, refs)
+}
+
+func groupIDsForFieldValues(values []database.FieldValue) []uint {
+	ids := make([]uint, 0, len(values))
+	seen := map[uint]struct{}{}
+	for _, value := range values {
+		if value.TargetType != "group" || value.GroupID == nil {
+			continue
+		}
+		id := *value.GroupID
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *Service) groupsByID(ctx context.Context, ids []uint) (map[uint]database.Group, error) {
+	if len(ids) == 0 {
+		return map[uint]database.Group{}, nil
+	}
+	var groups []database.Group
+	if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&groups).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[uint]database.Group, len(groups))
+	for _, group := range groups {
+		byID[group.ID] = group
+	}
+	return byID, nil
+}
+
+func filteredTargetResultFromHydration(value database.FieldValue, summaries map[string]GroupMemberObjectSummary, annotations map[string]map[string]any, groups map[uint]database.Group) (TargetFilterResult, error) {
 	result := TargetFilterResult{
-		TargetType:    value.TargetType,
-		ObjectNumber:  intValueOrZero(value.ObjectNumber),
-		TargetKey:     value.TargetKey,
-		ObjectSummary: summary,
-		Annotations:   annotations,
+		TargetType:   value.TargetType,
+		ObjectNumber: intValueOrZero(value.ObjectNumber),
+		TargetKey:    value.TargetKey,
+		Annotations:  annotations[annotationMapKey(value.TargetType, value.TargetKey)],
+	}
+	if result.Annotations == nil {
+		result.Annotations = map[string]any{}
+	}
+	if summary, ok := summaries[value.TargetKey]; ok {
+		result.ObjectSummary = &summary
 	}
 	if value.TargetType == "group" && value.GroupID != nil {
-		group, err := s.lookupGroupByID(ctx, *value.GroupID)
-		if err != nil {
-			return TargetFilterResult{}, false, translateDBError(err)
+		group, ok := groups[*value.GroupID]
+		if !ok {
+			return TargetFilterResult{}, ErrNotFound
 		}
 		result.ID = group.PublicID
 	}
-	return result, true, nil
-}
-
-func (s *Service) filteredTargetSummary(ctx context.Context, repositoryID int64, value database.FieldValue) (*GroupMemberObjectSummary, error) {
-	if value.TargetType == "group" || value.ObjectNumber == nil {
-		return nil, nil
-	}
-	summaries, err := s.mirrorObjectSummaries(ctx, repositoryID, []ghreplica.ObjectRef{{
-		Type:   value.TargetType,
-		Number: *value.ObjectNumber,
-	}})
-	if err != nil {
-		return nil, err
-	}
-	summary, ok := summaries[objectTargetKey(repositoryID, value.TargetType, *value.ObjectNumber)]
-	if !ok {
-		return nil, nil
-	}
-	return &summary, nil
+	return result, nil
 }
 
 func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string, repositoryID int64, objectNumber int, groupID *uint) (map[string]any, error) {
@@ -1463,6 +1525,79 @@ func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string
 		annotations[value.FieldDefinition.Name] = fieldValueToAPI(value)
 	}
 	return annotations, nil
+}
+
+type annotationTarget struct {
+	targetType string
+	targetKey  string
+}
+
+func annotationTargetsForSearchRows(rows []scoredSearchTarget) []annotationTarget {
+	targets := make([]annotationTarget, 0, len(rows))
+	for _, row := range rows {
+		if row.TargetKey == "" {
+			continue
+		}
+		targets = append(targets, annotationTarget{targetType: row.TargetType, targetKey: row.TargetKey})
+	}
+	return targets
+}
+
+func annotationTargetsForFieldValues(values []database.FieldValue) []annotationTarget {
+	targets := make([]annotationTarget, 0, len(values))
+	for _, value := range values {
+		if value.TargetKey == "" {
+			continue
+		}
+		targets = append(targets, annotationTarget{targetType: value.TargetType, targetKey: value.TargetKey})
+	}
+	return targets
+}
+
+func (s *Service) getAnnotationsForTargetKeys(ctx context.Context, repositoryID int64, targets []annotationTarget) (map[string]map[string]any, error) {
+	result := make(map[string]map[string]any, len(targets))
+	targetKeys := make([]string, 0, len(targets))
+	wanted := map[string]struct{}{}
+	seenKeys := map[string]struct{}{}
+	for _, target := range targets {
+		if target.targetType == "" || target.targetKey == "" {
+			continue
+		}
+		mapKey := annotationMapKey(target.targetType, target.targetKey)
+		result[mapKey] = map[string]any{}
+		wanted[mapKey] = struct{}{}
+		if _, ok := seenKeys[target.targetKey]; ok {
+			continue
+		}
+		seenKeys[target.targetKey] = struct{}{}
+		targetKeys = append(targetKeys, target.targetKey)
+	}
+	if len(targetKeys) == 0 {
+		return result, nil
+	}
+
+	var values []database.FieldValue
+	if err := s.db.WithContext(ctx).Preload("FieldDefinition").
+		Where("github_repository_id = ? AND target_key IN ?", repositoryID, targetKeys).
+		Order("target_key ASC, field_definition_id ASC").
+		Find(&values).Error; err != nil {
+		return nil, err
+	}
+	for _, value := range values {
+		mapKey := annotationMapKey(value.TargetType, value.TargetKey)
+		if _, ok := wanted[mapKey]; !ok {
+			continue
+		}
+		if result[mapKey] == nil {
+			result[mapKey] = map[string]any{}
+		}
+		result[mapKey][value.FieldDefinition.Name] = fieldValueToAPI(value)
+	}
+	return result, nil
+}
+
+func annotationMapKey(targetType, targetKey string) string {
+	return targetType + "\x00" + targetKey
 }
 
 func (s *Service) resolveTarget(ctx context.Context, repository database.RepositoryProjection, targetType string, objectNumber int, groupID *uint) (targetRef, error) {

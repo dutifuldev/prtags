@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/dutifuldev/prtags/internal/core"
 	"github.com/dutifuldev/prtags/internal/database"
@@ -41,6 +43,8 @@ func (s *Server) Echo() *echo.Echo {
 }
 
 func (s *Server) registerRoutes() {
+	s.echo.Use(s.requestMetricsMiddleware)
+
 	s.echo.GET("/healthz", func(c echo.Context) error {
 		return c.JSON(http.StatusOK, jsend.Success(map[string]any{"status": "ok"}))
 	})
@@ -74,6 +78,53 @@ func (s *Server) registerRoutes() {
 
 	s.echo.POST("/v1/repos/:owner/:repo/search/text", s.handleSearchText)
 	s.echo.POST("/v1/repos/:owner/:repo/search/similar", s.handleSearchSimilar)
+}
+
+func (s *Server) requestMetricsMiddleware(next echo.HandlerFunc) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		start := time.Now()
+		metrics := database.NewQueryMetrics()
+		request := c.Request()
+		c.SetRequest(request.WithContext(database.WithQueryMetrics(request.Context(), metrics)))
+
+		err := next(c)
+		if shouldLogRequestMetrics(c) {
+			snapshot := metrics.Snapshot()
+			slog.Info("http request",
+				"method", request.Method,
+				"route", requestMetricRoute(c, request),
+				"status", responseStatus(c),
+				"duration_ms", durationMillis(time.Since(start)),
+				"db_query_count", snapshot.QueryCount,
+				"db_duration_ms", durationMillis(snapshot.QueryDuration),
+				"db_slowest_ms", durationMillis(snapshot.SlowestQuery),
+			)
+		}
+		return err
+	}
+}
+
+func shouldLogRequestMetrics(c echo.Context) bool {
+	path := c.Request().URL.Path
+	return path != "/healthz" && path != "/readyz"
+}
+
+func requestMetricRoute(c echo.Context, request *http.Request) string {
+	if route := c.Path(); route != "" {
+		return route
+	}
+	return request.URL.Path
+}
+
+func responseStatus(c echo.Context) int {
+	if c.Response().Status != 0 {
+		return c.Response().Status
+	}
+	return http.StatusOK
+}
+
+func durationMillis(duration time.Duration) float64 {
+	return float64(duration.Microseconds()) / 1000
 }
 
 func (s *Server) handleCreateField(c echo.Context) error {

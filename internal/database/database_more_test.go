@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -80,4 +81,27 @@ func TestDatabaseOpenHelpersAndConflicts(t *testing.T) {
 	require.Equal(t, 2, pool.MaxIdleConns)
 	require.False(t, isPublicIDConflict(nil))
 	require.True(t, isPublicIDConflict(gorm.ErrDuplicatedKey))
+}
+
+func TestQueryMetricsRecordContextAndLogger(t *testing.T) {
+	metrics := NewQueryMetrics()
+	metrics.Record(2 * time.Millisecond)
+	metrics.Record(5 * time.Millisecond)
+
+	snapshot := metrics.Snapshot()
+	require.Equal(t, 2, snapshot.QueryCount)
+	require.Equal(t, 7*time.Millisecond, snapshot.QueryDuration)
+	require.Equal(t, 5*time.Millisecond, snapshot.SlowestQuery)
+
+	ctx := WithQueryMetrics(context.Background(), metrics)
+	fromContext, ok := QueryMetricsFromContext(ctx)
+	require.True(t, ok)
+	require.Same(t, metrics, fromContext)
+
+	wrapped := NewQueryMetricsLogger(logger.Default.LogMode(logger.Silent))
+	wrapped.Trace(ctx, time.Now().Add(-time.Millisecond), func() (string, int64) {
+		return "SELECT 1", 1
+	}, nil)
+
+	require.Equal(t, 3, metrics.Snapshot().QueryCount)
 }

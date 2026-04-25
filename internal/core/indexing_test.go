@@ -95,6 +95,27 @@ func TestResolveSearchResultsBatchesMirrorSummaries(t *testing.T) {
 	})
 	defer server.Close()
 
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	_, err := service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "intent",
+		ObjectScope:  "pull_request",
+		FieldType:    "text",
+		IsSearchable: true,
+	}, "")
+	require.NoError(t, err)
+	_, err = service.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
+		Name:         "theme",
+		ObjectScope:  "issue",
+		FieldType:    "text",
+		IsSearchable: true,
+	}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "pull_request", 22, nil, map[string]any{"intent": "retry auth safely"}, "")
+	require.NoError(t, err)
+	_, err = service.SetAnnotations(ctx, actor, "acme", "widgets", "issue", 11, nil, map[string]any{"theme": "auth flakes"}, "")
+	require.NoError(t, err)
+	batchCalls.Store(0)
+
 	results, err := service.resolveSearchResults(ctx, 101, []scoredSearchTarget{
 		{TargetType: "pull_request", TargetKey: objectTargetKey(101, "pull_request", 22), Score: 0.75},
 		{TargetType: "issue", TargetKey: objectTargetKey(101, "issue", 11), Score: 0.5},
@@ -104,6 +125,8 @@ func TestResolveSearchResultsBatchesMirrorSummaries(t *testing.T) {
 	require.Equal(t, int32(1), batchCalls.Load())
 	require.Equal(t, "Retry ACP turns safely", results[0].ObjectSummary.Title)
 	require.Equal(t, "Auth retries are flaky", results[1].ObjectSummary.Title)
+	require.Equal(t, "retry auth safely", results[0].Annotations["intent"])
+	require.Equal(t, "auth flakes", results[1].Annotations["theme"])
 }
 
 func TestBuildSearchResultLoadsGroupAnnotations(t *testing.T) {
