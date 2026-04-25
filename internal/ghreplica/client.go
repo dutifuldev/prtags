@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/dutifuldev/ghreplica/mirror"
 )
 
 type Client struct {
@@ -15,61 +17,12 @@ type Client struct {
 	httpClient *http.Client
 }
 
-type Repository struct {
-	ID         int64  `json:"id"`
-	Name       string `json:"name"`
-	FullName   string `json:"full_name"`
-	HTMLURL    string `json:"html_url"`
-	Visibility string `json:"visibility"`
-	Private    bool   `json:"private"`
-	Owner      struct {
-		Login string `json:"login"`
-	} `json:"owner"`
-}
-
-type Issue struct {
-	ID        int64     `json:"id"`
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	State     string    `json:"state"`
-	HTMLURL   string    `json:"html_url"`
-	UpdatedAt time.Time `json:"updated_at"`
-	User      struct {
-		Login string `json:"login"`
-	} `json:"user"`
-}
-
-type PullRequest struct {
-	ID        int64     `json:"id"`
-	Number    int       `json:"number"`
-	Title     string    `json:"title"`
-	State     string    `json:"state"`
-	HTMLURL   string    `json:"html_url"`
-	UpdatedAt time.Time `json:"updated_at"`
-	User      struct {
-		Login string `json:"login"`
-	} `json:"user"`
-}
-
-type BatchObjectRef struct {
-	Type   string `json:"type"`
-	Number int    `json:"number"`
-}
-
-type BatchObjectSummary struct {
-	Title       string
-	State       string
-	HTMLURL     string
-	AuthorLogin string
-	UpdatedAt   time.Time
-}
-
-type BatchObjectResult struct {
-	Type    string
-	Number  int
-	Found   bool
-	Summary *BatchObjectSummary
-}
+type Repository = mirror.RepositoryObject
+type Issue = mirror.IssueObject
+type PullRequest = mirror.PullRequestObject
+type BatchObjectRef = mirror.ObjectRef
+type BatchObjectSummary = mirror.ObjectSummary
+type BatchObjectResult = mirror.ObjectResult
 
 func NewClient(baseURL string) *Client {
 	return &Client{
@@ -186,7 +139,7 @@ func (c *Client) requestJSON(ctx context.Context, method, path string, body any,
 
 func decodeBatchObjectSummary(objectType string, raw json.RawMessage) (*BatchObjectSummary, error) {
 	switch objectType {
-	case "issue":
+	case mirror.ObjectTypeIssue:
 		var issue Issue
 		if err := json.Unmarshal(raw, &issue); err != nil {
 			return nil, err
@@ -198,7 +151,7 @@ func decodeBatchObjectSummary(objectType string, raw json.RawMessage) (*BatchObj
 			AuthorLogin: issue.User.Login,
 			UpdatedAt:   issue.UpdatedAt,
 		}, nil
-	case "pull_request":
+	case mirror.ObjectTypePullRequest:
 		var pull PullRequest
 		if err := json.Unmarshal(raw, &pull); err != nil {
 			return nil, err
