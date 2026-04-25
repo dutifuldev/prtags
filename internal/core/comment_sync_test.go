@@ -138,7 +138,7 @@ func TestCommentSyncTriggerAndReconcileCreatesAndUpdatesComments(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	result, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -193,7 +193,7 @@ func TestCommentSyncDeletesCommentsWhenGroupBecomesSingleton(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -227,7 +227,7 @@ func TestCommentSyncReconcileAppliesLatestStateWhenQueuedRevisionIsStale(t *test
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -272,7 +272,7 @@ func TestCommentSyncMarksPermissionDeniedWithoutHammeringGitHub(t *testing.T) {
 		}
 		return false
 	})
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -294,7 +294,7 @@ func TestCommentSyncDeletesDuplicateManagedComments(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -334,7 +334,7 @@ func TestCommentSyncRetryableFailureSucceedsLater(t *testing.T) {
 		}
 		return false
 	})
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -369,7 +369,7 @@ func TestCommentSyncHelperPaths(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, nil)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, nil)
 	require.True(t, syncService.Enabled())
 	syncService.SetDispatcher(dispatcher)
 
@@ -441,7 +441,7 @@ func TestCommentSyncReconcileVerifyRecreatesMissingComment(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -463,7 +463,7 @@ func TestCommentSyncReconcileUpdatesExistingManagedComment(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -487,7 +487,7 @@ func TestCommentSyncReconcileDeletePathRemovesManagedComments(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -511,7 +511,7 @@ func TestCommentSyncDisabledPaths(t *testing.T) {
 	ctx := context.Background()
 	db := openCommentSyncTestDB(t)
 	group := seedCommentSyncGroup(t, db)
-	syncService := NewCommentSyncService(db, nil, nil)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, nil, nil)
 	require.False(t, syncService.Enabled())
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
@@ -529,7 +529,7 @@ func TestCommentSyncReconcileShortCircuitAndCanonicalPaths(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -582,7 +582,7 @@ func TestCommentSyncDeleteAndVerifyErrorBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -607,7 +607,7 @@ func TestCommentSyncDeleteAndVerifyErrorBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -638,7 +638,7 @@ func TestCommentSyncDeleteAndVerifyErrorBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -669,7 +669,7 @@ func TestCommentSyncAdditionalReconcileBranches(t *testing.T) {
 		group := seedCommentSyncGroup(t, db)
 		dispatcher := &commentSyncDispatcherStub{}
 		store, client := newTestGitHubCommentClient(t)
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -696,7 +696,7 @@ func TestCommentSyncAdditionalReconcileBranches(t *testing.T) {
 		group := seedCommentSyncGroup(t, db)
 		dispatcher := &commentSyncDispatcherStub{}
 		_, client := newTestGitHubCommentClient(t)
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -736,7 +736,7 @@ func TestCommentSyncAdditionalReconcileBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -760,7 +760,7 @@ func TestCommentSyncAdditionalReconcileBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -787,7 +787,7 @@ func TestCommentSyncAdditionalReconcileBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -811,7 +811,7 @@ func TestCommentSyncProjectAndRepairBranches(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{reconcileErr: errors.New("queue reconcile failed")}
 	_, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, "missing-group")
 	require.ErrorIs(t, err, ErrNotFound)
@@ -872,7 +872,7 @@ func TestCommentSyncProjectAndRepairBranches(t *testing.T) {
 	}).Error)
 	require.ErrorContains(t, syncService.Repair(ctx, group.ID), "queue reconcile failed")
 
-	disabled := NewCommentSyncService(db, nil, nil)
+	disabled := NewCommentSyncService(db, testMirrorClient{}, nil, nil)
 	require.NoError(t, disabled.Reconcile(ctx, 999, 1, false))
 }
 
@@ -898,7 +898,7 @@ func TestCommentSyncReconcileFailureBranches(t *testing.T) {
 		}
 		return false
 	})
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
@@ -942,9 +942,9 @@ func TestCommentSyncRenderAndDeleteHelperBranches(t *testing.T) {
 		}
 		return false
 	})
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
-	noDispatch := NewCommentSyncService(db, client, nil)
+	noDispatch := NewCommentSyncService(db, testMirrorClient{}, client, nil)
 	affected, err := noDispatch.projectGroupTx(db, group.ID)
 	require.NoError(t, err)
 	require.Zero(t, affected)
@@ -963,7 +963,7 @@ func TestCommentSyncRenderAndDeleteHelperBranches(t *testing.T) {
 	db2 := openNamedCommentSyncTestDB(t, "render-b")
 	group2 := seedCommentSyncGroup(t, db2)
 	store, client2 := newTestGitHubCommentClient(t)
-	syncService2 := NewCommentSyncService(db2, client2, &commentSyncDispatcherStub{})
+	syncService2 := NewCommentSyncService(db2, testMirrorClient{}, client2, &commentSyncDispatcherStub{})
 	require.NoError(t, db2.Create(&database.GroupCommentSyncTarget{
 		GroupID:            group2.ID,
 		GitHubRepositoryID: group2.GitHubRepositoryID,
@@ -989,7 +989,7 @@ func TestCommentSyncRenderAndDeleteHelperBranches(t *testing.T) {
 		}
 		return false
 	})
-	badDeleteSync := NewCommentSyncService(db3, badDeleteClient, &commentSyncDispatcherStub{})
+	badDeleteSync := NewCommentSyncService(db3, testMirrorClient{}, badDeleteClient, &commentSyncDispatcherStub{})
 	require.NoError(t, db3.Create(&database.GroupCommentSyncTarget{
 		GroupID:            group3.ID,
 		GitHubRepositoryID: group3.GitHubRepositoryID,
@@ -1017,7 +1017,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 		db := openCommentSyncTestDB(t)
 		group := seedCommentSyncGroup(t, db)
 		_, client := newTestGitHubCommentClient(t)
-		syncService := NewCommentSyncService(db, client, &commentSyncDispatcherStub{})
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, &commentSyncDispatcherStub{})
 
 		require.Error(t, syncService.Reconcile(ctx, 99999, 1, false))
 
@@ -1040,7 +1040,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 		dispatcher := &commentSyncDispatcherStub{}
 		var store *githubCommentStore
 		_, client := newTestGitHubCommentClient(t)
-		syncService := NewCommentSyncService(db, client, dispatcher)
+		syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 		_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
@@ -1048,7 +1048,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 		var row database.GroupCommentSyncTarget
 		require.NoError(t, db.Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
 
-		require.NoError(t, db.Migrator().DropTable(&database.TargetProjection{}))
+		syncService = NewCommentSyncService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, client, dispatcher)
 		err = syncService.Reconcile(ctx, row.ID, row.DesiredRevision, false)
 		require.Error(t, err)
 		require.NoError(t, db.First(&row, row.ID).Error)
@@ -1057,7 +1057,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 		db = openNamedCommentSyncTestDB(t, "render-b")
 		group = seedCommentSyncGroup(t, db)
 		store, client = newTestGitHubCommentClient(t)
-		syncService = NewCommentSyncService(db, client, dispatcher)
+		syncService = NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 		_, err = syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
 		require.NoError(t, db.Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
@@ -1084,7 +1084,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService = NewCommentSyncService(db, client, dispatcher)
+		syncService = NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 		_, err = syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
 		require.NoError(t, db.Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
@@ -1104,7 +1104,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService = NewCommentSyncService(db, client, dispatcher)
+		syncService = NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 		_, err = syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
 		require.NoError(t, db.Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
@@ -1122,7 +1122,7 @@ func TestCommentSyncMoreReconcileBranches(t *testing.T) {
 			}
 			return false
 		})
-		syncService = NewCommentSyncService(db, client, dispatcher)
+		syncService = NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 		_, err = syncService.TriggerGroupSync(ctx, group.PublicID)
 		require.NoError(t, err)
 		require.NoError(t, db.Where("object_type = ? AND object_number = ?", "issue", 11).First(&row).Error)
@@ -1184,30 +1184,6 @@ func seedCommentSyncGroup(t *testing.T, db *gorm.DB) database.Group {
 		TargetKey:          objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
 		AddedBy:            "tester",
 		AddedAt:            time.Now().UTC(),
-	}).Error)
-	require.NoError(t, db.Create(&database.TargetProjection{
-		GitHubRepositoryID: group.GitHubRepositoryID,
-		RepositoryOwner:    group.RepositoryOwner,
-		RepositoryName:     group.RepositoryName,
-		TargetType:         "issue",
-		ObjectNumber:       11,
-		Title:              "Auth retries are flaky",
-		State:              "open",
-		HTMLURL:            "https://github.com/acme/widgets/issues/11",
-		SourceUpdatedAt:    time.Now().UTC(),
-		FetchedAt:          time.Now().UTC(),
-	}).Error)
-	require.NoError(t, db.Create(&database.TargetProjection{
-		GitHubRepositoryID: group.GitHubRepositoryID,
-		RepositoryOwner:    group.RepositoryOwner,
-		RepositoryName:     group.RepositoryName,
-		TargetType:         "pull_request",
-		ObjectNumber:       22,
-		Title:              "Retry ACP turns safely",
-		State:              "open",
-		HTMLURL:            "https://github.com/acme/widgets/pull/22",
-		SourceUpdatedAt:    time.Now().UTC(),
-		FetchedAt:          time.Now().UTC(),
 	}).Error)
 	return group
 }

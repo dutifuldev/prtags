@@ -15,6 +15,7 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/dutifuldev/prtags/internal/auth"
 	"github.com/dutifuldev/prtags/internal/config"
+	"github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/jsend"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -149,14 +150,15 @@ func TestAuthAndRuntimeHelpers(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	require.Nil(t, buildCommentSyncService(db, config.Config{}))
+	mirror := ghreplica.NewSchemaClient(db, "public")
+	require.Nil(t, buildCommentSyncService(db, config.Config{}, mirror))
 	require.NotNil(t, buildCommentSyncService(db, config.Config{
 		GitHubBaseURL:           viewerServer.URL,
 		GitHubAppID:             "1",
 		GitHubInstallationID:    "2",
 		GitHubAppPrivateKeyPEM:  "pem",
 		GitHubAppPrivateKeyPath: "",
-	}))
+	}, mirror))
 
 	dispatcher, err := newRiverDispatcherForDB(db, nil, nil)
 	require.NoError(t, err)

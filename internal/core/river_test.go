@@ -19,19 +19,12 @@ import (
 )
 
 type jobDispatcherStub struct {
-	refreshCalls   []targetRef
 	rebuildCalls   []targetRef
 	projectEventID []uint
 	reconcileCalls []commentSyncDispatchCall
-	refreshErr     error
 	rebuildErr     error
 	projectErr     error
 	reconcileErr   error
-}
-
-func (d *jobDispatcherStub) EnqueueTargetProjectionRefreshTx(_ *gorm.DB, _ database.Group, target targetRef) error {
-	d.refreshCalls = append(d.refreshCalls, target)
-	return d.refreshErr
 }
 
 func (d *jobDispatcherStub) EnqueueRebuildsTx(_ *gorm.DB, _ database.RepositoryProjection, target targetRef, _ time.Time) error {
@@ -58,7 +51,6 @@ func (d *jobDispatcherStub) Start(context.Context) error                        
 func (d *jobDispatcherStub) Stop(context.Context) error                            { return nil }
 
 func TestRiverArgsKindsAndHelpers(t *testing.T) {
-	require.Equal(t, indexJobKindTargetProjectionRefresh, TargetProjectionRefreshArgs{}.Kind())
 	require.Equal(t, "search_document_rebuild", SearchDocumentRebuildArgs{}.Kind())
 	require.Equal(t, "embedding_rebuild", EmbeddingRebuildArgs{}.Kind())
 	require.Equal(t, "group_comment_sync_project", GroupCommentProjectArgs{}.Kind())
@@ -97,15 +89,6 @@ func TestRiverWorkersAndSQLHelpers(t *testing.T) {
 	require.NoError(t, err)
 	drainIndexJobs(t, ctx, db, service.indexer)
 
-	refreshWorker := &targetProjectionRefreshWorker{indexer: service.indexer}
-	require.NoError(t, refreshWorker.Work(ctx, &river.Job[TargetProjectionRefreshArgs]{Args: TargetProjectionRefreshArgs{
-		RepositoryID: group.GitHubRepositoryID,
-		Owner:        group.RepositoryOwner,
-		Name:         group.RepositoryName,
-		TargetType:   "pull_request",
-		TargetKey:    objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
-	}}))
-
 	searchWorker := &searchDocumentRebuildWorker{indexer: service.indexer}
 	require.NoError(t, searchWorker.Work(ctx, &river.Job[SearchDocumentRebuildArgs]{Args: SearchDocumentRebuildArgs{
 		RepositoryID: group.GitHubRepositoryID,
@@ -131,7 +114,7 @@ func TestGroupCommentRiverWorkers(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	store, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
 	event := eventForGroup(group.ID)
 	require.NoError(t, db.Create(&event).Error)
@@ -163,7 +146,7 @@ func TestGroupCommentReconcileWorkerSnoozesRetryAfter(t *testing.T) {
 		}
 		return false
 	})
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 	_, err := syncService.TriggerGroupSync(ctx, group.PublicID)
 	require.NoError(t, err)
 
@@ -217,7 +200,7 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	store, client := newTestGitHubCommentClient(t)
 	_ = store
-	commentSync := NewCommentSyncService(db, client, &commentSyncDispatcherStub{})
+	commentSync := NewCommentSyncService(db, testMirrorClient{}, client, &commentSyncDispatcherStub{})
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 
@@ -233,15 +216,13 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 		TargetKey:    objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
 		ObjectNumber: 22,
 	}
-	require.NoError(t, dispatcher.EnqueueTargetProjectionRefreshTx(nil, group, targetRef{TargetType: "group"}))
-	require.NoError(t, dispatcher.EnqueueTargetProjectionRefreshTx(nil, group, targetRef{TargetType: "issue"}))
 	require.Error(t, dispatcher.EnqueueRebuildsTx(nil, repository, target, time.Now().UTC()))
 	require.Error(t, dispatcher.EnqueueGroupCommentProjectTx(nil, 77))
 	require.Error(t, dispatcher.EnqueueGroupCommentReconcileTx(nil, 88, 2, time.Now().UTC(), true))
 
 	var legacy database.IndexJob
 	require.NoError(t, db.Create(&database.IndexJob{
-		Kind:               indexJobKindTargetProjectionRefresh,
+		Kind:               "target_projection_refresh",
 		Status:             "pending",
 		GitHubRepositoryID: group.GitHubRepositoryID,
 		RepositoryOwner:    group.RepositoryOwner,
@@ -250,7 +231,9 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 		TargetKey:          objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
 	}).Error)
 	require.NoError(t, db.First(&legacy).Error)
-	require.Error(t, dispatcher.ImportLegacyIndexJobs(ctx, db))
+	require.NoError(t, dispatcher.ImportLegacyIndexJobs(ctx, db))
+	require.NoError(t, db.First(&legacy, legacy.ID).Error)
+	require.Equal(t, "succeeded", legacy.Status)
 
 	nilDispatcher, err := NewRiverDispatcher(sqlDB, nil, nil)
 	require.NoError(t, err)
@@ -259,10 +242,6 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 
 	tx := db.Begin()
 	require.NoError(t, tx.Error)
-	err = dispatcher.EnqueueTargetProjectionRefreshTx(tx, group, target)
-	if err != nil {
-		require.NotContains(t, err.Error(), "gorm transaction is missing sql tx")
-	}
 	err = dispatcher.EnqueueRebuildsTx(tx, repository, target, time.Now().UTC())
 	if err != nil {
 		require.NotContains(t, err.Error(), "gorm transaction is missing sql tx")
@@ -279,7 +258,6 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 
 	sqlTx := sqlTxForTest(t, db)
 	for _, legacyJob := range []database.IndexJob{
-		{Kind: indexJobKindTargetProjectionRefresh, GitHubRepositoryID: group.GitHubRepositoryID, RepositoryOwner: group.RepositoryOwner, RepositoryName: group.RepositoryName, TargetType: "pull_request", TargetKey: target.TargetKey},
 		{Kind: "search_document_rebuild", GitHubRepositoryID: group.GitHubRepositoryID, RepositoryOwner: group.RepositoryOwner, RepositoryName: group.RepositoryName, TargetType: "pull_request", TargetKey: target.TargetKey},
 		{Kind: "embedding_rebuild", GitHubRepositoryID: group.GitHubRepositoryID, RepositoryOwner: group.RepositoryOwner, RepositoryName: group.RepositoryName, TargetType: "pull_request", TargetKey: target.TargetKey},
 	} {
@@ -288,6 +266,7 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 			require.NotErrorIs(t, err, errUnsupportedLegacyJobKind)
 		}
 	}
+	require.ErrorIs(t, dispatcher.importLegacyIndexJob(ctx, sqlTx, database.IndexJob{Kind: "target_projection_refresh"}), errUnsupportedLegacyJobKind)
 
 	require.NoError(t, db.Transaction(func(tx *gorm.DB) error {
 		return dispatcher.importLegacyIndexJobsTx(ctx, tx, sqlTxForTest(t, db), []database.IndexJob{{Kind: "unknown"}}, time.Now().UTC())

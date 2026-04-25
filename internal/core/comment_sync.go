@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dutifuldev/prtags/internal/database"
+	"github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/githubapi"
 	"gorm.io/gorm"
 )
@@ -29,6 +30,7 @@ type commentSyncDispatcher interface {
 
 type CommentSyncService struct {
 	db         *gorm.DB
+	mirror     mirrorClient
 	github     *githubapi.Client
 	dispatcher commentSyncDispatcher
 }
@@ -39,9 +41,10 @@ type GroupCommentSyncResult struct {
 	CommentsScheduled int    `json:"comments_scheduled"`
 }
 
-func NewCommentSyncService(db *gorm.DB, githubClient *githubapi.Client, dispatcher commentSyncDispatcher) *CommentSyncService {
+func NewCommentSyncService(db *gorm.DB, mirror mirrorClient, githubClient *githubapi.Client, dispatcher commentSyncDispatcher) *CommentSyncService {
 	return &CommentSyncService{
 		db:         db,
+		mirror:     mirror,
 		github:     githubClient,
 		dispatcher: dispatcher,
 	}
@@ -52,7 +55,7 @@ func (s *CommentSyncService) SetDispatcher(dispatcher commentSyncDispatcher) {
 }
 
 func (s *CommentSyncService) Enabled() bool {
-	return s != nil && s.github != nil && s.github.Enabled()
+	return s != nil && s.mirror != nil && s.github != nil && s.github.Enabled()
 }
 
 func (s *CommentSyncService) TriggerGroupSync(ctx context.Context, groupPublicID string) (GroupCommentSyncResult, error) {
@@ -252,7 +255,7 @@ func (s *CommentSyncService) projectGroupTx(tx *gorm.DB, groupID uint) (int, err
 		return 0, nil
 	}
 
-	group, members, existing, err := s.loadGroupProjectionState(tx, groupID)
+	group, members, existing, err := s.loadGroupCommentState(tx, groupID)
 	if err != nil {
 		return 0, err
 	}
@@ -275,7 +278,7 @@ func (s *CommentSyncService) projectGroupTx(tx *gorm.DB, groupID uint) (int, err
 	return affected + removed, nil
 }
 
-func (s *CommentSyncService) loadGroupProjectionState(tx *gorm.DB, groupID uint) (database.Group, []database.GroupMember, []database.GroupCommentSyncTarget, error) {
+func (s *CommentSyncService) loadGroupCommentState(tx *gorm.DB, groupID uint) (database.Group, []database.GroupMember, []database.GroupCommentSyncTarget, error) {
 	group, err := s.groupByIDTx(tx, groupID)
 	if err != nil {
 		return database.Group{}, nil, nil, err
@@ -490,31 +493,29 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 		return "", "", false, nil
 	}
 
-	objectNumbers := make([]int, 0, len(members))
+	refs := make([]ghreplica.ObjectRef, 0, len(members))
 	for _, member := range members {
-		objectNumbers = append(objectNumbers, member.ObjectNumber)
+		refs = append(refs, ghreplica.ObjectRef{Type: member.ObjectType, Number: member.ObjectNumber})
 	}
 
-	var projections []database.TargetProjection
-	if err := s.db.WithContext(ctx).
-		Where("github_repository_id = ? AND object_number IN ?", group.GitHubRepositoryID, objectNumbers).
-		Find(&projections).Error; err != nil {
+	summaries, err := commentObjectSummaries(ctx, s.mirror, group.GitHubRepositoryID, refs)
+	if err != nil {
 		return "", "", false, err
-	}
-	projectionByKey := make(map[string]database.TargetProjection, len(projections))
-	for _, projection := range projections {
-		projectionByKey[objectTargetKey(group.GitHubRepositoryID, projection.TargetType, projection.ObjectNumber)] = projection
 	}
 
 	lines := commentHeaderLines(group, currentType, currentNumber)
 
 	for _, member := range members {
-		projection, ok := projectionByKey[member.TargetKey]
+		summary, ok := summaries[member.TargetKey]
 		numberLabel := commentNumberLabel(member, currentType, currentNumber)
-		numberCell := fmt.Sprintf("[%s](%s)", numberLabel, issueURL(group.RepositoryOwner, group.RepositoryName, member.ObjectType, member.ObjectNumber, projection.HTMLURL))
+		htmlURL := ""
+		if ok {
+			htmlURL = summary.HTMLURL
+		}
+		numberCell := fmt.Sprintf("[%s](%s)", numberLabel, issueURL(group.RepositoryOwner, group.RepositoryName, member.ObjectType, member.ObjectNumber, htmlURL))
 		title := "Title unavailable"
-		if ok && strings.TrimSpace(projection.Title) != "" {
-			title = projection.Title
+		if ok && strings.TrimSpace(summary.Title) != "" {
+			title = summary.Title
 		}
 		lines = append(lines, fmt.Sprintf("| %s | %s |", numberCell, markdownCell(title)))
 	}
@@ -523,6 +524,21 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 	body := strings.Join(lines, "\n")
 	sum := sha256.Sum256([]byte(body))
 	return body, hex.EncodeToString(sum[:]), true, nil
+}
+
+func commentObjectSummaries(ctx context.Context, mirror mirrorClient, repositoryID int64, refs []ghreplica.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
+	results, err := mirror.BatchGetObjects(ctx, repositoryID, refs)
+	if err != nil {
+		return nil, err
+	}
+	summaries := make(map[string]GroupMemberObjectSummary, len(results))
+	for _, result := range results {
+		if !result.Found || result.Summary == nil {
+			continue
+		}
+		summaries[objectTargetKey(repositoryID, result.Type, result.Number)] = objectSummaryFromMirror(*result.Summary)
+	}
+	return summaries, nil
 }
 
 func (s *CommentSyncService) commentMembers(ctx context.Context, group database.Group) ([]database.GroupMember, error) {

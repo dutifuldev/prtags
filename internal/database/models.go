@@ -35,23 +35,6 @@ type RepositoryAccessGrant struct {
 	UpdatedAt             time.Time `json:"updated_at"`
 }
 
-type TargetProjection struct {
-	ID                 uint      `gorm:"primaryKey" json:"id"`
-	GitHubRepositoryID int64     `gorm:"column:github_repository_id;index;uniqueIndex:idx_target_projections_repo_type_number,priority:1" json:"github_repository_id"`
-	RepositoryOwner    string    `json:"repository_owner"`
-	RepositoryName     string    `json:"repository_name"`
-	TargetType         string    `gorm:"uniqueIndex:idx_target_projections_repo_type_number,priority:2" json:"target_type"`
-	ObjectNumber       int       `gorm:"uniqueIndex:idx_target_projections_repo_type_number,priority:3" json:"object_number"`
-	Title              string    `json:"title"`
-	State              string    `json:"state"`
-	AuthorLogin        string    `json:"author_login"`
-	HTMLURL            string    `json:"html_url"`
-	SourceUpdatedAt    time.Time `json:"source_updated_at"`
-	FetchedAt          time.Time `json:"fetched_at"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
-}
-
 type Group struct {
 	ID                 uint       `gorm:"primaryKey" json:"-"`
 	PublicID           string     `gorm:"column:public_id;uniqueIndex" json:"id"`

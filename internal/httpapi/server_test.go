@@ -75,6 +75,34 @@ func (c stubMirrorClient) GetPullRequest(context.Context, string, string, int) (
 	}, nil
 }
 
+func (c stubMirrorClient) BatchGetObjects(_ context.Context, _ int64, objects []ghreplica.ObjectRef) ([]ghreplica.ObjectResult, error) {
+	if c.fail {
+		return nil, fmt.Errorf("mirror unavailable")
+	}
+	results := make([]ghreplica.ObjectResult, 0, len(objects))
+	for _, object := range objects {
+		result := ghreplica.ObjectResult{Type: object.Type, Number: object.Number}
+		summary := ghreplica.ObjectSummary{
+			Title:       fmt.Sprintf("%s %d", strings.ReplaceAll(object.Type, "_", " "), object.Number),
+			State:       "open",
+			AuthorLogin: "alice",
+			UpdatedAt:   time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+		}
+		if object.Type == "pull_request" {
+			summary.Title = "Retry ACP turns safely"
+			summary.AuthorLogin = "bob"
+			summary.HTMLURL = fmt.Sprintf("https://github.com/acme/widgets/pull/%d", object.Number)
+		} else {
+			summary.Title = "Auth retries are flaky"
+			summary.HTMLURL = fmt.Sprintf("https://github.com/acme/widgets/issues/%d", object.Number)
+		}
+		result.Found = true
+		result.Summary = &summary
+		results = append(results, result)
+	}
+	return results, nil
+}
+
 func TestAPIEndToEndFlow(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
@@ -150,9 +178,7 @@ func TestAPIEndToEndFlow(t *testing.T) {
 
 	groupWithMetadata := postJSON(t, server.Echo(), http.MethodGet, fmt.Sprintf("/v1/groups/%s?include=metadata", groupID), nil, http.StatusOK)
 	require.Contains(t, groupWithMetadata, `"object_summary"`)
-	require.Contains(t, groupWithMetadata, `"object_summary_freshness"`)
-	require.Contains(t, groupWithMetadata, `"state":"current"`)
-	require.Contains(t, groupWithMetadata, `"source":"target_projection"`)
+	require.NotContains(t, groupWithMetadata, `"object_summary_freshness"`)
 	require.Contains(t, groupWithMetadata, `"Retry ACP turns safely"`)
 	require.Contains(t, groupWithMetadata, `"https://github.com/acme/widgets/pull/22"`)
 

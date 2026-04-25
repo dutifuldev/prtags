@@ -200,36 +200,32 @@ func TestServiceHelperDBBackedPaths(t *testing.T) {
 	require.Equal(t, "repo:101:pull_request:22", objectTargetKey(101, "pull_request", 22))
 }
 
-func TestProjectionHelpers(t *testing.T) {
+func TestMirrorSummaryHelpers(t *testing.T) {
 	now := time.Now().UTC()
-	projection := database.TargetProjection{
-		TargetType:      "pull_request",
-		ObjectNumber:    22,
-		Title:           "Auth",
-		State:           "open",
-		HTMLURL:         "https://github.com/acme/widgets/pull/22",
-		AuthorLogin:     "alice",
-		SourceUpdatedAt: now.Add(-time.Hour),
-		FetchedAt:       now,
+	summary := objectSummaryFromMirror(testObjectSummary("pull_request", 22))
+	summary.UpdatedAt = now
+	member := database.GroupMember{
+		ID:                 7,
+		GitHubRepositoryID: 101,
+		ObjectType:         "pull_request",
+		ObjectNumber:       22,
+		TargetKey:          objectTargetKey(101, "pull_request", 22),
+		AddedBy:            "tester",
+		AddedAt:            now,
 	}
-	resolution := projectionToGroupMemberResolution(now, projection)
-	require.NotNil(t, resolution.Summary)
-	require.NotNil(t, resolution.Freshness)
-	require.False(t, targetProjectionStale(now, projection))
-	projection.FetchedAt = time.Time{}
-	require.True(t, targetProjectionStale(now, projection))
-	projection.FetchedAt = now.Add(-2 * targetProjectionFreshnessTTL)
-	require.True(t, targetProjectionStale(now, projection))
-	require.NotNil(t, missingGroupMemberResolution().Freshness)
+	view := groupMemberViewFromModel(member, summary, true)
+	require.NotNil(t, view.ObjectSummary)
+	require.Equal(t, "Retry ACP turns safely", view.ObjectSummary.Title)
+	require.Nil(t, groupMemberViewFromModel(member, summary, false).ObjectSummary)
 
 	members := []database.GroupMember{
 		{ObjectType: "pull_request", ObjectNumber: 22},
 		{ObjectType: "issue", ObjectNumber: 11},
 		{ObjectType: "pull_request", ObjectNumber: 22},
+		{ObjectType: "group", ObjectNumber: 1},
 	}
-	types, numbers := projectionLookupKeys(members)
-	require.ElementsMatch(t, []string{"pull_request", "issue"}, types)
-	require.ElementsMatch(t, []int{22, 11}, numbers)
+	refs := mirrorObjectRefsForMembers(members)
+	require.Len(t, refs, 3)
 }
 
 func TestServiceHelperDirectPaths(t *testing.T) {
@@ -240,7 +236,7 @@ func TestServiceHelperDirectPaths(t *testing.T) {
 	commentSyncDB := openCommentSyncTestDB(t)
 	store, githubClient := newTestGitHubCommentClient(t)
 	_ = store
-	commentSync := NewCommentSyncService(commentSyncDB, githubClient, &commentSyncDispatcherStub{})
+	commentSync := NewCommentSyncService(commentSyncDB, testMirrorClient{}, githubClient, &commentSyncDispatcherStub{})
 	service.SetJobDispatcher(nil)
 	service.SetCommentSync(commentSync)
 
@@ -657,29 +653,6 @@ func TestDispatcherBackedQueueHelpers(t *testing.T) {
 	dispatcher := &jobDispatcherStub{}
 	service.SetJobDispatcher(dispatcher)
 
-	group := database.Group{
-		PublicID:           "nimble-seal-q4k7",
-		GitHubRepositoryID: 101,
-		RepositoryOwner:    "acme",
-		RepositoryName:     "widgets",
-		Kind:               "mixed",
-		Title:              "Dispatcher coverage",
-		Status:             "open",
-		CreatedBy:          "tester",
-		UpdatedBy:          "tester",
-		RowVersion:         1,
-	}
-
-	targets := []targetRef{
-		{RepositoryID: 101, Owner: "acme", Name: "widgets", TargetType: "pull_request", TargetKey: objectTargetKey(101, "pull_request", 22), ObjectNumber: 22},
-		{RepositoryID: 101, Owner: "acme", Name: "widgets", TargetType: "pull_request", TargetKey: objectTargetKey(101, "pull_request", 22), ObjectNumber: 22},
-		{RepositoryID: 101, Owner: "acme", Name: "widgets", TargetType: "issue", TargetKey: objectTargetKey(101, "issue", 11), ObjectNumber: 11},
-		{RepositoryID: 101, Owner: "acme", Name: "widgets", TargetType: "group", TargetKey: groupTargetKey(group.PublicID)},
-	}
-
-	require.NoError(t, service.enqueueTargetProjectionRefreshJobs(ctx, group, targets))
-	require.Len(t, dispatcher.refreshCalls, 2)
-
 	repository := database.RepositoryProjection{GitHubRepositoryID: 101, Owner: "acme", Name: "widgets"}
 	require.NoError(t, service.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		return service.enqueueRebuildsTx(tx, repository, targetRef{
@@ -772,18 +745,6 @@ func TestServiceLowCoverageHelperBranches(t *testing.T) {
 		AddedBy:            actor.ID,
 		AddedAt:            time.Now().UTC(),
 	}).Error)
-	require.NoError(t, db.Create(&database.TargetProjection{
-		GitHubRepositoryID: group.GitHubRepositoryID,
-		RepositoryOwner:    group.RepositoryOwner,
-		RepositoryName:     group.RepositoryName,
-		TargetType:         "pull_request",
-		ObjectNumber:       22,
-		Title:              "Retry ACP turns safely",
-		State:              "open",
-		HTMLURL:            "https://github.com/acme/widgets/pull/22",
-		SourceUpdatedAt:    time.Now().UTC(),
-		FetchedAt:          time.Now().UTC(),
-	}).Error)
 
 	errorDispatcher := &jobDispatcherStub{rebuildErr: errors.New("queue rebuild failed")}
 	service.SetJobDispatcher(errorDispatcher)
@@ -861,7 +822,7 @@ func TestServiceLowCoverageHelperBranches(t *testing.T) {
 	resolved, err := service.resolveTarget(ctx, repository, "pull_request", 22, nil)
 	require.NoError(t, err)
 	require.Equal(t, "pull_request", resolved.TargetType)
-	require.False(t, targetProjectionStale(time.Now().UTC(), *resolved.Projection))
+	require.False(t, resolved.SourceUpdatedAt().IsZero())
 
 	_, ok, err = service.filteredTargetResult(ctx, repository.GitHubRepositoryID, "multi_enum", "missing", database.FieldValue{
 		GitHubRepositoryID: repository.GitHubRepositoryID,
@@ -921,8 +882,8 @@ func TestServiceLowCoverageHelperBranches(t *testing.T) {
 	require.NoError(t, service.enqueueFieldTargetRebuildsTx(tx, repository, 99999, time.Now().UTC()))
 	require.NoError(t, tx.Rollback().Error)
 
-	refreshDispatcher := &jobDispatcherStub{refreshErr: errors.New("queue refresh failed")}
-	service.SetJobDispatcher(refreshDispatcher)
+	memberDispatcher := &jobDispatcherStub{rebuildErr: errors.New("queue rebuild failed")}
+	service.SetJobDispatcher(memberDispatcher)
 	tx = db.Begin()
 	require.NoError(t, tx.Error)
 	require.ErrorContains(t, service.addGroupMemberTx(tx, group, repository, actor, &database.GroupMember{
@@ -933,7 +894,7 @@ func TestServiceLowCoverageHelperBranches(t *testing.T) {
 		TargetKey:          objectTargetKey(group.GitHubRepositoryID, "issue", 33),
 		AddedBy:            actor.ID,
 		AddedAt:            time.Now().UTC(),
-	}, "group-member-refresh-fail"), "queue refresh failed")
+	}, "group-member-rebuild-fail"), "queue rebuild failed")
 	require.NoError(t, tx.Rollback().Error)
 
 	tx = db.Begin()
@@ -1105,7 +1066,7 @@ func TestPermissionRepositoryAndGrantHelperBranches(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestEventProjectionAndConflictHelperBranches(t *testing.T) {
+func TestEventMirrorAndConflictHelperBranches(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestService(t)
 	defer server.Close()
@@ -1113,29 +1074,29 @@ func TestEventProjectionAndConflictHelperBranches(t *testing.T) {
 	repository := database.RepositoryProjection{GitHubRepositoryID: 101, Owner: "acme", Name: "widgets"}
 	actor := permissionsActor()
 
-	issueProjection, err := service.ensureTargetProjection(ctx, "acme", "widgets", repository.GitHubRepositoryID, "issue", 11)
+	issueRef, err := service.resolveTarget(ctx, repository, "issue", 11, nil)
 	require.NoError(t, err)
-	require.Equal(t, "Auth retries are flaky", issueProjection.Title)
+	require.Equal(t, objectTargetKey(repository.GitHubRepositoryID, "issue", 11), issueRef.TargetKey)
 
-	pullProjection, err := service.ensureTargetProjection(ctx, "acme", "widgets", repository.GitHubRepositoryID, "pull_request", 22)
+	pullRef, err := service.resolveTarget(ctx, repository, "pull_request", 22, nil)
 	require.NoError(t, err)
-	require.Equal(t, "Retry ACP turns safely", pullProjection.Title)
+	require.Equal(t, objectTargetKey(repository.GitHubRepositoryID, "pull_request", 22), pullRef.TargetKey)
 
-	_, err = service.ensureTargetProjection(ctx, "acme", "widgets", repository.GitHubRepositoryID, "group", 1)
+	_, err = service.resolveTarget(ctx, repository, "group", 1, nil)
 	require.Error(t, err)
 
 	badService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
-	_, err = badService.ensureTargetProjection(ctx, "acme", "widgets", repository.GitHubRepositoryID, "issue", 11)
+	_, err = badService.resolveTarget(ctx, repository, "issue", 11, nil)
 	require.Error(t, err)
 
-	emptySummaries, err := service.loadCachedGroupMemberProjections(ctx, repository.GitHubRepositoryID, []database.GroupMember{{ObjectType: "group", ObjectNumber: 1}})
+	emptySummaries, err := service.mirrorObjectSummaries(ctx, repository.GitHubRepositoryID, mirrorObjectRefsForMembers([]database.GroupMember{{ObjectType: "group", ObjectNumber: 1}}))
 	require.NoError(t, err)
 	require.Empty(t, emptySummaries)
 
-	summaries, err := service.loadCachedGroupMemberProjections(ctx, repository.GitHubRepositoryID, []database.GroupMember{
+	summaries, err := service.mirrorObjectSummaries(ctx, repository.GitHubRepositoryID, mirrorObjectRefsForMembers([]database.GroupMember{
 		{ObjectType: "issue", ObjectNumber: 11},
 		{ObjectType: "pull_request", ObjectNumber: 22},
-	})
+	}))
 	require.NoError(t, err)
 	require.Len(t, summaries, 2)
 
@@ -1229,9 +1190,9 @@ func TestCommentSyncLowLevelHelperBranches(t *testing.T) {
 	group := seedCommentSyncGroup(t, db)
 	dispatcher := &commentSyncDispatcherStub{}
 	_, client := newTestGitHubCommentClient(t)
-	syncService := NewCommentSyncService(db, client, dispatcher)
+	syncService := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 
-	loadedGroup, members, existing, err := syncService.loadGroupProjectionState(db, group.ID)
+	loadedGroup, members, existing, err := syncService.loadGroupCommentState(db, group.ID)
 	require.NoError(t, err)
 	require.Equal(t, group.ID, loadedGroup.ID)
 	require.Len(t, members, 2)
@@ -1257,7 +1218,7 @@ func TestCommentSyncLowLevelHelperBranches(t *testing.T) {
 
 	noSchemaDB, err := gorm.Open(sqlite.Open("file:"+t.Name()+"-comment-sync-noschema?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	noSchemaService := NewCommentSyncService(noSchemaDB, client, dispatcher)
+	noSchemaService := NewCommentSyncService(noSchemaDB, testMirrorClient{}, client, dispatcher)
 	err = noSchemaService.createCommentSyncTarget(noSchemaDB, database.GroupMember{
 		GroupID:            1,
 		GitHubRepositoryID: 101,
@@ -1269,7 +1230,7 @@ func TestCommentSyncLowLevelHelperBranches(t *testing.T) {
 	err = noSchemaService.updateCommentSyncTarget(noSchemaDB, 1, 2, false, objectTargetKey(101, "issue", 44), time.Now().UTC(), time.Now().UTC().Add(time.Second))
 	require.Error(t, err)
 
-	_, _, _, err = noSchemaService.loadGroupProjectionState(noSchemaDB, 999)
+	_, _, _, err = noSchemaService.loadGroupCommentState(noSchemaDB, 999)
 	require.Error(t, err)
 
 	affected, err := syncService.markAllCommentSyncTargetsDeleted(db, []database.GroupCommentSyncTarget{created}, time.Now().UTC(), time.Now().UTC().Add(time.Second))

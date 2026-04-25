@@ -55,6 +55,46 @@ func TestClientReturnsMissingIssueAndPullRequestErrors(t *testing.T) {
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
+func TestClientBatchGetObjectsPreservesOrderAndMissingRows(t *testing.T) {
+	db := openMirrorTestDB(t)
+	seedMirrorRows(t, db)
+	client := NewClient(mirror.NewReader(db))
+
+	results, err := client.BatchGetObjects(context.Background(), 1103012935, []ObjectRef{
+		{Type: "pull_request", Number: 22},
+		{Type: "issue", Number: 11},
+		{Type: "pull_request", Number: 999},
+		{Type: "issue", Number: 0},
+		{Type: "discussion", Number: 7},
+		{Type: "pull_request", Number: 22},
+	})
+	require.NoError(t, err)
+	require.Len(t, results, 6)
+	require.True(t, results[0].Found)
+	require.Equal(t, "pull_request", results[0].Type)
+	require.Equal(t, "Pull title", results[0].Summary.Title)
+	require.True(t, results[1].Found)
+	require.Equal(t, "issue", results[1].Type)
+	require.Equal(t, "Issue title", results[1].Summary.Title)
+	require.False(t, results[2].Found)
+	require.Nil(t, results[2].Summary)
+	require.False(t, results[3].Found)
+	require.False(t, results[4].Found)
+	require.True(t, results[5].Found)
+
+	empty, err := client.BatchGetObjects(context.Background(), 1103012935, nil)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
+func TestClientBatchGetObjectsReturnsRepositoryLookupErrors(t *testing.T) {
+	db := openMirrorTestDB(t)
+	client := NewClient(mirror.NewReader(db))
+
+	_, err := client.BatchGetObjects(context.Background(), 999, []ObjectRef{{Type: "issue", Number: 11}})
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
 func TestNewSchemaClientReadsConfiguredSchema(t *testing.T) {
 	db := openMirrorTestDB(t)
 	seedMirrorRows(t, db)

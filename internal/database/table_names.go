@@ -3,7 +3,6 @@ package database
 const (
 	RepositoryProjectionsTable   = "repository_projections"
 	RepositoryAccessGrantsTable  = "repository_access_grants"
-	TargetProjectionsTable       = "target_projections"
 	GroupsTable                  = "groups"
 	GroupMembersTable            = "group_members"
 	FieldDefinitionsTable        = "field_definitions"
@@ -18,7 +17,6 @@ const (
 
 func (RepositoryProjection) TableName() string   { return RepositoryProjectionsTable }
 func (RepositoryAccessGrant) TableName() string  { return RepositoryAccessGrantsTable }
-func (TargetProjection) TableName() string       { return TargetProjectionsTable }
 func (Group) TableName() string                  { return GroupsTable }
 func (GroupMember) TableName() string            { return GroupMembersTable }
 func (FieldDefinition) TableName() string        { return FieldDefinitionsTable }

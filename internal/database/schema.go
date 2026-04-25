@@ -12,7 +12,6 @@ func schemaModels() []any {
 	return []any{
 		&RepositoryProjection{},
 		&RepositoryAccessGrant{},
-		&TargetProjection{},
 		&Group{},
 		&GroupMember{},
 		&FieldDefinition{},

@@ -11,7 +11,7 @@
 That boundary should stay explicit in both implementation and explanations.
 
 - mirrored GitHub resources should come from `ghreplica`
-- groups, annotations, field definitions, and target projections belong to `prtags`
+- groups, annotations, field definitions, search indexes, and outbound comment state belong to `prtags`
 - if `prtags` needs product-specific behavior, implement it in `prtags`, not in `ghreplica`
 
 ## Read Behavior
@@ -23,15 +23,13 @@ Metadata is opt-in:
 - CLI: `--include-metadata`
 - HTTP: `?include=metadata`
 
-Metadata reads should stay cache-first through `target_projections`.
+Metadata reads should use direct reads from the shared `ghreplica` mirror tables.
 
 ## Write Behavior
 
-Group membership writes should succeed from stable refs first.
+Group membership writes should validate that the target exists in the shared `ghreplica` mirror tables.
 
-They should not block on live `ghreplica` fetches before the write succeeds.
-
-Projection refresh should happen after the write through background jobs.
+They should not create local PR or issue metadata projection rows.
 
 ## Documentation Convention
 

@@ -24,11 +24,6 @@ var (
 	ErrForbidden = &FailError{StatusCode: 403, Message: "forbidden"}
 )
 
-const (
-	indexJobKindTargetProjectionRefresh = "target_projection_refresh"
-	targetProjectionFreshnessTTL        = 15 * time.Minute
-)
-
 type FailError struct {
 	StatusCode int
 	Message    string
@@ -52,6 +47,7 @@ type mirrorClient interface {
 	GetRepository(ctx context.Context, owner, repo string) (ghreplica.Repository, error)
 	GetIssue(ctx context.Context, owner, repo string, number int) (ghreplica.Issue, error)
 	GetPullRequest(ctx context.Context, owner, repo string, number int) (ghreplica.PullRequest, error)
+	BatchGetObjects(ctx context.Context, repositoryID int64, objects []ghreplica.ObjectRef) ([]ghreplica.ObjectResult, error)
 }
 
 type groupMemberConflictDetails struct {
@@ -107,12 +103,12 @@ type AnnotationSetResult struct {
 }
 
 type TargetFilterResult struct {
-	TargetType   string                     `json:"target_type"`
-	ObjectNumber int                        `json:"object_number,omitempty"`
-	ID           string                     `json:"id,omitempty"`
-	TargetKey    string                     `json:"target_key"`
-	Projection   *database.TargetProjection `json:"projection,omitempty"`
-	Annotations  map[string]any             `json:"annotations"`
+	TargetType    string                    `json:"target_type"`
+	ObjectNumber  int                       `json:"object_number,omitempty"`
+	ID            string                    `json:"id,omitempty"`
+	TargetKey     string                    `json:"target_key"`
+	ObjectSummary *GroupMemberObjectSummary `json:"object_summary,omitempty"`
+	Annotations   map[string]any            `json:"annotations"`
 }
 
 type GroupListView struct {
@@ -129,22 +125,15 @@ type GroupMemberObjectSummary struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-type GroupMemberObjectFreshness struct {
-	State     string     `json:"state"`
-	Source    string     `json:"source"`
-	FetchedAt *time.Time `json:"fetched_at,omitempty"`
-}
-
 type GroupMemberView struct {
-	ID                 uint                        `json:"id"`
-	GitHubRepositoryID int64                       `json:"github_repository_id"`
-	ObjectType         string                      `json:"object_type"`
-	ObjectNumber       int                         `json:"object_number"`
-	TargetKey          string                      `json:"target_key"`
-	AddedBy            string                      `json:"added_by"`
-	AddedAt            time.Time                   `json:"added_at"`
-	ObjectSummary      *GroupMemberObjectSummary   `json:"object_summary,omitempty"`
-	ObjectFreshness    *GroupMemberObjectFreshness `json:"object_summary_freshness,omitempty"`
+	ID                 uint                      `json:"id"`
+	GitHubRepositoryID int64                     `json:"github_repository_id"`
+	ObjectType         string                    `json:"object_type"`
+	ObjectNumber       int                       `json:"object_number"`
+	TargetKey          string                    `json:"target_key"`
+	AddedBy            string                    `json:"added_by"`
+	AddedAt            time.Time                 `json:"added_at"`
+	ObjectSummary      *GroupMemberObjectSummary `json:"object_summary,omitempty"`
 }
 
 type GroupCommentSyncTargetStatusView struct {
@@ -803,7 +792,7 @@ func (s *Service) GetGroup(ctx context.Context, groupPublicID string, options Ge
 		}
 	} else {
 		for _, member := range members {
-			memberViews = append(memberViews, groupMemberViewFromModel(member, groupMemberResolution{}))
+			memberViews = append(memberViews, groupMemberViewFromModel(member, GroupMemberObjectSummary{}, false))
 		}
 	}
 
@@ -938,9 +927,6 @@ func (s *Service) addGroupMemberTx(tx *gorm.DB, group database.Group, repository
 		return err
 	}
 	if err := s.enqueueRebuildsTx(tx, repository, groupTargetRef(group), time.Now().UTC()); err != nil {
-		return err
-	}
-	if err := s.enqueueTargetProjectionRefreshJobsTx(tx, group, []targetRef{memberRef}); err != nil {
 		return err
 	}
 	return s.enqueueRebuildsTx(tx, repository, memberRef, time.Now().UTC())
@@ -1411,16 +1397,16 @@ func (s *Service) filteredTargetResult(ctx context.Context, repositoryID int64, 
 	if err != nil {
 		return TargetFilterResult{}, false, err
 	}
-	projection, err := s.filteredTargetProjection(ctx, repositoryID, value)
+	summary, err := s.filteredTargetSummary(ctx, repositoryID, value)
 	if err != nil {
 		return TargetFilterResult{}, false, err
 	}
 	result := TargetFilterResult{
-		TargetType:   value.TargetType,
-		ObjectNumber: intValueOrZero(value.ObjectNumber),
-		TargetKey:    value.TargetKey,
-		Projection:   projection,
-		Annotations:  annotations,
+		TargetType:    value.TargetType,
+		ObjectNumber:  intValueOrZero(value.ObjectNumber),
+		TargetKey:     value.TargetKey,
+		ObjectSummary: summary,
+		Annotations:   annotations,
 	}
 	if value.TargetType == "group" && value.GroupID != nil {
 		group, err := s.lookupGroupByID(ctx, *value.GroupID)
@@ -1432,19 +1418,22 @@ func (s *Service) filteredTargetResult(ctx context.Context, repositoryID int64, 
 	return result, true, nil
 }
 
-func (s *Service) filteredTargetProjection(ctx context.Context, repositoryID int64, value database.FieldValue) (*database.TargetProjection, error) {
+func (s *Service) filteredTargetSummary(ctx context.Context, repositoryID int64, value database.FieldValue) (*GroupMemberObjectSummary, error) {
 	if value.TargetType == "group" || value.ObjectNumber == nil {
 		return nil, nil
 	}
-	var stored database.TargetProjection
-	err := s.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, value.TargetType, *value.ObjectNumber).First(&stored).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
-	}
+	summaries, err := s.mirrorObjectSummaries(ctx, repositoryID, []ghreplica.ObjectRef{{
+		Type:   value.TargetType,
+		Number: *value.ObjectNumber,
+	}})
 	if err != nil {
 		return nil, err
 	}
-	return &stored, nil
+	summary, ok := summaries[objectTargetKey(repositoryID, value.TargetType, *value.ObjectNumber)]
+	if !ok {
+		return nil, nil
+	}
+	return &summary, nil
 }
 
 func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string, repositoryID int64, objectNumber int, groupID *uint) (map[string]any, error) {
@@ -1475,18 +1464,22 @@ func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string
 func (s *Service) resolveTarget(ctx context.Context, repository database.RepositoryProjection, targetType string, objectNumber int, groupID *uint) (targetRef, error) {
 	switch targetType {
 	case "pull_request", "issue":
-		projection, err := s.ensureTargetProjection(ctx, repository.Owner, repository.Name, repository.GitHubRepositoryID, targetType, objectNumber)
+		summaries, err := s.mirrorObjectSummaries(ctx, repository.GitHubRepositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: objectNumber}})
 		if err != nil {
 			return targetRef{}, err
 		}
+		summary, ok := summaries[objectTargetKey(repository.GitHubRepositoryID, targetType, objectNumber)]
+		if !ok {
+			return targetRef{}, ErrNotFound
+		}
 		return targetRef{
-			RepositoryID: repository.GitHubRepositoryID,
-			Owner:        repository.Owner,
-			Name:         repository.Name,
-			TargetType:   targetType,
-			TargetKey:    objectTargetKey(repository.GitHubRepositoryID, targetType, objectNumber),
-			ObjectNumber: objectNumber,
-			Projection:   &projection,
+			RepositoryID:         repository.GitHubRepositoryID,
+			Owner:                repository.Owner,
+			Name:                 repository.Name,
+			TargetType:           targetType,
+			TargetKey:            objectTargetKey(repository.GitHubRepositoryID, targetType, objectNumber),
+			ObjectNumber:         objectNumber,
+			SourceUpdatedAtValue: summary.UpdatedAt,
 		}, nil
 	case "group":
 		if groupID == nil || *groupID == 0 {
@@ -1509,82 +1502,17 @@ func (s *Service) resolveTarget(ctx context.Context, repository database.Reposit
 	}
 }
 
-func (s *Service) ensureTargetProjection(ctx context.Context, owner, repo string, repositoryID int64, targetType string, number int) (database.TargetProjection, error) {
-	now := time.Now().UTC()
-	var model database.TargetProjection
-	switch targetType {
-	case "pull_request":
-		pull, err := s.ghreplica.GetPullRequest(ctx, owner, repo, number)
-		if err != nil {
-			return database.TargetProjection{}, err
-		}
-		model = database.TargetProjection{
-			GitHubRepositoryID: repositoryID,
-			RepositoryOwner:    owner,
-			RepositoryName:     repo,
-			TargetType:         targetType,
-			ObjectNumber:       number,
-			Title:              pull.Title,
-			State:              pull.State,
-			AuthorLogin:        pull.User.Login,
-			HTMLURL:            pull.HTMLURL,
-			SourceUpdatedAt:    pull.UpdatedAt.UTC(),
-			FetchedAt:          now,
-		}
-	case "issue":
-		issue, err := s.ghreplica.GetIssue(ctx, owner, repo, number)
-		if err != nil {
-			return database.TargetProjection{}, err
-		}
-		model = database.TargetProjection{
-			GitHubRepositoryID: repositoryID,
-			RepositoryOwner:    owner,
-			RepositoryName:     repo,
-			TargetType:         targetType,
-			ObjectNumber:       number,
-			Title:              issue.Title,
-			State:              issue.State,
-			AuthorLogin:        issue.User.Login,
-			HTMLURL:            issue.HTMLURL,
-			SourceUpdatedAt:    issue.UpdatedAt.UTC(),
-			FetchedAt:          now,
-		}
-	default:
-		return database.TargetProjection{}, &FailError{StatusCode: 400, Message: "unsupported target_type"}
-	}
-	if err := s.db.WithContext(ctx).
-		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).
-		Assign(model).
-		FirstOrCreate(&model).Error; err != nil {
-		return database.TargetProjection{}, err
-	}
-	return model, nil
-}
-
 func (s *Service) enrichGroupMembers(ctx context.Context, group database.Group, members []database.GroupMember) ([]GroupMemberView, error) {
-	cachedProjections, err := s.loadCachedGroupMemberProjections(ctx, group.GitHubRepositoryID, members)
+	refs := mirrorObjectRefsForMembers(members)
+	summaries, err := s.mirrorObjectSummaries(ctx, group.GitHubRepositoryID, refs)
 	if err != nil {
 		return nil, err
 	}
 
-	now := time.Now().UTC()
 	views := make([]GroupMemberView, 0, len(members))
-	refreshTargets := make([]targetRef, 0, len(members))
 	for _, member := range members {
-		var resolution groupMemberResolution
-		if projection, ok := cachedProjections[member.TargetKey]; ok {
-			resolution = projectionToGroupMemberResolution(now, projection)
-			if targetProjectionStale(now, projection) {
-				refreshTargets = append(refreshTargets, groupMemberTargetRef(group, member, &projection))
-			}
-		} else {
-			resolution = missingGroupMemberResolution()
-			refreshTargets = append(refreshTargets, groupMemberTargetRef(group, member, nil))
-		}
-		views = append(views, groupMemberViewFromModel(member, resolution))
-	}
-	if len(refreshTargets) > 0 {
-		_ = s.enqueueTargetProjectionRefreshJobs(ctx, group, refreshTargets)
+		summary, ok := summaries[member.TargetKey]
+		views = append(views, groupMemberViewFromModel(member, summary, ok))
 	}
 	return views, nil
 }
@@ -1598,11 +1526,6 @@ type groupMemberCountRow struct {
 	GroupID    uint
 	ObjectType string
 	Count      int64
-}
-
-type groupMemberResolution struct {
-	Summary   *GroupMemberObjectSummary
-	Freshness *GroupMemberObjectFreshness
 }
 
 func (s *Service) listGroupMemberCounts(ctx context.Context, groups []database.Group) (map[uint]groupMemberCounts, error) {
@@ -1638,137 +1561,44 @@ func (s *Service) listGroupMemberCounts(ctx context.Context, groups []database.G
 	return counts, nil
 }
 
-func (s *Service) loadCachedGroupMemberProjections(ctx context.Context, repositoryID int64, members []database.GroupMember) (map[string]database.TargetProjection, error) {
-	if len(members) == 0 {
-		return map[string]database.TargetProjection{}, nil
-	}
-
-	targetTypes, objectNumbers := projectionLookupKeys(members)
-	if len(targetTypes) == 0 || len(objectNumbers) == 0 {
-		return map[string]database.TargetProjection{}, nil
-	}
-
-	var projections []database.TargetProjection
-	if err := s.db.WithContext(ctx).
-		Where("github_repository_id = ? AND target_type IN ? AND object_number IN ?", repositoryID, targetTypes, objectNumbers).
-		Find(&projections).Error; err != nil {
-		return nil, err
-	}
-
-	summaries := make(map[string]database.TargetProjection, len(projections))
-	for _, projection := range projections {
-		summaries[objectTargetKey(repositoryID, projection.TargetType, projection.ObjectNumber)] = projection
-	}
-	return summaries, nil
-}
-
-func projectionLookupKeys(members []database.GroupMember) ([]string, []int) {
-	targetTypes := make([]string, 0, len(members))
-	objectNumbers := make([]int, 0, len(members))
-	seenTypes := map[string]struct{}{}
-	seenNumbers := map[int]struct{}{}
+func mirrorObjectRefsForMembers(members []database.GroupMember) []ghreplica.ObjectRef {
+	refs := make([]ghreplica.ObjectRef, 0, len(members))
 	for _, member := range members {
 		if member.ObjectType != "pull_request" && member.ObjectType != "issue" {
 			continue
 		}
-		if _, ok := seenTypes[member.ObjectType]; !ok {
-			seenTypes[member.ObjectType] = struct{}{}
-			targetTypes = append(targetTypes, member.ObjectType)
-		}
-		if _, ok := seenNumbers[member.ObjectNumber]; !ok {
-			seenNumbers[member.ObjectNumber] = struct{}{}
-			objectNumbers = append(objectNumbers, member.ObjectNumber)
-		}
+		refs = append(refs, ghreplica.ObjectRef{Type: member.ObjectType, Number: member.ObjectNumber})
 	}
-	return targetTypes, objectNumbers
+	return refs
 }
 
-func (s *Service) enqueueTargetProjectionRefreshJobs(ctx context.Context, group database.Group, targets []targetRef) error {
-	return s.enqueueTargetProjectionRefreshJobsDB(s.db.WithContext(ctx), group, targets)
-}
-
-func (s *Service) enqueueTargetProjectionRefreshJobsTx(tx *gorm.DB, group database.Group, targets []targetRef) error {
-	return s.enqueueTargetProjectionRefreshJobsDB(tx, group, targets)
-}
-
-func (s *Service) enqueueTargetProjectionRefreshJobsDB(db *gorm.DB, group database.Group, targets []targetRef) error {
-	if s.dispatcher != nil {
-		for _, target := range dedupeProjectionRefreshTargets(targets) {
-			if err := s.dispatcher.EnqueueTargetProjectionRefreshTx(db, group, target); err != nil {
-				return err
-			}
-		}
-		return nil
+func (s *Service) mirrorObjectSummaries(ctx context.Context, repositoryID int64, refs []ghreplica.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
+	results, err := s.ghreplica.BatchGetObjects(ctx, repositoryID, refs)
+	if err != nil {
+		return nil, err
 	}
-
-	now := time.Now().UTC()
-	for _, target := range dedupeProjectionRefreshTargets(targets) {
-		if err := s.createProjectionRefreshJob(db, group, target, now); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func dedupeProjectionRefreshTargets(targets []targetRef) []targetRef {
-	seen := make(map[string]struct{}, len(targets))
-	filtered := make([]targetRef, 0, len(targets))
-	for _, target := range targets {
-		if !isProjectionRefreshTarget(target) {
+	summaries := make(map[string]GroupMemberObjectSummary, len(results))
+	for _, result := range results {
+		if !result.Found || result.Summary == nil {
 			continue
 		}
-		dedupeKey := target.TargetType + ":" + target.TargetKey
-		if _, ok := seen[dedupeKey]; ok {
-			continue
-		}
-		seen[dedupeKey] = struct{}{}
-		filtered = append(filtered, target)
+		summaries[objectTargetKey(repositoryID, result.Type, result.Number)] = objectSummaryFromMirror(*result.Summary)
 	}
-	return filtered
+	return summaries, nil
 }
 
-func isProjectionRefreshTarget(target targetRef) bool {
-	return (target.TargetType == "pull_request" || target.TargetType == "issue") && target.TargetKey != ""
-}
-
-func (s *Service) createProjectionRefreshJob(db *gorm.DB, group database.Group, target targetRef, now time.Time) error {
-	exists, err := projectionRefreshJobExists(db, group.GitHubRepositoryID, target)
-	if err != nil || exists {
-		return err
-	}
-	job := database.IndexJob{
-		Kind:               indexJobKindTargetProjectionRefresh,
-		Status:             "pending",
-		GitHubRepositoryID: group.GitHubRepositoryID,
-		RepositoryOwner:    group.RepositoryOwner,
-		RepositoryName:     group.RepositoryName,
-		TargetType:         target.TargetType,
-		TargetKey:          target.TargetKey,
-		NextAttemptAt:      timePtr(now),
-	}
-	if target.Projection != nil {
-		job.SourceUpdatedAt = timePtr(target.Projection.SourceUpdatedAt)
-	}
-	return db.Create(&job).Error
-}
-
-func projectionRefreshJobExists(db *gorm.DB, repositoryID int64, target targetRef) (bool, error) {
-	var existing database.IndexJob
-	err := db.
-		Where("kind = ? AND github_repository_id = ? AND target_type = ? AND target_key = ? AND status IN ?", indexJobKindTargetProjectionRefresh, repositoryID, target.TargetType, target.TargetKey, []string{"pending", "processing"}).
-		First(&existing).Error
-	switch {
-	case err == nil:
-		return true, nil
-	case errors.Is(err, gorm.ErrRecordNotFound):
-		return false, nil
-	default:
-		return false, err
+func objectSummaryFromMirror(summary ghreplica.ObjectSummary) GroupMemberObjectSummary {
+	return GroupMemberObjectSummary{
+		Title:       summary.Title,
+		State:       summary.State,
+		HTMLURL:     summary.HTMLURL,
+		AuthorLogin: summary.AuthorLogin,
+		UpdatedAt:   summary.UpdatedAt,
 	}
 }
 
-func groupMemberViewFromModel(member database.GroupMember, resolution groupMemberResolution) GroupMemberView {
-	return GroupMemberView{
+func groupMemberViewFromModel(member database.GroupMember, summary GroupMemberObjectSummary, found bool) GroupMemberView {
+	view := GroupMemberView{
 		ID:                 member.ID,
 		GitHubRepositoryID: member.GitHubRepositoryID,
 		ObjectType:         member.ObjectType,
@@ -1776,59 +1606,11 @@ func groupMemberViewFromModel(member database.GroupMember, resolution groupMembe
 		TargetKey:          member.TargetKey,
 		AddedBy:            member.AddedBy,
 		AddedAt:            member.AddedAt,
-		ObjectSummary:      resolution.Summary,
-		ObjectFreshness:    resolution.Freshness,
 	}
-}
-
-func projectionToGroupMemberResolution(now time.Time, projection database.TargetProjection) groupMemberResolution {
-	fetchedAt := projection.FetchedAt
-	state := "current"
-	if targetProjectionStale(now, projection) {
-		state = "stale"
+	if found {
+		view.ObjectSummary = &summary
 	}
-	return groupMemberResolution{
-		Summary: &GroupMemberObjectSummary{
-			Title:       projection.Title,
-			State:       projection.State,
-			HTMLURL:     projection.HTMLURL,
-			AuthorLogin: projection.AuthorLogin,
-			UpdatedAt:   projection.SourceUpdatedAt,
-		},
-		Freshness: &GroupMemberObjectFreshness{
-			State:     state,
-			Source:    "target_projection",
-			FetchedAt: &fetchedAt,
-		},
-	}
-}
-
-func missingGroupMemberResolution() groupMemberResolution {
-	return groupMemberResolution{
-		Freshness: &GroupMemberObjectFreshness{
-			State:  "missing",
-			Source: "missing_projection",
-		},
-	}
-}
-
-func targetProjectionStale(now time.Time, projection database.TargetProjection) bool {
-	if projection.FetchedAt.IsZero() {
-		return true
-	}
-	return now.Sub(projection.FetchedAt.UTC()) > targetProjectionFreshnessTTL
-}
-
-func groupMemberTargetRef(group database.Group, member database.GroupMember, projection *database.TargetProjection) targetRef {
-	return targetRef{
-		RepositoryID: group.GitHubRepositoryID,
-		Owner:        group.RepositoryOwner,
-		Name:         group.RepositoryName,
-		TargetType:   member.ObjectType,
-		TargetKey:    member.TargetKey,
-		ObjectNumber: member.ObjectNumber,
-		Projection:   projection,
-	}
+	return view
 }
 
 func (s *Service) loadFieldDefinitionsTx(tx *gorm.DB, repositoryID int64, scope string) ([]database.FieldDefinition, error) {
@@ -1975,14 +1757,14 @@ type eventRefInput struct {
 }
 
 type targetRef struct {
-	RepositoryID int64
-	Owner        string
-	Name         string
-	TargetType   string
-	TargetKey    string
-	ObjectNumber int
-	GroupID      *uint
-	Projection   *database.TargetProjection
+	RepositoryID         int64
+	Owner                string
+	Name                 string
+	TargetType           string
+	TargetKey            string
+	ObjectNumber         int
+	GroupID              *uint
+	SourceUpdatedAtValue time.Time
 }
 
 func (t targetRef) ApplicableScope() string {
@@ -1998,8 +1780,8 @@ func (t targetRef) ObjectNumberPtr() *int {
 }
 
 func (t targetRef) SourceUpdatedAt() time.Time {
-	if t.Projection != nil {
-		return t.Projection.SourceUpdatedAt
+	if !t.SourceUpdatedAtValue.IsZero() {
+		return t.SourceUpdatedAtValue.UTC()
 	}
 	return time.Now().UTC()
 }

@@ -27,7 +27,7 @@ Today it enforces:
 
 CI currently enforces:
 
-- a minimum total coverage floor of `49.0%`
+- a minimum total coverage floor of `80.0%`
 - `golangci-lint`
 - cyclomatic complexity through `cyclop`
 - cognitive complexity through `gocognit`

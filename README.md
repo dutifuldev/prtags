@@ -179,9 +179,9 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 `ghreplica` remains the source of truth for mirrored repositories, pull requests, and issues. `PRtags` resolves repo and object identity through `ghreplica`, uses stable GitHub-backed identifiers so renames do not break object identity, and derives write permissions from GitHub repo access. That means `PRtags` is not trying to become a second GitHub mirror. It is a curation layer over a mirror that already exists.
 
-This split is important operationally too. `PRtags` owns its own schema, jobs, search documents, and embeddings. It shares a Postgres database with `ghreplica` only so the two systems can join mirrored GitHub data with curation data; it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
+This split is important operationally too. `PRtags` owns its own schema, jobs, search documents, and embeddings. It shares a Postgres database with `ghreplica` so the two systems can join mirrored GitHub data with curation data. It should not copy PR or issue display metadata into a second local projection cache.
 
-For group reads, `PRtags` returns refs by default. When metadata is requested, `PRtags` enriches member references from cached target projections. If a projection is missing or stale, `PRtags` returns the cached result it already has, marks the freshness state explicitly, and queues a background refresh from `ghreplica`. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
+For group reads, `PRtags` returns refs by default. When metadata is requested, `PRtags` enriches member references by reading the shared `ghreplica` mirror tables directly. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
 
 A simplified refs-only `group get` member looks like:
 
@@ -204,10 +204,6 @@ With `--include-metadata` or `?include=metadata`, a member can also include:
     "state": "closed",
     "html_url": "https://github.com/dutifuldev/ghreplica/pull/24",
     "author_login": "dutifulbob"
-  },
-  "object_summary_freshness": {
-    "state": "current",
-    "source": "target_projection"
   }
 }
 ```
@@ -344,7 +340,7 @@ The deployment uses one shared Postgres database with separate
 schemas:
 
 - configured mirror schema for mirrored GitHub data
-- `prtags` schema for groups, annotations, projections, and jobs
+- `prtags` schema for groups, annotations, search indexes, and jobs
 
 That shared-database topology is what allows normal SQL joins between `PRtags`
 groups and `ghreplica` mirror tables. It deprecates the separate `PRtags`

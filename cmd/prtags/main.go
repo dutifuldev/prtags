@@ -277,7 +277,7 @@ func openServeRuntime() (config.Config, serveRuntime, error) {
 	ghClient := ghreplica.NewSchemaClient(db, cfg.GHReplicaSchema)
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, checker, indexer)
-	commentSync := buildCommentSyncService(db, cfg)
+	commentSync := buildCommentSyncService(db, cfg, ghClient)
 	dispatcher, err := newRiverDispatcherForDB(db, indexer, commentSync)
 	if err != nil {
 		return config.Config{}, serveRuntime{}, err
@@ -377,11 +377,11 @@ func postgresKeywordValue(value string) string {
 	return "'" + escaped + "'"
 }
 
-func buildCommentSyncService(db *gorm.DB, cfg config.Config) *core.CommentSyncService {
+func buildCommentSyncService(db *gorm.DB, cfg config.Config, mirror *ghreplica.Client) *core.CommentSyncService {
 	if !cfg.HasGitHubApp() {
 		return nil
 	}
-	return core.NewCommentSyncService(db, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
+	return core.NewCommentSyncService(db, mirror, githubapi.NewClient(cfg.GitHubBaseURL, githubapi.AuthConfig{
 		AppID:          cfg.GitHubAppID,
 		InstallationID: cfg.GitHubInstallationID,
 		PrivateKeyPEM:  cfg.GitHubAppPrivateKeyPEM,

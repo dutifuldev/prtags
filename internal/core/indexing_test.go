@@ -59,7 +59,7 @@ func TestRecoverStaleJobsRequeuesExpiredProcessingJobs(t *testing.T) {
 	require.Equal(t, "job lease expired", job.LastError)
 }
 
-func TestBuildSearchResultLoadsProjectionAndAnnotations(t *testing.T) {
+func TestBuildSearchResultLoadsMirrorSummaryAndAnnotations(t *testing.T) {
 	ctx := context.Background()
 	service, _, server := newTestService(t)
 	defer server.Close()
@@ -80,8 +80,8 @@ func TestBuildSearchResultLoadsProjectionAndAnnotations(t *testing.T) {
 
 	result, err := service.buildSearchResult(ctx, 101, "pull_request", objectTargetKey(101, "pull_request", 22), 0.75)
 	require.NoError(t, err)
-	require.NotNil(t, result.Projection)
-	require.Equal(t, 22, result.Projection.ObjectNumber)
+	require.NotNil(t, result.ObjectSummary)
+	require.Equal(t, "Retry ACP turns safely", result.ObjectSummary.Title)
 	require.Equal(t, "retry auth safely", result.Annotations["intent"])
 	require.Equal(t, 0.75, result.Score)
 }
@@ -166,24 +166,6 @@ func TestIndexerFailureAndSearchHelperBranches(t *testing.T) {
 	service, db, server := newTestService(t)
 	defer server.Close()
 
-	indexer := service.indexer
-	require.Error(t, indexer.refreshTargetProjection(ctx, database.IndexJob{
-		Kind:               indexJobKindTargetProjectionRefresh,
-		GitHubRepositoryID: 101,
-		RepositoryOwner:    "acme",
-		RepositoryName:     "widgets",
-		TargetType:         "pull_request",
-		TargetKey:          "bad-key",
-	}))
-	require.Error(t, indexer.refreshTargetProjection(ctx, database.IndexJob{
-		Kind:               indexJobKindTargetProjectionRefresh,
-		GitHubRepositoryID: 101,
-		RepositoryOwner:    "acme",
-		RepositoryName:     "widgets",
-		TargetType:         "group",
-		TargetKey:          "group:test",
-	}))
-
 	textQuery, err := service.searchTextRows(ctx, 101, "auth", []string{"pull_request"}, 5)
 	require.NoError(t, err)
 	require.NotNil(t, textQuery)
@@ -192,7 +174,6 @@ func TestIndexerFailureAndSearchHelperBranches(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, similarQuery)
 
-	var noProjection database.TargetProjection
 	require.NoError(t, db.Create(&database.Group{
 		PublicID:           "quiet-otter-z9x2",
 		GitHubRepositoryID: 101,
@@ -210,12 +191,11 @@ func TestIndexerFailureAndSearchHelperBranches(t *testing.T) {
 
 	result, err := service.populateObjectSearchResult(ctx, 101, "pull_request", "repo:101:pull_request:999", TextSearchResult{TargetType: "pull_request", TargetKey: "repo:101:pull_request:999"})
 	require.NoError(t, err)
-	require.Nil(t, result.Projection)
+	require.Nil(t, result.ObjectSummary)
 
 	groupResult, err := service.populateGroupSearchResult(ctx, 101, groupTargetKey(group.PublicID), TextSearchResult{TargetType: "group", TargetKey: groupTargetKey(group.PublicID)})
 	require.NoError(t, err)
 	require.Equal(t, group.PublicID, groupResult.ID)
-	require.Empty(t, noProjection.HTMLURL)
 }
 
 func TestIndexerPostgresSearchHelpers(t *testing.T) {
@@ -276,69 +256,6 @@ func TestIndexerPostgresSearchHelpers(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestProjectionRefreshJobHelpers(t *testing.T) {
-	ctx := context.Background()
-	service, db, server := newTestService(t)
-	defer server.Close()
-
-	group := database.Group{
-		PublicID:           "sleek-hound-v3m1",
-		GitHubRepositoryID: 101,
-		RepositoryOwner:    "acme",
-		RepositoryName:     "widgets",
-		Kind:               "mixed",
-		Title:              "Projection refresh",
-		Status:             "open",
-		CreatedBy:          "tester",
-		UpdatedBy:          "tester",
-		RowVersion:         1,
-	}
-	require.NoError(t, db.Create(&group).Error)
-
-	target := targetRef{
-		RepositoryID: group.GitHubRepositoryID,
-		Owner:        group.RepositoryOwner,
-		Name:         group.RepositoryName,
-		TargetType:   "pull_request",
-		TargetKey:    objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
-		ObjectNumber: 22,
-		Projection: &database.TargetProjection{
-			SourceUpdatedAt: time.Now().UTC().Add(-time.Minute),
-		},
-	}
-
-	require.NoError(t, service.enqueueTargetProjectionRefreshJobs(ctx, group, []targetRef{
-		target,
-		target,
-		{TargetType: "group", TargetKey: groupTargetKey(group.PublicID)},
-	}))
-
-	var jobs []database.IndexJob
-	require.NoError(t, db.WithContext(ctx).Where("kind = ?", indexJobKindTargetProjectionRefresh).Find(&jobs).Error)
-	require.Len(t, jobs, 1)
-	require.NotNil(t, jobs[0].NextAttemptAt)
-
-	exists, err := projectionRefreshJobExists(db, group.GitHubRepositoryID, target)
-	require.NoError(t, err)
-	require.True(t, exists)
-
-	require.NoError(t, service.createProjectionRefreshJob(db, group, targetRef{
-		RepositoryID: group.GitHubRepositoryID,
-		Owner:        group.RepositoryOwner,
-		Name:         group.RepositoryName,
-		TargetType:   "issue",
-		TargetKey:    objectTargetKey(group.GitHubRepositoryID, "issue", 11),
-		ObjectNumber: 11,
-		Projection: &database.TargetProjection{
-			SourceUpdatedAt: time.Now().UTC(),
-		},
-	}, time.Now().UTC()))
-
-	exists, err = projectionRefreshJobExists(db, group.GitHubRepositoryID, targetRef{TargetType: "issue", TargetKey: objectTargetKey(group.GitHubRepositoryID, "issue", 11)})
-	require.NoError(t, err)
-	require.True(t, exists)
-}
-
 func TestIndexerClaimAndProcessSuccessPaths(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestService(t)
@@ -375,17 +292,6 @@ func TestIndexerClaimAndProcessSuccessPaths(t *testing.T) {
 	}, 1)
 	require.Len(t, rows, 1)
 
-	refreshJob := database.IndexJob{
-		Kind:               indexJobKindTargetProjectionRefresh,
-		Status:             "pending",
-		GitHubRepositoryID: 101,
-		RepositoryOwner:    "acme",
-		RepositoryName:     "widgets",
-		TargetType:         "pull_request",
-		TargetKey:          objectTargetKey(101, "pull_request", 22),
-	}
-	require.NoError(t, service.indexer.processJob(ctx, refreshJob))
-
 	embeddingJob := database.IndexJob{
 		Kind:               "embedding_rebuild",
 		Status:             "pending",
@@ -419,7 +325,7 @@ func TestIndexerAdditionalHelperAndErrorBranches(t *testing.T) {
 
 	missingJob := database.IndexJob{
 		ID:                 9999,
-		Kind:               indexJobKindTargetProjectionRefresh,
+		Kind:               "unknown",
 		Status:             "pending",
 		GitHubRepositoryID: 101,
 		RepositoryOwner:    "acme",
@@ -431,7 +337,7 @@ func TestIndexerAdditionalHelperAndErrorBranches(t *testing.T) {
 
 	badRefreshJob := database.IndexJob{
 		ID:                 10000,
-		Kind:               indexJobKindTargetProjectionRefresh,
+		Kind:               "unknown",
 		Status:             "pending",
 		GitHubRepositoryID: 101,
 		RepositoryOwner:    "acme",
@@ -495,9 +401,17 @@ func TestIndexerAdditionalHelperAndErrorBranches(t *testing.T) {
 	_, ok = groupPublicIDFromTargetKey("group:   ")
 	require.False(t, ok)
 
-	noProjection, err := service.populateObjectSearchResult(ctx, 101, "pull_request", "bad-key", TextSearchResult{TargetType: "pull_request", TargetKey: "bad-key"})
+	noSummary, err := service.populateObjectSearchResult(ctx, 101, "pull_request", "bad-key", TextSearchResult{TargetType: "pull_request", TargetKey: "bad-key"})
 	require.NoError(t, err)
-	require.Nil(t, noProjection.Projection)
+	require.Nil(t, noSummary.ObjectSummary)
+
+	mirrorFailService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
+	_, err = mirrorFailService.populateObjectSearchResult(ctx, 101, "pull_request", objectTargetKey(101, "pull_request", 22), TextSearchResult{TargetType: "pull_request", TargetKey: objectTargetKey(101, "pull_request", 22)})
+	require.Error(t, err)
+
+	failIndexer := NewIndexer(db, testMirrorClient{behavior: batchBehavior{fail: true}}, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	_, _, err = failIndexer.objectSearchParts(ctx, 101, "pull_request", objectTargetKey(101, "pull_request", 22))
+	require.Error(t, err)
 
 	noGroup, err := service.populateGroupSearchResult(ctx, 101, "bad-key", TextSearchResult{TargetType: "group", TargetKey: "bad-key"})
 	require.NoError(t, err)

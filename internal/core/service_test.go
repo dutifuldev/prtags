@@ -5,6 +5,7 @@ import (
 	crand "crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -231,14 +232,12 @@ func TestGetGroupOmitsMetadataByDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, members, 1)
 	require.Nil(t, members[0].ObjectSummary)
-	require.Nil(t, members[0].ObjectFreshness)
 }
 
-func TestGetGroupUsesCurrentCachedProjectionWithoutBatchFetch(t *testing.T) {
+func TestGetGroupLoadsMirrorMetadataDirectly(t *testing.T) {
 	ctx := context.Background()
 	var batchCalls atomic.Int32
 	service, _, server := newTestServiceWithBatchOptions(t, batchBehavior{
-		delay: time.Second,
 		calls: &batchCalls,
 	})
 	defer server.Close()
@@ -260,20 +259,14 @@ func TestGetGroupUsesCurrentCachedProjectionWithoutBatchFetch(t *testing.T) {
 	_, members, _, err := service.GetGroup(ctx, group.PublicID, GetGroupOptions{IncludeMetadata: true})
 	require.NoError(t, err)
 	require.Len(t, members, 2)
-	require.Zero(t, batchCalls.Load())
+	require.Greater(t, batchCalls.Load(), int32(0))
 	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
 	require.Equal(t, "bob", members[0].ObjectSummary.AuthorLogin)
-	require.NotNil(t, members[0].ObjectFreshness)
-	require.Equal(t, "current", members[0].ObjectFreshness.State)
-	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
 	require.Equal(t, "Auth retries are flaky", members[1].ObjectSummary.Title)
 	require.Equal(t, "alice", members[1].ObjectSummary.AuthorLogin)
-	require.NotNil(t, members[1].ObjectFreshness)
-	require.Equal(t, "current", members[1].ObjectFreshness.State)
-	require.Equal(t, "target_projection", members[1].ObjectFreshness.Source)
 }
 
-func TestGetGroupEnqueuesRefreshWhenProjectionMissing(t *testing.T) {
+func TestGetGroupOmitsMissingMirrorMetadata(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestService(t)
 	defer server.Close()
@@ -289,8 +282,8 @@ func TestGetGroupEnqueuesRefreshWhenProjectionMissing(t *testing.T) {
 		GroupID:            group.ID,
 		GitHubRepositoryID: group.GitHubRepositoryID,
 		ObjectType:         "pull_request",
-		ObjectNumber:       22,
-		TargetKey:          objectTargetKey(group.GitHubRepositoryID, "pull_request", 22),
+		ObjectNumber:       999,
+		TargetKey:          objectTargetKey(group.GitHubRepositoryID, "pull_request", 999),
 		AddedBy:            actor.ID,
 		AddedAt:            time.Now().UTC(),
 	}
@@ -300,33 +293,13 @@ func TestGetGroupEnqueuesRefreshWhenProjectionMissing(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, members, 1)
 	require.Nil(t, members[0].ObjectSummary)
-	require.NotNil(t, members[0].ObjectFreshness)
-	require.Equal(t, "missing", members[0].ObjectFreshness.State)
-	require.Equal(t, "missing_projection", members[0].ObjectFreshness.Source)
 
-	var jobs []database.IndexJob
-	require.NoError(t, db.WithContext(ctx).Where("kind = ?", indexJobKindTargetProjectionRefresh).Find(&jobs).Error)
-	require.Len(t, jobs, 1)
-	require.Equal(t, "pending", jobs[0].Status)
-
-	drainIndexJobs(t, ctx, db, service.indexer)
-
-	var projection database.TargetProjection
-	require.NoError(t, db.WithContext(ctx).
-		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", group.GitHubRepositoryID, "pull_request", 22).
-		First(&projection).Error)
-	require.Equal(t, "Retry ACP turns safely", projection.Title)
-
-	_, members, _, err = service.GetGroup(ctx, group.PublicID, GetGroupOptions{IncludeMetadata: true})
-	require.NoError(t, err)
-	require.Len(t, members, 1)
-	require.NotNil(t, members[0].ObjectSummary)
-	require.Equal(t, "Retry ACP turns safely", members[0].ObjectSummary.Title)
-	require.Equal(t, "current", members[0].ObjectFreshness.State)
-	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
+	var refreshJobs []database.IndexJob
+	require.NoError(t, db.WithContext(ctx).Where("kind = ?", "target_projection_refresh").Find(&refreshJobs).Error)
+	require.Empty(t, refreshJobs)
 }
 
-func TestGetGroupMarksStaleProjectionAndEnqueuesRefresh(t *testing.T) {
+func TestAddGroupMemberDoesNotCreateProjectionRefreshJobs(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestService(t)
 	defer server.Close()
@@ -338,69 +311,13 @@ func TestGetGroupMarksStaleProjectionAndEnqueuesRefresh(t *testing.T) {
 	}, "")
 	require.NoError(t, err)
 
-	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
-	require.NoError(t, err)
-	drainIndexJobs(t, ctx, db, service.indexer)
-
-	staleAt := time.Now().UTC().Add(-2 * targetProjectionFreshnessTTL)
-	require.NoError(t, db.WithContext(ctx).
-		Model(&database.TargetProjection{}).
-		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", group.GitHubRepositoryID, "pull_request", 22).
-		Update("fetched_at", staleAt).Error)
-
-	_, members, _, err := service.GetGroup(ctx, group.PublicID, GetGroupOptions{IncludeMetadata: true})
-	require.NoError(t, err)
-	require.Len(t, members, 1)
-	require.NotNil(t, members[0].ObjectSummary)
-	require.Equal(t, "stale", members[0].ObjectFreshness.State)
-	require.Equal(t, "target_projection", members[0].ObjectFreshness.Source)
-
-	var jobs []database.IndexJob
-	require.NoError(t, db.WithContext(ctx).
-		Where("kind = ? AND status = ?", indexJobKindTargetProjectionRefresh, "pending").
-		Find(&jobs).Error)
-	require.Len(t, jobs, 1)
-}
-
-func TestAddGroupMemberDoesNotBlockOnProjectionFetch(t *testing.T) {
-	ctx := context.Background()
-	service, db, server := newTestServiceWithBatchOptions(t, batchBehavior{
-		objectDelay: time.Second,
-	})
-	defer server.Close()
-
-	actor := permissions.Actor{Type: "user", ID: "tester"}
-	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
-		Kind:  "pull_request",
-		Title: "Auth work",
-	}, "")
-	require.NoError(t, err)
-
-	start := time.Now()
 	member, err := service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 22, "")
-	elapsed := time.Since(start)
 	require.NoError(t, err)
 	require.Equal(t, 22, member.ObjectNumber)
-	require.Less(t, elapsed, 250*time.Millisecond)
-
-	var projectionCount int64
-	require.NoError(t, db.WithContext(ctx).
-		Model(&database.TargetProjection{}).
-		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", group.GitHubRepositoryID, "pull_request", 22).
-		Count(&projectionCount).Error)
-	require.Zero(t, projectionCount)
 
 	var refreshJobs []database.IndexJob
-	require.NoError(t, db.WithContext(ctx).Where("kind = ?", indexJobKindTargetProjectionRefresh).Find(&refreshJobs).Error)
-	require.Len(t, refreshJobs, 1)
-
-	drainIndexJobs(t, ctx, db, service.indexer)
-
-	require.NoError(t, db.WithContext(ctx).
-		Model(&database.TargetProjection{}).
-		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", group.GitHubRepositoryID, "pull_request", 22).
-		Count(&projectionCount).Error)
-	require.EqualValues(t, 1, projectionCount)
+	require.NoError(t, db.WithContext(ctx).Where("kind = ?", "target_projection_refresh").Find(&refreshJobs).Error)
+	require.Empty(t, refreshJobs)
 }
 
 func TestAddGroupMemberRejectsTargetAlreadyOwnedByAnotherGroup(t *testing.T) {
@@ -972,7 +889,7 @@ func TestSyncGroupCommentsUsesCommentSyncService(t *testing.T) {
 
 	dispatcher := &commentSyncDispatcherStub{}
 	_, client := newTestGitHubCommentClient(t)
-	commentSync := NewCommentSyncService(db, client, dispatcher)
+	commentSync := NewCommentSyncService(db, testMirrorClient{}, client, dispatcher)
 	service.SetCommentSync(commentSync)
 
 	result, err := service.SyncGroupComments(ctx, actor, group.PublicID)
@@ -1395,6 +1312,59 @@ func (c testMirrorClient) GetPullRequest(context.Context, string, string, int) (
 		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
 		User:      ghreplica.UserObject{Login: "bob"},
 	}, nil
+}
+
+func (c testMirrorClient) BatchGetObjects(_ context.Context, _ int64, objects []ghreplica.ObjectRef) ([]ghreplica.ObjectResult, error) {
+	if c.behavior.fail {
+		return nil, errors.New("mirror unavailable")
+	}
+	if c.behavior.calls != nil {
+		c.behavior.calls.Add(1)
+	}
+	if c.behavior.delay > 0 {
+		time.Sleep(c.behavior.delay)
+	}
+	results := make([]ghreplica.ObjectResult, 0, len(objects))
+	for _, object := range objects {
+		result := ghreplica.ObjectResult{Type: object.Type, Number: object.Number}
+		if object.Number == 999 || object.Number <= 0 {
+			results = append(results, result)
+			continue
+		}
+		summary := testObjectSummary(object.Type, object.Number)
+		result.Found = true
+		result.Summary = &summary
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+func testObjectSummary(objectType string, number int) ghreplica.ObjectSummary {
+	title := fmt.Sprintf("%s %d", strings.ReplaceAll(objectType, "_", " "), number)
+	author := "alice"
+	if objectType == "pull_request" {
+		author = "bob"
+	}
+	switch {
+	case objectType == "issue" && number == 11:
+		title = "Auth retries are flaky"
+	case objectType == "pull_request" && number == 22:
+		title = "Retry ACP turns safely"
+	}
+	return ghreplica.ObjectSummary{
+		Title:       title,
+		State:       "open",
+		HTMLURL:     testObjectURL(objectType, number),
+		AuthorLogin: author,
+		UpdatedAt:   time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func testObjectURL(objectType string, number int) string {
+	if objectType == "pull_request" {
+		return fmt.Sprintf("https://github.com/acme/widgets/pull/%d", number)
+	}
+	return fmt.Sprintf("https://github.com/acme/widgets/issues/%d", number)
 }
 
 func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, behavior batchBehavior, checker permissions.Checker) (*Service, *gorm.DB, *httptest.Server) {

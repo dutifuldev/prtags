@@ -13,6 +13,7 @@ import (
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
+	"github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/gorm"
 )
@@ -26,12 +27,12 @@ type Indexer struct {
 }
 
 type TextSearchResult struct {
-	TargetType  string                     `json:"target_type"`
-	ID          string                     `json:"id,omitempty"`
-	TargetKey   string                     `json:"target_key"`
-	Score       float64                    `json:"score"`
-	Projection  *database.TargetProjection `json:"projection,omitempty"`
-	Annotations map[string]any             `json:"annotations,omitempty"`
+	TargetType    string                    `json:"target_type"`
+	ID            string                    `json:"id,omitempty"`
+	TargetKey     string                    `json:"target_key"`
+	Score         float64                   `json:"score"`
+	ObjectSummary *GroupMemberObjectSummary `json:"object_summary,omitempty"`
+	Annotations   map[string]any            `json:"annotations,omitempty"`
 }
 
 func NewIndexer(db *gorm.DB, gh mirrorClient, provider embedding.Provider) *Indexer {
@@ -176,61 +177,10 @@ func (i *Indexer) processJob(ctx context.Context, job database.IndexJob) error {
 		if err := i.rebuildEmbedding(ctx, job); err != nil {
 			return i.markJobFailed(ctx, job.ID, err)
 		}
-	case indexJobKindTargetProjectionRefresh:
-		if err := i.refreshTargetProjection(ctx, job); err != nil {
-			return i.markJobFailed(ctx, job.ID, err)
-		}
 	default:
 		return i.markJobFailed(ctx, job.ID, fmt.Errorf("unknown job kind %q", job.Kind))
 	}
 	return i.markJobSucceeded(ctx, job.ID)
-}
-
-func (i *Indexer) refreshTargetProjection(ctx context.Context, job database.IndexJob) error {
-	number, ok := objectNumberFromTargetKey(job.TargetKey)
-	if !ok || number <= 0 {
-		return fmt.Errorf("invalid target key %q for target projection refresh", job.TargetKey)
-	}
-
-	now := time.Now().UTC()
-	model := database.TargetProjection{
-		GitHubRepositoryID: job.GitHubRepositoryID,
-		RepositoryOwner:    job.RepositoryOwner,
-		RepositoryName:     job.RepositoryName,
-		TargetType:         job.TargetType,
-		ObjectNumber:       number,
-		FetchedAt:          now,
-	}
-
-	switch job.TargetType {
-	case "pull_request":
-		pull, err := i.ghreplica.GetPullRequest(ctx, job.RepositoryOwner, job.RepositoryName, number)
-		if err != nil {
-			return err
-		}
-		model.Title = pull.Title
-		model.State = pull.State
-		model.AuthorLogin = pull.User.Login
-		model.HTMLURL = pull.HTMLURL
-		model.SourceUpdatedAt = pull.UpdatedAt.UTC()
-	case "issue":
-		issue, err := i.ghreplica.GetIssue(ctx, job.RepositoryOwner, job.RepositoryName, number)
-		if err != nil {
-			return err
-		}
-		model.Title = issue.Title
-		model.State = issue.State
-		model.AuthorLogin = issue.User.Login
-		model.HTMLURL = issue.HTMLURL
-		model.SourceUpdatedAt = issue.UpdatedAt.UTC()
-	default:
-		return fmt.Errorf("unsupported target type %q for target projection refresh", job.TargetType)
-	}
-
-	return i.db.WithContext(ctx).
-		Where("github_repository_id = ? AND target_type = ? AND object_number = ?", job.GitHubRepositoryID, job.TargetType, number).
-		Assign(model).
-		FirstOrCreate(&model).Error
 }
 
 func (i *Indexer) rebuildSearchDocument(ctx context.Context, job database.IndexJob) error {
@@ -572,12 +522,13 @@ func (s *Service) populateObjectSearchResult(ctx context.Context, repositoryID i
 	if !ok {
 		return result, nil
 	}
-	var projection database.TargetProjection
-	err := s.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).First(&projection).Error
+	summaries, err := s.mirrorObjectSummaries(ctx, repositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: number}})
 	if err != nil {
-		return result, nil
+		return TextSearchResult{}, err
 	}
-	result.Projection = &projection
+	if summary, ok := summaries[targetKey]; ok {
+		result.ObjectSummary = &summary
+	}
 	annotations, err := s.getAnnotationsForTarget(ctx, targetType, repositoryID, number, nil)
 	if err != nil {
 		return TextSearchResult{}, err
@@ -616,16 +567,18 @@ func (i *Indexer) objectSearchParts(ctx context.Context, repositoryID int64, tar
 	if !ok {
 		return nil, time.Now().UTC(), nil
 	}
-	var projection database.TargetProjection
-	err := i.db.WithContext(ctx).Where("github_repository_id = ? AND target_type = ? AND object_number = ?", repositoryID, targetType, number).First(&projection).Error
+	results, err := i.ghreplica.BatchGetObjects(ctx, repositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: number}})
 	if err != nil {
+		return nil, time.Now().UTC(), err
+	}
+	if len(results) == 0 || !results[0].Found || results[0].Summary == nil {
 		return nil, time.Now().UTC(), nil
 	}
 	parts := []string{}
-	if strings.TrimSpace(projection.Title) != "" {
-		parts = append(parts, projection.Title)
+	if strings.TrimSpace(results[0].Summary.Title) != "" {
+		parts = append(parts, results[0].Summary.Title)
 	}
-	return parts, projection.SourceUpdatedAt, nil
+	return parts, results[0].Summary.UpdatedAt.UTC(), nil
 }
 
 func (i *Indexer) groupSearchParts(ctx context.Context, targetKey string) ([]string, time.Time, error) {

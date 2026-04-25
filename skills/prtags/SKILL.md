@@ -21,8 +21,8 @@ It depends on `ghreplica`.
 - group membership
 - field definitions
 - annotation values
-- cached target projections for lightweight object metadata
 - search and similarity indexes over curated metadata
+- outbound GitHub comment sync state
 
 ## Boundary rule
 
@@ -45,28 +45,24 @@ Metadata is opt-in:
 When metadata is requested, `prtags` returns:
 
 - `object_summary`
-- `object_summary_freshness`
 
 When metadata is not requested, those fields should be omitted, not `null`.
 
 ## Group metadata behavior
 
-Metadata reads should stay cache-first through `target_projections`.
+Metadata reads should use direct reads from the shared `ghreplica` mirror tables.
 
-If a projection is missing or stale:
+If mirror metadata is missing:
 
-- return the cached result already available
-- or return refs only if metadata was not requested
-- queue a background `target_projection_refresh` job
-- do not block the read path on a live `ghreplica` fetch
+- omit `object_summary` for that member
+- do not create a local PR or issue metadata cache
+- do not queue a metadata refresh job
 
 ## Group write behavior
 
-`group add-pr` and `group add-issue` should succeed from stable refs first.
+`group add-pr` and `group add-issue` should validate the target against the shared `ghreplica` mirror tables.
 
-They should not block on live `ghreplica` reads before the write succeeds.
-
-Projection refresh should happen afterward through background jobs.
+They should not create local PR or issue metadata projection rows.
 
 ## CLI patterns
 

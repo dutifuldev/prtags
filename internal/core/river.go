@@ -18,17 +18,15 @@ import (
 )
 
 const (
-	queueTargetProjectionRefresh = "target_projection_refresh"
-	queueSearchDocumentRebuild   = "search_document_rebuild"
-	queueEmbeddingRebuild        = "embedding_rebuild"
-	queueGroupCommentProject     = "group_comment_project"
-	queueGroupCommentReconcile   = "group_comment_reconcile"
-	queueGroupCommentRepair      = "group_comment_repair"
-	defaultRetryCap              = 30 * time.Minute
+	queueSearchDocumentRebuild = "search_document_rebuild"
+	queueEmbeddingRebuild      = "embedding_rebuild"
+	queueGroupCommentProject   = "group_comment_project"
+	queueGroupCommentReconcile = "group_comment_reconcile"
+	queueGroupCommentRepair    = "group_comment_repair"
+	defaultRetryCap            = 30 * time.Minute
 )
 
 type JobDispatcher interface {
-	EnqueueTargetProjectionRefreshTx(tx *gorm.DB, group database.Group, target targetRef) error
 	EnqueueRebuildsTx(tx *gorm.DB, repository database.RepositoryProjection, target targetRef, sourceUpdatedAt time.Time) error
 	EnqueueGroupCommentProjectTx(tx *gorm.DB, eventID uint) error
 	EnqueueGroupCommentReconcileTx(tx *gorm.DB, syncTargetID uint, desiredRevision int, scheduledAt time.Time, verify bool) error
@@ -42,16 +40,6 @@ type RiverDispatcher struct {
 	indexer     *Indexer
 	commentSync *CommentSyncService
 }
-
-type TargetProjectionRefreshArgs struct {
-	RepositoryID int64  `json:"repository_id" river:"unique"`
-	Owner        string `json:"owner"`
-	Name         string `json:"name"`
-	TargetType   string `json:"target_type" river:"unique"`
-	TargetKey    string `json:"target_key" river:"unique"`
-}
-
-func (TargetProjectionRefreshArgs) Kind() string { return indexJobKindTargetProjectionRefresh }
 
 type SearchDocumentRebuildArgs struct {
 	RepositoryID int64  `json:"repository_id" river:"unique"`
@@ -92,21 +80,6 @@ type GroupCommentRepairArgs struct {
 }
 
 func (GroupCommentRepairArgs) Kind() string { return "group_comment_sync_repair" }
-
-type targetProjectionRefreshWorker struct {
-	river.WorkerDefaults[TargetProjectionRefreshArgs]
-	indexer *Indexer
-}
-
-func (w *targetProjectionRefreshWorker) Work(ctx context.Context, job *river.Job[TargetProjectionRefreshArgs]) error {
-	return w.indexer.refreshTargetProjection(ctx, database.IndexJob{
-		GitHubRepositoryID: job.Args.RepositoryID,
-		RepositoryOwner:    job.Args.Owner,
-		RepositoryName:     job.Args.Name,
-		TargetType:         job.Args.TargetType,
-		TargetKey:          job.Args.TargetKey,
-	})
-}
 
 type searchDocumentRebuildWorker struct {
 	river.WorkerDefaults[SearchDocumentRebuildArgs]
@@ -175,15 +148,13 @@ func (w *groupCommentRepairWorker) Work(ctx context.Context, job *river.Job[Grou
 
 func NewRiverDispatcher(sqlDB *sql.DB, indexer *Indexer, commentSync *CommentSyncService) (*RiverDispatcher, error) {
 	workers := river.NewWorkers()
-	river.AddWorker(workers, &targetProjectionRefreshWorker{indexer: indexer})
 	river.AddWorker(workers, &searchDocumentRebuildWorker{indexer: indexer})
 	river.AddWorker(workers, &embeddingRebuildWorker{indexer: indexer})
 
 	periodicJobs := []*river.PeriodicJob{}
 	queues := map[string]river.QueueConfig{
-		queueTargetProjectionRefresh: {MaxWorkers: 2},
-		queueSearchDocumentRebuild:   {MaxWorkers: 2},
-		queueEmbeddingRebuild:        {MaxWorkers: 1},
+		queueSearchDocumentRebuild: {MaxWorkers: 2},
+		queueEmbeddingRebuild:      {MaxWorkers: 1},
 	}
 
 	if commentSync != nil && commentSync.Enabled() {
@@ -230,30 +201,6 @@ func (d *RiverDispatcher) Start(ctx context.Context) error {
 
 func (d *RiverDispatcher) Stop(ctx context.Context) error {
 	return d.client.Stop(ctx)
-}
-
-func (d *RiverDispatcher) EnqueueTargetProjectionRefreshTx(tx *gorm.DB, group database.Group, target targetRef) error {
-	if target.TargetType != "pull_request" && target.TargetType != "issue" {
-		return nil
-	}
-	if target.TargetKey == "" {
-		return nil
-	}
-	sqlTx, err := sqlTxFromGorm(tx)
-	if err != nil {
-		return err
-	}
-	_, err = d.client.InsertTx(tx.Statement.Context, sqlTx, TargetProjectionRefreshArgs{
-		RepositoryID: group.GitHubRepositoryID,
-		Owner:        group.RepositoryOwner,
-		Name:         group.RepositoryName,
-		TargetType:   target.TargetType,
-		TargetKey:    target.TargetKey,
-	}, &river.InsertOpts{
-		Queue:      queueTargetProjectionRefresh,
-		UniqueOpts: uniqueActiveJobOpts(),
-	})
-	return err
 }
 
 func (d *RiverDispatcher) EnqueueRebuildsTx(tx *gorm.DB, repository database.RepositoryProjection, target targetRef, sourceUpdatedAt time.Time) error {
@@ -354,6 +301,9 @@ func (d *RiverDispatcher) importLegacyIndexJobsTx(ctx context.Context, tx *gorm.
 	for _, job := range jobs {
 		if err := d.importLegacyIndexJob(ctx, sqlTx, job); err != nil {
 			if errors.Is(err, errUnsupportedLegacyJobKind) {
+				if err := markLegacyIndexJobMigrated(tx, job.ID, now); err != nil {
+					return err
+				}
 				continue
 			}
 			return err
@@ -381,15 +331,6 @@ var errUnsupportedLegacyJobKind = errors.New("unsupported legacy job kind")
 
 func (d *RiverDispatcher) importLegacyIndexJob(ctx context.Context, sqlTx *sql.Tx, job database.IndexJob) error {
 	switch job.Kind {
-	case indexJobKindTargetProjectionRefresh:
-		_, err := d.client.InsertTx(ctx, sqlTx, TargetProjectionRefreshArgs{
-			RepositoryID: job.GitHubRepositoryID,
-			Owner:        job.RepositoryOwner,
-			Name:         job.RepositoryName,
-			TargetType:   job.TargetType,
-			TargetKey:    job.TargetKey,
-		}, &river.InsertOpts{Queue: queueTargetProjectionRefresh, UniqueOpts: uniqueActiveJobOpts()})
-		return err
 	case "search_document_rebuild":
 		_, err := d.client.InsertTx(ctx, sqlTx, SearchDocumentRebuildArgs{
 			RepositoryID: job.GitHubRepositoryID,
