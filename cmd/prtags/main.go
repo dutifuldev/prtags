@@ -438,7 +438,7 @@ func newFieldCommand(serverURL *string) *cobra.Command {
 				return err
 			}
 			desired := parseDesiredFieldDefinition(cobraFlagReader{cmd: cmd})
-			fields, err := fetchFieldDefinitions(context.Background(), *serverURL, owner, name)
+			fields, err := fetchFieldDefinitionsForEnsure(context.Background(), *serverURL, owner, name)
 			if err != nil {
 				return err
 			}

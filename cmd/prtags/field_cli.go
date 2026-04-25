@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -77,6 +79,18 @@ func fetchFieldDefinitions(ctx context.Context, serverURL, owner, repo string) (
 		return nil, err
 	}
 	return fields, nil
+}
+
+func fetchFieldDefinitionsForEnsure(ctx context.Context, serverURL, owner, repo string) ([]fieldDefinitionView, error) {
+	fields, err := fetchFieldDefinitions(ctx, serverURL, owner, repo)
+	if err == nil {
+		return fields, nil
+	}
+	var httpErr *cli.HTTPError
+	if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
+		return []fieldDefinitionView{}, nil
+	}
+	return nil, err
 }
 
 func createFieldDefinition(ctx context.Context, serverURL, owner, repo string, payload map[string]any) (fieldDefinitionView, error) {

@@ -58,6 +58,39 @@ func TestFieldEnsureCreatesMissingField(t *testing.T) {
 	require.Equal(t, "created", envelope.Data.Action)
 }
 
+func TestFieldEnsureCreatesWhenInitialFieldListIsNotFound(t *testing.T) {
+	t.Helper()
+	var createPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/repos/acme/widgets/fields":
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(jsend.Fail(map[string]any{"message": "not found"}))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/repos/acme/widgets/fields":
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&createPayload))
+			_ = json.NewEncoder(w).Encode(jsend.Success(map[string]any{
+				"id":               9,
+				"name":             "intent",
+				"display_name":     "intent",
+				"object_scope":     "pull_request",
+				"field_type":       "text",
+				"enum_values_json": []string{},
+				"is_searchable":    true,
+				"is_vectorized":    true,
+			}))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	stdout, stderr, err := runCLI(t, server.URL, "field", "ensure", "-R", "acme/widgets", "--name", "intent", "--scope", "pull_request", "--type", "text", "--searchable", "--vectorized")
+	require.NoError(t, err, stderr)
+	require.Equal(t, "intent", createPayload["name"])
+	require.Contains(t, stdout, `"action": "created"`)
+}
+
 func TestFieldEnsureNoopWhenFieldAlreadyMatches(t *testing.T) {
 	t.Helper()
 	requests := 0

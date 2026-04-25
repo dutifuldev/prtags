@@ -21,6 +21,15 @@ type Client struct {
 	actorID    string
 }
 
+type HTTPError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("request failed (%d): %s", e.StatusCode, strings.TrimSpace(e.Body))
+}
+
 func NewClient(baseURL string) *Client {
 	authToken := strings.TrimSpace(firstNonEmptyEnv("PRTAGS_GITHUB_TOKEN"))
 	if authToken == "" {
@@ -70,7 +79,7 @@ func (c *Client) do(req *http.Request) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("request failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Body: string(raw)}
 	}
 	return raw, nil
 }
