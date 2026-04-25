@@ -196,7 +196,7 @@ func (s *Service) readRepositoryProjection(ctx context.Context, owner, repo stri
 
 	mirrorRepository, err := s.ghreplica.GetRepository(ctx, owner, repo)
 	if err != nil {
-		return database.RepositoryProjection{}, ErrNotFound
+		return database.RepositoryProjection{}, translateDBError(err)
 	}
 	if _, err := s.lookupRepositoryProjectionByGitHubID(ctx, mirrorRepository.ID); err != nil {
 		return database.RepositoryProjection{}, translateDBError(err)
