@@ -816,12 +816,16 @@ func (s *Service) AddGroupMember(ctx context.Context, actor permissions.Actor, g
 	if err := validateMemberType(group.Kind, objectType); err != nil {
 		return database.GroupMember{}, err
 	}
+	target, err := s.resolveTarget(ctx, repository, objectType, objectNumber, nil)
+	if err != nil {
+		return database.GroupMember{}, err
+	}
 	member := database.GroupMember{
 		GroupID:            group.ID,
 		GitHubRepositoryID: group.GitHubRepositoryID,
-		ObjectType:         objectType,
-		ObjectNumber:       objectNumber,
-		TargetKey:          objectTargetKey(group.GitHubRepositoryID, objectType, objectNumber),
+		ObjectType:         target.TargetType,
+		ObjectNumber:       target.ObjectNumber,
+		TargetKey:          target.TargetKey,
 		AddedBy:            actor.ID,
 		AddedAt:            time.Now().UTC(),
 	}

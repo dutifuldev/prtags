@@ -320,6 +320,26 @@ func TestAddGroupMemberDoesNotCreateProjectionRefreshJobs(t *testing.T) {
 	require.Empty(t, refreshJobs)
 }
 
+func TestAddGroupMemberRejectsMissingMirrorTarget(t *testing.T) {
+	ctx := context.Background()
+	service, db, server := newTestService(t)
+	defer server.Close()
+
+	actor := permissions.Actor{Type: "user", ID: "tester"}
+	group, err := service.CreateGroup(ctx, actor, "acme", "widgets", GroupInput{
+		Kind:  "pull_request",
+		Title: "Auth work",
+	}, "")
+	require.NoError(t, err)
+
+	_, err = service.AddGroupMember(ctx, actor, group.PublicID, "pull_request", 999, "")
+	require.ErrorIs(t, err, ErrNotFound)
+
+	var count int64
+	require.NoError(t, db.WithContext(ctx).Model(&database.GroupMember{}).Where("group_id = ?", group.ID).Count(&count).Error)
+	require.Zero(t, count)
+}
+
 func TestAddGroupMemberRejectsTargetAlreadyOwnedByAnotherGroup(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestService(t)
