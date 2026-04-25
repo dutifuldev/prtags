@@ -45,7 +45,7 @@ func (s *Service) UpsertRepositoryAccessGrant(ctx context.Context, owner, repo s
 }
 
 func (s *Service) ListRepositoryAccessGrants(ctx context.Context, owner, repo string) ([]database.RepositoryAccessGrant, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}

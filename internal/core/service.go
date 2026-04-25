@@ -174,6 +174,9 @@ func (s *Service) SetCommentSync(commentSync *CommentSyncService) {
 }
 
 func (s *Service) EnsureRepository(ctx context.Context, owner, repo string) (database.RepositoryProjection, error) {
+	timer := database.StartQueryStep(ctx, "repo_ensure")
+	defer timer.Done()
+
 	repository, err := s.ghreplica.GetRepository(ctx, owner, repo)
 	if err != nil {
 		return database.RepositoryProjection{}, err
@@ -194,6 +197,14 @@ func (s *Service) EnsureRepository(ctx context.Context, owner, repo string) (dat
 		return database.RepositoryProjection{}, err
 	}
 	return model, nil
+}
+
+func (s *Service) readRepositoryProjection(ctx context.Context, owner, repo string) (database.RepositoryProjection, error) {
+	timer := database.StartQueryStep(ctx, "repo_read")
+	defer timer.Done()
+
+	repository, err := s.lookupRepositoryProjection(ctx, owner, repo)
+	return repository, translateDBError(err)
 }
 
 func (s *Service) requireWrite(ctx context.Context, actor permissions.Actor, repo database.RepositoryProjection) error {
@@ -284,11 +295,13 @@ func (s *Service) CreateFieldDefinition(ctx context.Context, actor permissions.A
 }
 
 func (s *Service) ListFieldDefinitions(ctx context.Context, owner, repo string) ([]database.FieldDefinition, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}
 	var fields []database.FieldDefinition
+	timer := database.StartQueryStep(ctx, "fields_list")
+	defer timer.Done()
 	err = s.db.WithContext(ctx).
 		Where("github_repository_id = ?", repository.GitHubRepositoryID).
 		Order("sort_order ASC, name ASC").
@@ -740,7 +753,7 @@ func (s *Service) UpdateGroup(ctx context.Context, actor permissions.Actor, grou
 }
 
 func (s *Service) ListGroups(ctx context.Context, owner, repo string) ([]GroupListView, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -780,9 +793,12 @@ func (s *Service) GetGroup(ctx context.Context, groupPublicID string, options Ge
 	}
 
 	var members []database.GroupMember
+	membersTimer := database.StartQueryStep(ctx, "group_members")
 	if err := s.db.WithContext(ctx).Where("group_id = ?", group.ID).Order("id ASC").Find(&members).Error; err != nil {
+		membersTimer.Done()
 		return database.Group{}, nil, nil, err
 	}
+	membersTimer.Done()
 
 	memberViews := make([]GroupMemberView, 0, len(members))
 	if options.IncludeMetadata {
@@ -1047,9 +1063,9 @@ func (s *Service) SyncGroupComments(ctx context.Context, actor permissions.Actor
 }
 
 func (s *Service) ListGroupCommentSyncTargets(ctx context.Context, actor permissions.Actor, owner, repo string) ([]GroupCommentSyncTargetStatusView, error) {
-	repository, err := s.lookupRepositoryProjection(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
-		return nil, translateDBError(err)
+		return nil, err
 	}
 	if err := s.requireWrite(ctx, actor, repository); err != nil {
 		return nil, err
@@ -1286,7 +1302,7 @@ func (s *Service) appendFieldValueEventTx(tx *gorm.DB, repositoryID int64, targe
 }
 
 func (s *Service) GetAnnotations(ctx context.Context, owner, repo, targetType string, objectNumber int, groupID *uint) (AnnotationSetResult, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return AnnotationSetResult{}, err
 	}
@@ -1305,7 +1321,7 @@ func (s *Service) GetAnnotations(ctx context.Context, owner, repo, targetType st
 }
 
 func (s *Service) FilterTargets(ctx context.Context, owner, repo, targetType, fieldName string, rawValue string) ([]TargetFilterResult, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -1464,10 +1480,33 @@ func groupIDsForFieldValues(values []database.FieldValue) []uint {
 	return ids
 }
 
+func groupPublicIDsForSearchRows(rows []scoredSearchTarget) []string {
+	ids := make([]string, 0, len(rows))
+	seen := map[string]struct{}{}
+	for _, row := range rows {
+		if row.TargetType != "group" {
+			continue
+		}
+		id, ok := groupPublicIDFromTargetKey(row.TargetKey)
+		if !ok {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (s *Service) groupsByID(ctx context.Context, ids []uint) (map[uint]database.Group, error) {
 	if len(ids) == 0 {
 		return map[uint]database.Group{}, nil
 	}
+	timer := database.StartQueryStep(ctx, "groups_batch")
+	defer timer.Done()
+
 	var groups []database.Group
 	if err := s.db.WithContext(ctx).Where("id IN ?", ids).Find(&groups).Error; err != nil {
 		return nil, err
@@ -1475,6 +1514,24 @@ func (s *Service) groupsByID(ctx context.Context, ids []uint) (map[uint]database
 	byID := make(map[uint]database.Group, len(groups))
 	for _, group := range groups {
 		byID[group.ID] = group
+	}
+	return byID, nil
+}
+
+func (s *Service) groupsByPublicID(ctx context.Context, publicIDs []string) (map[string]database.Group, error) {
+	if len(publicIDs) == 0 {
+		return map[string]database.Group{}, nil
+	}
+	timer := database.StartQueryStep(ctx, "groups_batch")
+	defer timer.Done()
+
+	var groups []database.Group
+	if err := s.db.WithContext(ctx).Where("public_id IN ?", publicIDs).Find(&groups).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[string]database.Group, len(groups))
+	for _, group := range groups {
+		byID[group.PublicID] = group
 	}
 	return byID, nil
 }
@@ -1503,6 +1560,9 @@ func filteredTargetResultFromHydration(value database.FieldValue, summaries map[
 }
 
 func (s *Service) getAnnotationsForTarget(ctx context.Context, targetType string, repositoryID int64, objectNumber int, groupID *uint) (map[string]any, error) {
+	timer := database.StartQueryStep(ctx, "annotations_single")
+	defer timer.Done()
+
 	targetKey := objectTargetKey(repositoryID, targetType, objectNumber)
 	if targetType == "group" && groupID != nil {
 		group, err := s.lookupGroupByID(ctx, *groupID)
@@ -1559,6 +1619,8 @@ func (s *Service) getAnnotationsForTargetKeys(ctx context.Context, repositoryID 
 	if len(filters.targetKeys) == 0 {
 		return filters.result, nil
 	}
+	timer := database.StartQueryStep(ctx, "annotations_batch")
+	defer timer.Done()
 
 	var values []database.FieldValue
 	if err := s.db.WithContext(ctx).Preload("FieldDefinition").
@@ -1731,6 +1793,9 @@ func mirrorObjectRefsForMembers(members []database.GroupMember) []ghreplica.Obje
 }
 
 func (s *Service) mirrorObjectSummaries(ctx context.Context, repositoryID int64, refs []ghreplica.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
+	timer := database.StartQueryStep(ctx, "mirror_batch_objects")
+	defer timer.Done()
+
 	results, err := s.ghreplica.BatchGetObjects(ctx, repositoryID, refs)
 	if err != nil {
 		return nil, err
@@ -2372,12 +2437,18 @@ func intValueOrZero(value *int) int {
 }
 
 func (s *Service) lookupGroupByID(ctx context.Context, groupID uint) (database.Group, error) {
+	timer := database.StartQueryStep(ctx, "group_lookup")
+	defer timer.Done()
+
 	var group database.Group
 	err := s.db.WithContext(ctx).First(&group, groupID).Error
 	return group, err
 }
 
 func (s *Service) lookupGroupByPublicID(ctx context.Context, groupPublicID string) (database.Group, error) {
+	timer := database.StartQueryStep(ctx, "group_lookup")
+	defer timer.Done()
+
 	var group database.Group
 	err := s.db.WithContext(ctx).
 		Where("public_id = ?", strings.TrimSpace(groupPublicID)).

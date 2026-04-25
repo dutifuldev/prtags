@@ -46,7 +46,7 @@ func NewIndexer(db *gorm.DB, gh mirrorClient, provider embedding.Provider) *Inde
 }
 
 func (s *Service) SearchText(ctx context.Context, owner, repo, query string, targetTypes []string, limit int) ([]TextSearchResult, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -59,7 +59,7 @@ func (s *Service) SearchText(ctx context.Context, owner, repo, query string, tar
 }
 
 func (s *Service) SearchSimilar(ctx context.Context, owner, repo, query string, targetTypes []string, limit int) ([]TextSearchResult, error) {
-	repository, err := s.EnsureRepository(ctx, owner, repo)
+	repository, err := s.readRepositoryProjection(ctx, owner, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -385,6 +385,9 @@ func normalizeSearchRequest(limit int, targetTypes []string) (int, []string) {
 }
 
 func (s *Service) searchTextRows(ctx context.Context, repositoryID int64, query string, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	timer := database.StartQueryStep(ctx, "search_text_rows")
+	defer timer.Done()
+
 	if s.db.Name() == "postgres" {
 		return s.searchTextRowsPostgres(ctx, repositoryID, query, targetTypes, limit)
 	}
@@ -439,6 +442,9 @@ func (s *Service) searchTextRowsFallback(ctx context.Context, repositoryID int64
 }
 
 func (s *Service) searchSimilarRows(ctx context.Context, repositoryID int64, queryVector []float32, targetTypes []string, limit int) ([]scoredSearchTarget, error) {
+	timer := database.StartQueryStep(ctx, "search_similar_rows")
+	defer timer.Done()
+
 	if s.db.Name() == "postgres" {
 		return s.searchSimilarRowsPostgres(ctx, repositoryID, queryVector, targetTypes, limit)
 	}
@@ -515,6 +521,10 @@ func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, 
 	if err != nil {
 		return nil, err
 	}
+	groups, err := s.groupsByPublicID(ctx, groupPublicIDsForSearchRows(rows))
+	if err != nil {
+		return nil, err
+	}
 	for _, row := range rows {
 		result := TextSearchResult{
 			TargetType: row.TargetType,
@@ -522,7 +532,7 @@ func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, 
 			Score:      row.Score,
 		}
 		if row.TargetType == "group" {
-			result, err = s.populateGroupSearchResultWithAnnotations(ctx, row.TargetKey, result, annotations)
+			result, err = s.populateGroupSearchResultWithHydration(row.TargetKey, result, annotations, groups)
 		} else {
 			result, err = s.populateObjectSearchResultWithHydration(row.TargetType, row.TargetKey, result, summaries, annotations)
 		}
@@ -609,6 +619,20 @@ func (s *Service) populateGroupSearchResultWithAnnotations(ctx context.Context, 
 	group, err := s.lookupGroupByPublicID(ctx, groupPublicID)
 	if err != nil {
 		return TextSearchResult{}, translateDBError(err)
+	}
+	result.ID = group.PublicID
+	result.Annotations = annotations[annotationMapKey("group", groupTargetKey(group.PublicID))]
+	return result, nil
+}
+
+func (s *Service) populateGroupSearchResultWithHydration(targetKey string, result TextSearchResult, annotations map[string]map[string]any, groups map[string]database.Group) (TextSearchResult, error) {
+	groupPublicID, ok := groupPublicIDFromTargetKey(targetKey)
+	if !ok {
+		return result, nil
+	}
+	group, ok := groups[groupPublicID]
+	if !ok {
+		return TextSearchResult{}, ErrNotFound
 	}
 	result.ID = group.PublicID
 	result.Annotations = annotations[annotationMapKey("group", groupTargetKey(group.PublicID))]

@@ -98,6 +98,7 @@ func (s *Server) requestMetricsMiddleware(next echo.HandlerFunc) echo.HandlerFun
 				"db_query_count", snapshot.QueryCount,
 				"db_duration_ms", durationMillis(snapshot.QueryDuration),
 				"db_slowest_ms", durationMillis(snapshot.SlowestQuery),
+				"steps", snapshot.Steps,
 			)
 		}
 		return err

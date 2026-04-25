@@ -104,4 +104,13 @@ func TestQueryMetricsRecordContextAndLogger(t *testing.T) {
 	}, nil)
 
 	require.Equal(t, 3, metrics.Snapshot().QueryCount)
+
+	metrics.RecordStep("repo_read", 2*time.Millisecond)
+	metrics.RecordStep("search_text_rows", 1500*time.Microsecond)
+	step := StartQueryStep(ctx, "annotations_batch")
+	step.Done()
+	snapshot = metrics.Snapshot()
+	require.Contains(t, snapshot.Steps, "annotations_batch=")
+	require.Contains(t, snapshot.Steps, "repo_read=2.0ms")
+	require.Contains(t, snapshot.Steps, "search_text_rows=1.5ms")
 }

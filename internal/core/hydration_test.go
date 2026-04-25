@@ -77,6 +77,26 @@ func TestSearchHydrationHelpersCoverInvalidAndGroupTargets(t *testing.T) {
 	require.Equal(t, group.PublicID, groupResult.ID)
 	require.Equal(t, "auth", groupResult.Annotations["theme"])
 
+	require.Equal(t, []string{group.PublicID}, groupPublicIDsForSearchRows([]scoredSearchTarget{
+		{TargetType: "group", TargetKey: groupTargetKey(group.PublicID)},
+		{TargetType: "group", TargetKey: groupTargetKey(group.PublicID)},
+		{TargetType: "pull_request", TargetKey: objectTargetKey(101, "pull_request", 22)},
+		{TargetType: "group", TargetKey: "bad-key"},
+	}))
+	emptyGroups, err := service.groupsByPublicID(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, emptyGroups)
+	groups, err := service.groupsByPublicID(ctx, []string{group.PublicID})
+	require.NoError(t, err)
+	require.Equal(t, group.PublicID, groups[group.PublicID].PublicID)
+	groupHydrated, err := service.populateGroupSearchResultWithHydration(groupTargetKey(group.PublicID), TextSearchResult{TargetType: "group", TargetKey: groupTargetKey(group.PublicID)}, annotations, groups)
+	require.NoError(t, err)
+	require.Equal(t, group.PublicID, groupHydrated.ID)
+	require.Equal(t, "auth", groupHydrated.Annotations["theme"])
+
+	_, err = service.populateGroupSearchResultWithHydration(groupTargetKey("missing"), TextSearchResult{TargetType: "group", TargetKey: groupTargetKey("missing")}, annotations, groups)
+	require.ErrorIs(t, err, ErrNotFound)
+
 	invalidGroup, err := service.populateGroupSearchResultWithAnnotations(ctx, "bad-key", TextSearchResult{TargetKey: "bad-key"}, annotations)
 	require.NoError(t, err)
 	require.Empty(t, invalidGroup.ID)

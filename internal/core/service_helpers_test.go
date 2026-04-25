@@ -1062,8 +1062,9 @@ func TestPermissionRepositoryAndGrantHelperBranches(t *testing.T) {
 	require.Equal(t, "alice", grants[0].GitHubLogin)
 	require.Equal(t, "zoe", grants[1].GitHubLogin)
 
-	_, err = badService.ListRepositoryAccessGrants(ctx, "acme", "widgets")
-	require.Error(t, err)
+	grants, err = badService.ListRepositoryAccessGrants(ctx, "acme", "widgets")
+	require.NoError(t, err)
+	require.Len(t, grants, 2)
 }
 
 func TestEventMirrorAndConflictHelperBranches(t *testing.T) {

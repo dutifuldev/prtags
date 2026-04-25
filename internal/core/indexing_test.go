@@ -358,6 +358,8 @@ func TestIndexerAdditionalHelperAndErrorBranches(t *testing.T) {
 	_, err = badService.SearchSimilar(ctx, "acme", "widgets", "auth", nil, 0)
 	require.Error(t, err)
 
+	_, err = service.EnsureRepository(ctx, "acme", "widgets")
+	require.NoError(t, err)
 	failingIndexer := NewIndexer(db, testMirrorClient{}, failingEmbeddingProvider{})
 	failingService := NewService(db, testMirrorClient{}, permissions.AllowAllChecker{}, failingIndexer)
 	_, err = failingService.SearchSimilar(ctx, "acme", "widgets", "auth", []string{"pull_request"}, 5)
