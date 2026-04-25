@@ -20,6 +20,9 @@ GITHUB_APP_PRIVATE_KEY_PATH=/home/bob/prtags/secrets/github-app.private-key.pem
 The shared Cloud SQL instance is connection-limited, so keep the default pool settings conservative unless you have intentionally split workers or moved the database:
 
 ```env
+DB_NAME=ghreplica
+PRTAGS_SCHEMA=prtags
+GHREPLICA_SCHEMA=public
 DB_MAX_OPEN_CONNS=5
 DB_MAX_IDLE_CONNS=2
 DB_CONN_MAX_IDLE_TIME=5m

@@ -12,7 +12,6 @@ import (
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -221,14 +220,11 @@ func newPostgresTestServiceWithBatchOptions(t *testing.T, behavior batchBehavior
 	require.NoError(t, err)
 	require.NoError(t, database.RunMigrations(db))
 
-	server := newTestGHReplicaServer(t, behavior)
-	ghClient := ghreplica.NewClient(server.URL)
+	ghClient := testMirrorClient{behavior: behavior}
 	indexer := NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 
 	t.Cleanup(func() {
-		server.Close()
-
 		sqlDB, err := db.DB()
 		require.NoError(t, err)
 		require.NoError(t, sqlDB.Close())

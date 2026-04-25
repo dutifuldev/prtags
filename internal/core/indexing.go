@@ -13,14 +13,13 @@ import (
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/gorm"
 )
 
 type Indexer struct {
 	db        *gorm.DB
-	ghreplica *ghreplica.Client
+	ghreplica mirrorClient
 	embedding embedding.Provider
 	owner     string
 	leaseTTL  time.Duration
@@ -35,7 +34,7 @@ type TextSearchResult struct {
 	Annotations map[string]any             `json:"annotations,omitempty"`
 }
 
-func NewIndexer(db *gorm.DB, gh *ghreplica.Client, provider embedding.Provider) *Indexer {
+func NewIndexer(db *gorm.DB, gh mirrorClient, provider embedding.Provider) *Indexer {
 	return &Indexer{
 		db:        db,
 		ghreplica: gh,

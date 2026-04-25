@@ -9,7 +9,8 @@ import (
 
 func TestFromEnvParsesDatabasePoolSettings(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://example")
-	t.Setenv("GHREPLICA_BASE_URL", "https://ghreplica.example")
+	t.Setenv("PRTAGS_SCHEMA", "prtags")
+	t.Setenv("GHREPLICA_SCHEMA", "ghreplica")
 	t.Setenv("DB_MAX_OPEN_CONNS", "7")
 	t.Setenv("DB_MAX_IDLE_CONNS", "3")
 	t.Setenv("DB_CONN_MAX_IDLE_TIME", "90s")
@@ -20,6 +21,8 @@ func TestFromEnvParsesDatabasePoolSettings(t *testing.T) {
 	require.Equal(t, 3, cfg.DBMaxIdleConns)
 	require.Equal(t, 90*time.Second, cfg.DBConnMaxIdleTime)
 	require.Equal(t, 45*time.Minute, cfg.DBConnMaxLifetime)
+	require.Equal(t, "prtags", cfg.PRTagsSchema)
+	require.Equal(t, "ghreplica", cfg.GHReplicaSchema)
 	require.NoError(t, cfg.Validate())
 }
 
@@ -30,7 +33,8 @@ func TestValidateRejectsInvalidDatabasePoolSettings(t *testing.T) {
 		DBMaxIdleConns:     3,
 		DBConnMaxIdleTime:  time.Minute,
 		DBConnMaxLifetime:  time.Minute,
-		GHReplicaBaseURL:   "https://ghreplica.example",
+		PRTagsSchema:       "public",
+		GHReplicaSchema:    "public",
 		WorkerPollInterval: time.Second,
 		EmbeddingModel:     "local-hash@1",
 	}
@@ -54,7 +58,8 @@ func TestConfigHelpersAndGitHubAppValidation(t *testing.T) {
 		DBMaxIdleConns:          1,
 		DBConnMaxIdleTime:       time.Minute,
 		DBConnMaxLifetime:       time.Minute,
-		GHReplicaBaseURL:        "https://ghreplica.example",
+		PRTagsSchema:            "public",
+		GHReplicaSchema:         "public",
 		WorkerPollInterval:      time.Second,
 		EmbeddingModel:          "local-hash@1",
 		GitHubAppID:             "1",
@@ -77,7 +82,8 @@ func TestConfigHelpersAndGitHubAppValidation(t *testing.T) {
 func TestConfigValidationErrors(t *testing.T) {
 	require.ErrorContains(t, validateDatabase(Config{}), "DATABASE_URL is required")
 	require.ErrorContains(t, validatePool(Config{DBMaxOpenConns: 0, DBMaxIdleConns: 0, DBConnMaxIdleTime: time.Second, DBConnMaxLifetime: time.Second}), "DB_MAX_OPEN_CONNS")
-	require.ErrorContains(t, validateReplicaAndWorker(Config{GHReplicaBaseURL: "", WorkerPollInterval: time.Second}), "GHREPLICA_BASE_URL is required")
-	require.ErrorContains(t, validateReplicaAndWorker(Config{GHReplicaBaseURL: "https://ghreplica.example"}), "WORKER_POLL_INTERVAL")
+	require.ErrorContains(t, validateSchemasAndWorker(Config{PRTagsSchema: "bad-schema", GHReplicaSchema: "public", WorkerPollInterval: time.Second}), "PRTAGS_SCHEMA")
+	require.ErrorContains(t, validateSchemasAndWorker(Config{PRTagsSchema: "public", GHReplicaSchema: "bad-schema", WorkerPollInterval: time.Second}), "GHREPLICA_SCHEMA")
+	require.ErrorContains(t, validateSchemasAndWorker(Config{PRTagsSchema: "public", GHReplicaSchema: "public"}), "WORKER_POLL_INTERVAL")
 	require.ErrorContains(t, validateEmbedding(Config{}), "EMBEDDING_MODEL is required")
 }

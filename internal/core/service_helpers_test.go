@@ -9,7 +9,6 @@ import (
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/dutifuldev/prtags/internal/database"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/stretchr/testify/require"
 	"gorm.io/datatypes"
@@ -1055,7 +1054,7 @@ func TestPermissionRepositoryAndGrantHelperBranches(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "widgets", repository.Name)
 
-	badService := NewService(db, ghreplica.NewClient("http://127.0.0.1:1"), permissions.AllowAllChecker{}, service.indexer)
+	badService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
 	_, err = badService.EnsureRepository(ctx, "acme", "widgets")
 	require.Error(t, err)
 
@@ -1125,7 +1124,7 @@ func TestEventProjectionAndConflictHelperBranches(t *testing.T) {
 	_, err = service.ensureTargetProjection(ctx, "acme", "widgets", repository.GitHubRepositoryID, "group", 1)
 	require.Error(t, err)
 
-	badService := NewService(db, ghreplica.NewClient("http://127.0.0.1:1"), permissions.AllowAllChecker{}, service.indexer)
+	badService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
 	_, err = badService.ensureTargetProjection(ctx, "acme", "widgets", repository.GitHubRepositoryID, "issue", 11)
 	require.Error(t, err)
 
@@ -1289,7 +1288,7 @@ func TestRepositoryAccessGrantErrorBranches(t *testing.T) {
 	service, db, server := newTestService(t)
 	defer server.Close()
 
-	badService := NewService(db, ghreplica.NewClient("http://127.0.0.1:1"), permissions.AllowAllChecker{}, service.indexer)
+	badService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
 	_, err := badService.UpsertRepositoryAccessGrant(ctx, "acme", "widgets", RepositoryAccessGrantInput{
 		GitHubUserID:          1,
 		GitHubLogin:           "alice",

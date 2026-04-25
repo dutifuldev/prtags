@@ -24,11 +24,61 @@ import (
 	"gorm.io/gorm/logger"
 )
 
+type stubMirrorClient struct {
+	fail bool
+}
+
+func (c stubMirrorClient) GetRepository(context.Context, string, string) (ghreplica.Repository, error) {
+	if c.fail {
+		return ghreplica.Repository{}, fmt.Errorf("mirror unavailable")
+	}
+	return ghreplica.Repository{
+		ID:         101,
+		Name:       "widgets",
+		FullName:   "acme/widgets",
+		HTMLURL:    "https://github.com/acme/widgets",
+		Visibility: "public",
+		Private:    false,
+		Owner: struct {
+			Login string `json:"login"`
+		}{Login: "acme"},
+	}, nil
+}
+
+func (c stubMirrorClient) GetIssue(context.Context, string, string, int) (ghreplica.Issue, error) {
+	if c.fail {
+		return ghreplica.Issue{}, fmt.Errorf("mirror unavailable")
+	}
+	return ghreplica.Issue{
+		ID:        1111,
+		Number:    11,
+		Title:     "Auth retries are flaky",
+		State:     "open",
+		HTMLURL:   "https://github.com/acme/widgets/issues/11",
+		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+		User:      ghreplica.UserObject{Login: "alice"},
+	}, nil
+}
+
+func (c stubMirrorClient) GetPullRequest(context.Context, string, string, int) (ghreplica.PullRequest, error) {
+	if c.fail {
+		return ghreplica.PullRequest{}, fmt.Errorf("mirror unavailable")
+	}
+	return ghreplica.PullRequest{
+		ID:        2022,
+		Number:    22,
+		Title:     "Retry ACP turns safely",
+		State:     "open",
+		HTMLURL:   "https://github.com/acme/widgets/pull/22",
+		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+		User:      ghreplica.UserObject{Login: "bob"},
+	}, nil
+}
+
 func TestAPIEndToEndFlow(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -114,8 +164,7 @@ func TestAPIEndToEndFlow(t *testing.T) {
 func TestAPIAddGroupMemberRejectsTargetAlreadyInAnotherGroup(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -154,8 +203,7 @@ func TestAPIAddGroupMemberRejectsTargetAlreadyInAnotherGroup(t *testing.T) {
 
 func TestManifestImportExport(t *testing.T) {
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -188,8 +236,7 @@ func TestManifestImportExport(t *testing.T) {
 func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -260,7 +307,7 @@ func TestAPIUpdateAndArchiveFlow(t *testing.T) {
 func TestAPIListGroupCommentSyncTargets(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	ghClient := ghreplica.NewClient("http://127.0.0.1:1")
+	ghClient := stubMirrorClient{fail: true}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -313,8 +360,7 @@ func TestAPIListGroupCommentSyncTargets(t *testing.T) {
 func TestAPIHandlerErrorBranches(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -363,8 +409,7 @@ func TestAPIHandlerErrorBranches(t *testing.T) {
 
 func TestAPIAdditionalHandlerBranches(t *testing.T) {
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -417,8 +462,7 @@ func TestAPIAdditionalHandlerBranches(t *testing.T) {
 func TestAPIAnnotationSearchAndMembershipHandlers(t *testing.T) {
 	ctx := context.Background()
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -519,8 +563,7 @@ func TestAPIAnnotationSearchAndMembershipHandlers(t *testing.T) {
 
 func TestAPIInvalidBodiesAndParams(t *testing.T) {
 	db := openTestDB(t)
-	stub := newStubGHReplica(t)
-	ghClient := ghreplica.NewClient(stub.URL)
+	ghClient := stubMirrorClient{}
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, permissions.AllowAllChecker{}, indexer)
 	server := httpapi.NewServer(db, service, true)
@@ -563,115 +606,6 @@ func invalidBodyRequest(t *testing.T, e *echo.Echo, method, path, body string, s
 
 func timePtr(value time.Time) *time.Time {
 	return &value
-}
-
-func newStubGHReplica(t *testing.T) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if writeStubObjectResponse(w, r.URL.Path) {
-			return
-		}
-		if r.URL.Path == "/v1/github-ext/repos/acme/widgets/objects/batch" {
-			writeStubBatchResponse(t, w, r)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-}
-
-func writeStubObjectResponse(w http.ResponseWriter, path string) bool {
-	switch path {
-	case "/v1/github/repos/acme/widgets":
-		_, _ = w.Write([]byte(`{
-			"id": 101,
-			"name": "widgets",
-			"full_name": "acme/widgets",
-			"html_url": "https://github.com/acme/widgets",
-			"visibility": "public",
-			"private": false,
-			"owner": {"login": "acme"}
-		}`))
-		return true
-	case "/v1/github/repos/acme/widgets/pulls/22":
-		_, _ = w.Write([]byte(`{
-			"id": 2022,
-			"number": 22,
-			"title": "Retry ACP turns safely",
-			"state": "open",
-			"html_url": "https://github.com/acme/widgets/pull/22",
-			"updated_at": "2026-04-16T12:00:00Z",
-			"user": {"login": "bob"}
-		}`))
-		return true
-	case "/v1/github/repos/acme/widgets/issues/11":
-		_, _ = w.Write([]byte(`{
-			"id": 1111,
-			"number": 11,
-			"title": "Auth retries are flaky",
-			"state": "open",
-			"html_url": "https://github.com/acme/widgets/issues/11",
-			"updated_at": "2026-04-16T12:00:00Z",
-			"user": {"login": "alice"}
-		}`))
-		return true
-	default:
-		return false
-	}
-}
-
-func writeStubBatchResponse(t *testing.T, w http.ResponseWriter, r *http.Request) {
-	t.Helper()
-	var input struct {
-		Objects []ghreplica.BatchObjectRef `json:"objects"`
-	}
-	require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
-	results := make([]map[string]any, 0, len(input.Objects))
-	for _, object := range input.Objects {
-		results = append(results, stubBatchObjectResult(object))
-	}
-	require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
-}
-
-func stubBatchObjectResult(object ghreplica.BatchObjectRef) map[string]any {
-	switch {
-	case object.Type == "pull_request" && object.Number == 22:
-		return map[string]any{
-			"type":   object.Type,
-			"number": object.Number,
-			"found":  true,
-			"object": map[string]any{
-				"id":         2022,
-				"number":     22,
-				"title":      "Retry ACP turns safely (batched)",
-				"state":      "open",
-				"html_url":   "https://github.com/acme/widgets/pull/22",
-				"updated_at": "2026-04-16T13:00:00Z",
-				"user":       map[string]any{"login": "bob"},
-			},
-		}
-	case object.Type == "issue" && object.Number == 11:
-		return map[string]any{
-			"type":   object.Type,
-			"number": object.Number,
-			"found":  true,
-			"object": map[string]any{
-				"id":         1111,
-				"number":     11,
-				"title":      "Auth retries are flaky (batched)",
-				"state":      "open",
-				"html_url":   "https://github.com/acme/widgets/issues/11",
-				"updated_at": "2026-04-16T13:00:00Z",
-				"user":       map[string]any{"login": "alice"},
-			},
-		}
-	default:
-		return map[string]any{
-			"type":   object.Type,
-			"number": object.Number,
-			"found":  false,
-		}
-	}
 }
 
 func postJSON(t *testing.T, e *echo.Echo, method, path string, payload any, expectedStatus int) string {

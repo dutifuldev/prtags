@@ -11,7 +11,6 @@ import (
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
@@ -48,7 +47,7 @@ func TestRecoverStaleJobsRequeuesExpiredProcessingJobs(t *testing.T) {
 		HeartbeatAt:        &stale,
 	}).Error)
 
-	indexer := NewIndexer(db, ghreplica.NewClient("http://127.0.0.1"), embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	indexer := NewIndexer(db, testMirrorClient{}, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	require.NoError(t, indexer.recoverStaleJobs(context.Background()))
 
 	var job database.IndexJob
@@ -229,8 +228,8 @@ func TestIndexerPostgresSearchHelpers(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	indexer := NewIndexer(db, ghreplica.NewClient("http://127.0.0.1"), embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
-	service := NewService(db, ghreplica.NewClient("http://127.0.0.1"), permissions.AllowAllChecker{}, indexer)
+	indexer := NewIndexer(db, testMirrorClient{}, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	service := NewService(db, testMirrorClient{}, permissions.AllowAllChecker{}, indexer)
 
 	mock.ExpectQuery("(?s).*FROM search_documents.*").
 		WillReturnRows(sqlmock.NewRows([]string{"github_repository_id", "target_type", "target_key", "score"}).
@@ -404,18 +403,18 @@ func TestIndexerAdditionalHelperAndErrorBranches(t *testing.T) {
 	service, db, server := newTestService(t)
 	defer server.Close()
 
-	badService := NewService(db, ghreplica.NewClient("http://127.0.0.1:1"), permissions.AllowAllChecker{}, service.indexer)
+	badService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
 	_, err := badService.SearchText(ctx, "acme", "widgets", "auth", nil, 0)
 	require.Error(t, err)
 	_, err = badService.SearchSimilar(ctx, "acme", "widgets", "auth", nil, 0)
 	require.Error(t, err)
 
-	failingIndexer := NewIndexer(db, ghreplica.NewClient(server.URL), failingEmbeddingProvider{})
-	failingService := NewService(db, ghreplica.NewClient(server.URL), permissions.AllowAllChecker{}, failingIndexer)
+	failingIndexer := NewIndexer(db, testMirrorClient{}, failingEmbeddingProvider{})
+	failingService := NewService(db, testMirrorClient{}, permissions.AllowAllChecker{}, failingIndexer)
 	_, err = failingService.SearchSimilar(ctx, "acme", "widgets", "auth", []string{"pull_request"}, 5)
 	require.ErrorContains(t, err, "embed failed")
 
-	idleIndexer := NewIndexer(db, ghreplica.NewClient(server.URL), embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
+	idleIndexer := NewIndexer(db, testMirrorClient{}, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	require.NoError(t, idleIndexer.RunOnce(ctx))
 
 	missingJob := database.IndexJob{

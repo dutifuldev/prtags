@@ -41,11 +41,17 @@ func (e *FailError) Error() string {
 
 type Service struct {
 	db          *gorm.DB
-	ghreplica   *ghreplica.Client
+	ghreplica   mirrorClient
 	permission  permissions.Checker
 	indexer     *Indexer
 	dispatcher  JobDispatcher
 	commentSync *CommentSyncService
+}
+
+type mirrorClient interface {
+	GetRepository(ctx context.Context, owner, repo string) (ghreplica.Repository, error)
+	GetIssue(ctx context.Context, owner, repo string, number int) (ghreplica.Issue, error)
+	GetPullRequest(ctx context.Context, owner, repo string, number int) (ghreplica.PullRequest, error)
 }
 
 type groupMemberConflictDetails struct {
@@ -161,7 +167,7 @@ type GetGroupOptions struct {
 	IncludeMetadata bool
 }
 
-func NewService(db *gorm.DB, gh *ghreplica.Client, checker permissions.Checker, indexer *Indexer) *Service {
+func NewService(db *gorm.DB, gh mirrorClient, checker permissions.Checker, indexer *Indexer) *Service {
 	return &Service{
 		db:         db,
 		ghreplica:  gh,

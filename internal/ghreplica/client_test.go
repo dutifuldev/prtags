@@ -2,151 +2,127 @@ package ghreplica
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/dutifuldev/ghreplica/mirror"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
-func TestGetRepository(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Fatalf("expected GET, got %s", r.Method)
-		}
-		if r.URL.Path != "/v1/github/repos/openclaw/openclaw" {
-			t.Fatalf("unexpected path %q", r.URL.Path)
-		}
-		_, _ = w.Write([]byte(`{"id":1,"name":"openclaw","full_name":"openclaw/openclaw","html_url":"https://github.com/openclaw/openclaw","visibility":"public","private":false,"owner":{"login":"openclaw"}}`))
-	}))
-	defer server.Close()
+func TestClientReadsMirrorObjects(t *testing.T) {
+	db := openMirrorTestDB(t)
+	seedMirrorRows(t, db)
 
-	client := NewClient(server.URL + "/")
-	repo, err := client.GetRepository(context.Background(), "openclaw", "openclaw")
-	if err != nil {
-		t.Fatalf("GetRepository returned error: %v", err)
-	}
-	if repo.FullName != "openclaw/openclaw" {
-		t.Fatalf("expected full name to decode, got %q", repo.FullName)
-	}
-	if repo.Owner.Login != "openclaw" {
-		t.Fatalf("expected owner login to decode, got %q", repo.Owner.Login)
-	}
-}
+	client := NewClient(mirror.NewReader(db))
+	repository, err := client.GetRepository(context.Background(), "openclaw", "openclaw")
+	require.NoError(t, err)
+	require.EqualValues(t, 1103012935, repository.ID)
+	require.Equal(t, "openclaw/openclaw", repository.FullName)
+	require.Equal(t, "openclaw", repository.Owner.Login)
 
-func TestRequestJSONReturnsStatusError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "bad request", http.StatusBadRequest)
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-	err := client.requestJSON(context.Background(), http.MethodGet, "/broken", nil, &Repository{})
-	if err == nil {
-		t.Fatal("expected requestJSON to fail")
-	}
-	if !strings.Contains(err.Error(), "status 400") {
-		t.Fatalf("expected status in error, got %v", err)
-	}
-}
-
-func TestBatchGetObjects(t *testing.T) {
-	updatedAt := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC).Format(time.RFC3339)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assertBatchRequest(t, r)
-		_, _ = w.Write([]byte(batchObjectsResponse(updatedAt)))
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
-	results, err := client.BatchGetObjects(context.Background(), "openclaw", "openclaw", []BatchObjectRef{
-		{Type: "issue", Number: 1},
-		{Type: "pull_request", Number: 2},
-		{Type: "issue", Number: 3},
-	})
-	if err != nil {
-		t.Fatalf("BatchGetObjects returned error: %v", err)
-	}
-	if len(results) != 3 {
-		t.Fatalf("expected 3 results, got %d", len(results))
-	}
-	if results[0].Summary == nil || results[0].Summary.AuthorLogin != "alice" {
-		t.Fatalf("expected decoded issue summary, got %#v", results[0].Summary)
-	}
-	if results[1].Summary == nil || results[1].Summary.Title != "PR title" {
-		t.Fatalf("expected decoded PR summary, got %#v", results[1].Summary)
-	}
-	if results[2].Found || results[2].Summary != nil {
-		t.Fatalf("expected missing object to stay empty, got %#v", results[2])
-	}
-}
-
-func assertBatchRequest(t *testing.T, r *http.Request) {
-	t.Helper()
-	if r.Method != http.MethodPost {
-		t.Fatalf("expected POST, got %s", r.Method)
-	}
-	if r.URL.Path != "/v1/github-ext/repos/openclaw/openclaw/objects/batch" {
-		t.Fatalf("unexpected path %q", r.URL.Path)
-	}
-	if got := r.Header.Get("Content-Type"); got != "application/json" {
-		t.Fatalf("expected json content-type, got %q", got)
-	}
-}
-
-func batchObjectsResponse(updatedAt string) string {
-	return `{"results":[{"type":"issue","number":1,"found":true,"object":{"id":11,"number":1,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/1","updated_at":"` + updatedAt + `","user":{"login":"alice"}}},{"type":"pull_request","number":2,"found":true,"object":{"id":22,"number":2,"title":"PR title","state":"closed","html_url":"https://github.com/openclaw/openclaw/pull/2","updated_at":"` + updatedAt + `","user":{"login":"bob"}}},{"type":"issue","number":3,"found":false,"object":null}]}`
-}
-
-func TestBatchGetObjectsEmpty(t *testing.T) {
-	client := NewClient("https://example.com")
-	results, err := client.BatchGetObjects(context.Background(), "openclaw", "openclaw", nil)
-	if err != nil {
-		t.Fatalf("BatchGetObjects returned error: %v", err)
-	}
-	if results != nil {
-		t.Fatalf("expected nil result for empty batch, got %#v", results)
-	}
-}
-
-func TestDecodeBatchObjectSummaryRejectsUnsupportedType(t *testing.T) {
-	_, err := decodeBatchObjectSummary("commit", []byte(`{"id":1}`))
-	if err == nil {
-		t.Fatal("expected unsupported type error")
-	}
-	if !strings.Contains(err.Error(), "unsupported batch object type") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestGetIssueAndPullRequest(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/v1/github/repos/openclaw/openclaw/issues/11":
-			_, _ = w.Write([]byte(`{"id":11,"number":11,"title":"Issue title","state":"open","html_url":"https://github.com/openclaw/openclaw/issues/11","user":{"login":"alice"}}`))
-		case "/v1/github/repos/openclaw/openclaw/pulls/22":
-			_, _ = w.Write([]byte(`{"id":22,"number":22,"title":"PR title","state":"open","html_url":"https://github.com/openclaw/openclaw/pull/22","user":{"login":"bob"}}`))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL)
 	issue, err := client.GetIssue(context.Background(), "openclaw", "openclaw", 11)
-	if err != nil {
-		t.Fatalf("GetIssue returned error: %v", err)
-	}
-	if issue.User.Login != "alice" {
-		t.Fatalf("expected issue author to decode, got %q", issue.User.Login)
-	}
+	require.NoError(t, err)
+	require.Equal(t, "Issue title", issue.Title)
+	require.Equal(t, "octocat", issue.User.Login)
 
-	pullRequest, err := client.GetPullRequest(context.Background(), "openclaw", "openclaw", 22)
-	if err != nil {
-		t.Fatalf("GetPullRequest returned error: %v", err)
+	pull, err := client.GetPullRequest(context.Background(), "openclaw", "openclaw", 22)
+	require.NoError(t, err)
+	require.Equal(t, "Pull title", pull.Title)
+	require.Equal(t, "open", pull.State)
+	require.Equal(t, "octocat", pull.User.Login)
+}
+
+func TestClientReturnsMissingMirrorErrors(t *testing.T) {
+	db := openMirrorTestDB(t)
+	client := NewClient(mirror.NewReader(db))
+
+	_, err := client.GetRepository(context.Background(), "missing", "repo")
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestClientReturnsMissingIssueAndPullRequestErrors(t *testing.T) {
+	db := openMirrorTestDB(t)
+	seedMirrorRows(t, db)
+	client := NewClient(mirror.NewReader(db))
+
+	_, err := client.GetIssue(context.Background(), "openclaw", "openclaw", 999)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	_, err = client.GetPullRequest(context.Background(), "openclaw", "openclaw", 999)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+}
+
+func TestNewSchemaClientReadsConfiguredSchema(t *testing.T) {
+	db := openMirrorTestDB(t)
+	seedMirrorRows(t, db)
+
+	client := NewSchemaClient(db, "main")
+	repository, err := client.GetRepository(context.Background(), "openclaw", "openclaw")
+	require.NoError(t, err)
+	require.Equal(t, "openclaw/openclaw", repository.FullName)
+}
+
+func openMirrorTestDB(t *testing.T) *gorm.DB {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&mirror.User{}, &mirror.Repository{}, &mirror.Issue{}, &mirror.PullRequest{}))
+	return db
+}
+
+func seedMirrorRows(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	now := time.Date(2026, 4, 25, 8, 0, 0, 0, time.UTC)
+	owner := mirror.User{GitHubID: 1, Login: "openclaw"}
+	require.NoError(t, db.Create(&owner).Error)
+	author := mirror.User{GitHubID: 2, Login: "octocat"}
+	require.NoError(t, db.Create(&author).Error)
+	repository := mirror.Repository{
+		GitHubID:   1103012935,
+		OwnerID:    &owner.ID,
+		OwnerLogin: "openclaw",
+		Name:       "openclaw",
+		FullName:   "openclaw/openclaw",
+		HTMLURL:    "https://github.com/openclaw/openclaw",
+		Visibility: "public",
 	}
-	if pullRequest.User.Login != "bob" {
-		t.Fatalf("expected pr author to decode, got %q", pullRequest.User.Login)
+	require.NoError(t, db.Create(&repository).Error)
+	issue := mirror.Issue{
+		RepositoryID:    repository.ID,
+		GitHubID:        11,
+		Number:          11,
+		Title:           "Issue title",
+		State:           "open",
+		AuthorID:        &author.ID,
+		HTMLURL:         "https://github.com/openclaw/openclaw/issues/11",
+		GitHubUpdatedAt: now,
 	}
+	require.NoError(t, db.Create(&issue).Error)
+	pullIssue := mirror.Issue{
+		RepositoryID:    repository.ID,
+		GitHubID:        22,
+		Number:          22,
+		Title:           "Pull title",
+		State:           "open",
+		AuthorID:        &author.ID,
+		HTMLURL:         "https://github.com/openclaw/openclaw/pull/22",
+		GitHubUpdatedAt: now,
+		IsPullRequest:   true,
+	}
+	require.NoError(t, db.Create(&pullIssue).Error)
+	pull := mirror.PullRequest{
+		IssueID:         pullIssue.ID,
+		RepositoryID:    repository.ID,
+		GitHubID:        22,
+		Number:          22,
+		State:           "open",
+		HTMLURL:         "https://github.com/openclaw/openclaw/pull/22",
+		GitHubUpdatedAt: now,
+	}
+	require.NoError(t, db.Create(&pull).Error)
 }

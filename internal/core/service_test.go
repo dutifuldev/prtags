@@ -1264,7 +1264,7 @@ func TestServiceBulkOuterErrorBranches(t *testing.T) {
 	service, db, server := newTestService(t)
 	defer server.Close()
 
-	badService := NewService(db, ghreplica.NewClient("http://127.0.0.1:1"), permissions.AllowAllChecker{}, service.indexer)
+	badService := NewService(db, testMirrorClient{behavior: batchBehavior{fail: true}}, permissions.AllowAllChecker{}, service.indexer)
 	actor := permissionsActor()
 
 	_, err := badService.CreateFieldDefinition(ctx, actor, "acme", "widgets", FieldDefinitionInput{
@@ -1340,6 +1340,63 @@ type batchBehavior struct {
 	calls       *atomic.Int32
 }
 
+type testMirrorClient struct {
+	behavior batchBehavior
+}
+
+func (c testMirrorClient) GetRepository(context.Context, string, string) (ghreplica.Repository, error) {
+	if c.behavior.fail {
+		return ghreplica.Repository{}, errors.New("mirror unavailable")
+	}
+	return ghreplica.Repository{
+		ID:         101,
+		Name:       "widgets",
+		FullName:   "acme/widgets",
+		HTMLURL:    "https://github.com/acme/widgets",
+		Visibility: "public",
+		Private:    false,
+		Owner: struct {
+			Login string `json:"login"`
+		}{Login: "acme"},
+	}, nil
+}
+
+func (c testMirrorClient) GetIssue(context.Context, string, string, int) (ghreplica.Issue, error) {
+	if c.behavior.fail {
+		return ghreplica.Issue{}, errors.New("mirror unavailable")
+	}
+	if c.behavior.objectDelay > 0 {
+		time.Sleep(c.behavior.objectDelay)
+	}
+	return ghreplica.Issue{
+		ID:        1111,
+		Number:    11,
+		Title:     "Auth retries are flaky",
+		State:     "open",
+		HTMLURL:   "https://github.com/acme/widgets/issues/11",
+		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+		User:      ghreplica.UserObject{Login: "alice"},
+	}, nil
+}
+
+func (c testMirrorClient) GetPullRequest(context.Context, string, string, int) (ghreplica.PullRequest, error) {
+	if c.behavior.fail {
+		return ghreplica.PullRequest{}, errors.New("mirror unavailable")
+	}
+	if c.behavior.objectDelay > 0 {
+		time.Sleep(c.behavior.objectDelay)
+	}
+	return ghreplica.PullRequest{
+		ID:        2022,
+		Number:    22,
+		Title:     "Retry ACP turns safely",
+		State:     "open",
+		HTMLURL:   "https://github.com/acme/widgets/pull/22",
+		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
+		User:      ghreplica.UserObject{Login: "bob"},
+	}, nil
+}
+
 func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, behavior batchBehavior, checker permissions.Checker) (*Service, *gorm.DB, *httptest.Server) {
 	t.Helper()
 
@@ -1349,138 +1406,12 @@ func newTestServiceWithBatchBehaviorAndChecker(t *testing.T, behavior batchBehav
 	require.NoError(t, err)
 	require.NoError(t, database.ApplyTestSchema(db))
 
-	server := newTestGHReplicaServer(t, behavior)
+	server := httptest.NewServer(http.NotFoundHandler())
 
-	ghClient := ghreplica.NewClient(server.URL)
+	ghClient := testMirrorClient{behavior: behavior}
 	indexer := NewIndexer(db, ghClient, embedding.NewLocalHashProvider("local-hash@1", database.EmbeddingDimensions))
 	service := NewService(db, ghClient, checker, indexer)
 	return service, db, server
-}
-
-func newTestGHReplicaServer(t *testing.T, behavior batchBehavior) *httptest.Server {
-	t.Helper()
-
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if writeTestObjectResponse(w, r.URL.Path, behavior.objectDelay) {
-			return
-		}
-		if r.URL.Path == "/v1/github-ext/repos/acme/widgets/objects/batch" {
-			writeTestBatchResponse(t, w, r, behavior)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-}
-
-func writeTestObjectResponse(w http.ResponseWriter, path string, delay time.Duration) bool {
-	switch path {
-	case "/v1/github/repos/acme/widgets":
-		_, _ = w.Write([]byte(`{
-			"id": 101,
-			"name": "widgets",
-			"full_name": "acme/widgets",
-			"html_url": "https://github.com/acme/widgets",
-			"visibility": "public",
-			"private": false,
-			"owner": {"login": "acme"}
-		}`))
-		return true
-	case "/v1/github/repos/acme/widgets/pulls/22":
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-		_, _ = w.Write([]byte(`{
-			"id": 2022,
-			"number": 22,
-			"title": "Retry ACP turns safely",
-			"state": "open",
-			"html_url": "https://github.com/acme/widgets/pull/22",
-			"updated_at": "2026-04-16T12:00:00Z",
-			"user": {"login": "bob"}
-		}`))
-		return true
-	case "/v1/github/repos/acme/widgets/issues/11":
-		if delay > 0 {
-			time.Sleep(delay)
-		}
-		_, _ = w.Write([]byte(`{
-			"id": 1111,
-			"number": 11,
-			"title": "Auth retries are flaky",
-			"state": "open",
-			"html_url": "https://github.com/acme/widgets/issues/11",
-			"updated_at": "2026-04-16T12:00:00Z",
-			"user": {"login": "alice"}
-		}`))
-		return true
-	default:
-		return false
-	}
-}
-
-func writeTestBatchResponse(t *testing.T, w http.ResponseWriter, r *http.Request, behavior batchBehavior) {
-	t.Helper()
-	if behavior.calls != nil {
-		behavior.calls.Add(1)
-	}
-	if behavior.delay > 0 {
-		time.Sleep(behavior.delay)
-	}
-	if behavior.fail {
-		http.Error(w, `{"error":"batch unavailable"}`, http.StatusBadGateway)
-		return
-	}
-	var input struct {
-		Objects []ghreplica.BatchObjectRef `json:"objects"`
-	}
-	require.NoError(t, json.NewDecoder(r.Body).Decode(&input))
-	results := make([]map[string]any, 0, len(input.Objects))
-	for _, object := range input.Objects {
-		results = append(results, testBatchObjectResult(object))
-	}
-	require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": results}))
-}
-
-func testBatchObjectResult(object ghreplica.BatchObjectRef) map[string]any {
-	switch {
-	case object.Type == "pull_request" && object.Number == 22:
-		return map[string]any{
-			"type":   object.Type,
-			"number": object.Number,
-			"found":  true,
-			"object": map[string]any{
-				"id":         2022,
-				"number":     22,
-				"title":      "Retry ACP turns safely (batched)",
-				"state":      "open",
-				"html_url":   "https://github.com/acme/widgets/pull/22",
-				"updated_at": "2026-04-16T13:00:00Z",
-				"user":       map[string]any{"login": "bob"},
-			},
-		}
-	case object.Type == "issue" && object.Number == 11:
-		return map[string]any{
-			"type":   object.Type,
-			"number": object.Number,
-			"found":  true,
-			"object": map[string]any{
-				"id":         1111,
-				"number":     11,
-				"title":      "Auth retries are flaky (batched)",
-				"state":      "open",
-				"html_url":   "https://github.com/acme/widgets/issues/11",
-				"updated_at": "2026-04-16T13:00:00Z",
-				"user":       map[string]any{"login": "alice"},
-			},
-		}
-	default:
-		return map[string]any{
-			"type":   object.Type,
-			"number": object.Number,
-			"found":  false,
-		}
-	}
 }
 
 func drainIndexJobs(t *testing.T, ctx context.Context, db *gorm.DB, indexer *Indexer) {

@@ -76,7 +76,6 @@ func TestAccessGrantCommandsReachServiceOpen(t *testing.T) {
 		UserLogin:   "dutifulbob",
 		UserID:      7937614,
 	})
-	t.Setenv("GHREPLICA_BASE_URL", "https://ghreplica.example")
 	t.Setenv("DATABASE_URL", "")
 
 	_, _, err := runCLI(t, "https://prtags.dutiful.dev", "access", "grant", "list", "-R", "acme/widgets")

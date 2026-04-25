@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 type Config struct {
@@ -15,7 +16,8 @@ type Config struct {
 	DBMaxIdleConns          int
 	DBConnMaxIdleTime       time.Duration
 	DBConnMaxLifetime       time.Duration
-	GHReplicaBaseURL        string
+	PRTagsSchema            string
+	GHReplicaSchema         string
 	GitHubBaseURL           string
 	GitHubAppID             string
 	GitHubInstallationID    string
@@ -35,7 +37,8 @@ func FromEnv() Config {
 		DBMaxIdleConns:          envInt("DB_MAX_IDLE_CONNS", 2),
 		DBConnMaxIdleTime:       envDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
 		DBConnMaxLifetime:       envDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
-		GHReplicaBaseURL:        envOrDefault("GHREPLICA_BASE_URL", "https://ghreplica.dutiful.dev"),
+		PRTagsSchema:            envOrDefault("PRTAGS_SCHEMA", "public"),
+		GHReplicaSchema:         envOrDefault("GHREPLICA_SCHEMA", "public"),
 		GitHubBaseURL:           envOrDefault("GITHUB_BASE_URL", "https://api.github.com"),
 		GitHubAppID:             strings.TrimSpace(os.Getenv("GITHUB_APP_ID")),
 		GitHubInstallationID:    strings.TrimSpace(os.Getenv("GITHUB_APP_INSTALLATION_ID")),
@@ -53,7 +56,7 @@ func (c Config) Validate() error {
 	validations := []func(Config) error{
 		validateDatabase,
 		validatePool,
-		validateReplicaAndWorker,
+		validateSchemasAndWorker,
 		validateEmbedding,
 		validateGitHubApp,
 	}
@@ -114,14 +117,35 @@ func validatePool(c Config) error {
 	}
 }
 
-func validateReplicaAndWorker(c Config) error {
-	if strings.TrimSpace(c.GHReplicaBaseURL) == "" {
-		return errors.New("GHREPLICA_BASE_URL is required")
+func validateSchemasAndWorker(c Config) error {
+	if !validIdentifier(c.PRTagsSchema) {
+		return errors.New("PRTAGS_SCHEMA must be a valid PostgreSQL identifier")
+	}
+	if !validIdentifier(c.GHReplicaSchema) {
+		return errors.New("GHREPLICA_SCHEMA must be a valid PostgreSQL identifier")
 	}
 	if c.WorkerPollInterval <= 0 {
 		return errors.New("WORKER_POLL_INTERVAL must be positive")
 	}
 	return nil
+}
+
+func validIdentifier(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		if i == 0 {
+			if r != '_' && !unicode.IsLetter(r) {
+				return false
+			}
+			continue
+		}
+		if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 func validateEmbedding(c Config) error {

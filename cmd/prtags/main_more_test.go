@@ -8,14 +8,17 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 
+	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/dutifuldev/prtags/internal/auth"
 	"github.com/dutifuldev/prtags/internal/config"
 	"github.com/dutifuldev/prtags/internal/jsend"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -134,7 +137,8 @@ func TestAuthAndRuntimeHelpers(t *testing.T) {
 		DBMaxIdleConns:     1,
 		DBConnMaxIdleTime:  time.Minute,
 		DBConnMaxLifetime:  time.Minute,
-		GHReplicaBaseURL:   "https://ghreplica.example",
+		PRTagsSchema:       "public",
+		GHReplicaSchema:    "public",
 		WorkerPollInterval: time.Second,
 		EmbeddingModel:     "local-hash@1",
 	})
@@ -189,7 +193,6 @@ func TestFieldAndAccessHelpers(t *testing.T) {
 func TestOpenOpsServiceWithSQLite(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("DATABASE_URL", "sqlite://"+filepath.Join(tempDir, "ops.db"))
-	t.Setenv("GHREPLICA_BASE_URL", "https://ghreplica.example")
 	t.Setenv("DB_MAX_OPEN_CONNS", "1")
 	t.Setenv("DB_MAX_IDLE_CONNS", "1")
 	t.Setenv("DB_CONN_MAX_IDLE_TIME", "1m")
@@ -199,4 +202,70 @@ func TestOpenOpsServiceWithSQLite(t *testing.T) {
 	_, cleanup, err := openOpsService()
 	require.Error(t, err)
 	require.Nil(t, cleanup)
+}
+
+func TestEnsureConfiguredSchemaRejectsMissingSchema(t *testing.T) {
+	db, mock, cleanup := newMockPostgresDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (\n\t\t\tSELECT 1\n\t\t\tFROM pg_namespace\n\t\t\tWHERE nspname = $1\n\t\t)")).
+		WithArgs("prtags").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(false))
+
+	err := ensureConfiguredSchema(context.Background(), db, "prtags")
+	require.ErrorContains(t, err, `PRTAGS_SCHEMA "prtags" does not exist`)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestEnsureConfiguredSchemaAllowsExistingSchema(t *testing.T) {
+	db, mock, cleanup := newMockPostgresDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT EXISTS (\n\t\t\tSELECT 1\n\t\t\tFROM pg_namespace\n\t\t\tWHERE nspname = $1\n\t\t)")).
+		WithArgs("prtags").
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	require.NoError(t, ensureConfiguredSchema(context.Background(), db, "prtags"))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestEnsureConfiguredSchemaSkipsPublic(t *testing.T) {
+	db, mock, cleanup := newMockPostgresDB(t)
+	defer cleanup()
+
+	require.NoError(t, ensureConfiguredSchema(context.Background(), db, "public"))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestDatabaseURLWithSearchPathPreservesURLDSN(t *testing.T) {
+	out, err := databaseURLWithSearchPath("postgres://user:pass@127.0.0.1:5432/ghreplica?sslmode=disable", "prtags")
+	require.NoError(t, err)
+	require.Equal(t, "postgres://user:pass@127.0.0.1:5432/ghreplica?search_path=prtags%2Cpublic&sslmode=disable", out)
+}
+
+func TestDatabaseURLWithSearchPathPreservesKeywordValueDSN(t *testing.T) {
+	out, err := databaseURLWithSearchPath("host=/cloudsql/project:region:instance user=bob dbname=ghreplica sslmode=disable", "prtags")
+	require.NoError(t, err)
+	require.Equal(t, "host=/cloudsql/project:region:instance user=bob dbname=ghreplica sslmode=disable search_path='prtags,public'", out)
+}
+
+func TestDatabaseURLWithSearchPathRejectsUnsupportedDSN(t *testing.T) {
+	_, err := databaseURLWithSearchPath("not a dsn", "prtags")
+	require.ErrorContains(t, err, "DATABASE_URL must be a URL or PostgreSQL keyword/value DSN")
+}
+
+func newMockPostgresDB(t *testing.T) (*gorm.DB, sqlmock.Sqlmock, func()) {
+	t.Helper()
+
+	sqlDB, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	db, err := gorm.Open(postgres.New(postgres.Config{
+		Conn:                 sqlDB,
+		PreferSimpleProtocol: true,
+	}), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+
+	return db, mock, func() {
+		_ = sqlDB.Close()
+	}
 }

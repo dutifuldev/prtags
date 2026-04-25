@@ -222,13 +222,20 @@ func openOpsService() (*core.Service, func(), error) {
 		return nil, nil, err
 	}
 
-	db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
+	databaseURL, err := databaseURLWithSearchPath(cfg.DatabaseURL, cfg.PRTagsSchema)
+	if err != nil {
+		return nil, nil, err
+	}
+	db, err := database.OpenWithPool(databaseURL, database.PoolConfig{
 		MaxOpenConns:    cfg.DBMaxOpenConns,
 		MaxIdleConns:    cfg.DBMaxIdleConns,
 		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
 		ConnMaxLifetime: cfg.DBConnMaxLifetime,
 	})
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := ensureConfiguredSchema(context.Background(), db, cfg.PRTagsSchema); err != nil {
 		return nil, nil, err
 	}
 	if err := database.RunMigrations(db); err != nil {
@@ -245,6 +252,6 @@ func openOpsService() (*core.Service, func(), error) {
 	cleanup := func() {
 		_ = sqlDB.Close()
 	}
-	service := core.NewService(db, ghreplica.NewClient(cfg.GHReplicaBaseURL), permissions.AllowAllChecker{}, nil)
+	service := core.NewService(db, ghreplica.NewSchemaClient(db, cfg.GHReplicaSchema), permissions.AllowAllChecker{}, nil)
 	return service, cleanup, nil
 }

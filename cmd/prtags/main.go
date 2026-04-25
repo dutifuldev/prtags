@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -273,7 +274,7 @@ func openServeRuntime() (config.Config, serveRuntime, error) {
 	if !cfg.AllowUnauthWrites {
 		checker = permissions.NewGitHubChecker(0)
 	}
-	ghClient := ghreplica.NewClient(cfg.GHReplicaBaseURL)
+	ghClient := ghreplica.NewSchemaClient(db, cfg.GHReplicaSchema)
 	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
 	service := core.NewService(db, ghClient, checker, indexer)
 	commentSync := buildCommentSyncService(db, cfg)
@@ -294,13 +295,20 @@ func openServeRuntime() (config.Config, serveRuntime, error) {
 }
 
 func openConfiguredDatabase(cfg config.Config) (*gorm.DB, error) {
-	db, err := database.OpenWithPool(cfg.DatabaseURL, database.PoolConfig{
+	databaseURL, err := databaseURLWithSearchPath(cfg.DatabaseURL, cfg.PRTagsSchema)
+	if err != nil {
+		return nil, err
+	}
+	db, err := database.OpenWithPool(databaseURL, database.PoolConfig{
 		MaxOpenConns:    cfg.DBMaxOpenConns,
 		MaxIdleConns:    cfg.DBMaxIdleConns,
 		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
 		ConnMaxLifetime: cfg.DBConnMaxLifetime,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := ensureConfiguredSchema(context.Background(), db, cfg.PRTagsSchema); err != nil {
 		return nil, err
 	}
 	if err := database.RunMigrations(db); err != nil {
@@ -310,6 +318,63 @@ func openConfiguredDatabase(cfg config.Config) (*gorm.DB, error) {
 		return nil, err
 	}
 	return db, nil
+}
+
+func ensureConfiguredSchema(ctx context.Context, db *gorm.DB, schema string) error {
+	if schema == "public" {
+		return nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	var exists bool
+	if err := sqlDB.QueryRowContext(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_namespace
+			WHERE nspname = $1
+		)
+	`, schema).Scan(&exists); err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("PRTAGS_SCHEMA %q does not exist", schema)
+	}
+	return nil
+}
+
+func databaseURLWithSearchPath(databaseURL, schema string) (string, error) {
+	searchPath := schema
+	if schema != "public" {
+		searchPath += ",public"
+	}
+	trimmedURL := strings.TrimSpace(databaseURL)
+	if !strings.Contains(trimmedURL, "://") && isPostgresKeywordValueDSN(trimmedURL) {
+		return trimmedURL + " search_path=" + postgresKeywordValue(searchPath), nil
+	}
+
+	parsed, err := url.Parse(trimmedURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme == "" {
+		return "", fmt.Errorf("DATABASE_URL must be a URL or PostgreSQL keyword/value DSN")
+	}
+	query := parsed.Query()
+	query.Set("search_path", searchPath)
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
+
+func isPostgresKeywordValueDSN(databaseURL string) bool {
+	fields := strings.Fields(databaseURL)
+	return len(fields) > 0 && strings.Contains(fields[0], "=")
+}
+
+func postgresKeywordValue(value string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
+	return "'" + escaped + "'"
 }
 
 func buildCommentSyncService(db *gorm.DB, cfg config.Config) *core.CommentSyncService {

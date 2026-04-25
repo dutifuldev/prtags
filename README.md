@@ -179,7 +179,7 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 `ghreplica` remains the source of truth for mirrored repositories, pull requests, and issues. `PRtags` resolves repo and object identity through `ghreplica`, uses stable GitHub-backed identifiers so renames do not break object identity, and derives write permissions from GitHub repo access. That means `PRtags` is not trying to become a second GitHub mirror. It is a curation layer over a mirror that already exists.
 
-This split is important operationally too. `PRtags` owns its own database, jobs, search documents, and embeddings. It should not share a database with `ghreplica`, and it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
+This split is important operationally too. `PRtags` owns its own schema, jobs, search documents, and embeddings. It shares a Postgres database with `ghreplica` only so the two systems can join mirrored GitHub data with curation data; it should not copy full PR or issue content unless it is maintaining a small explicit projection for display or indexing purposes.
 
 For group reads, `PRtags` returns refs by default. When metadata is requested, `PRtags` enriches member references from cached target projections. If a projection is missing or stale, `PRtags` returns the cached result it already has, marks the freshness state explicitly, and queues a background refresh from `ghreplica`. `group list` keeps the lighter default shape and returns `member_count` plus `member_counts` by type. The CLI keeps calling only `PRtags`.
 
@@ -242,7 +242,10 @@ The CLI resolves auth in this order:
 
 ## Local Development
 
-The local development loop is straightforward. Start a Postgres instance, point `PRtags` at a running `ghreplica`, and run the API:
+The local development loop needs a Postgres database that contains both the
+`ghreplica` mirror schema and the `PRtags` schema. For repo-scoped commands, the
+mirror schema must already have the repositories, issues, and pull requests you
+want to reference.
 
 ```bash
 docker run --rm --name prtags-postgres \
@@ -251,17 +254,26 @@ docker run --rm --name prtags-postgres \
   -p 55432:5432 \
   pgvector/pgvector:pg16
 
+docker exec prtags-postgres \
+  psql -U postgres -d prtags -c 'CREATE SCHEMA prtags;'
+
 export DATABASE_URL='postgres://postgres:prtags@127.0.0.1:55432/prtags?sslmode=disable'
 export DB_MAX_OPEN_CONNS=5
 export DB_MAX_IDLE_CONNS=2
 export DB_CONN_MAX_IDLE_TIME=5m
 export DB_CONN_MAX_LIFETIME=30m
-export GHREPLICA_BASE_URL='https://ghreplica.dutiful.dev'
+export PRTAGS_SCHEMA=prtags
+export GHREPLICA_SCHEMA=public
 export ALLOW_UNAUTH_WRITES=true
 go run ./cmd/prtags serve
 ```
 
 By default the server listens on `:8081`, runs migrations on startup, and starts the background indexing worker.
+
+A fresh database like the one above is enough to test process startup and basic
+health checks. To run the repo examples below, first run or restore `ghreplica`
+against the same database so the configured mirror schema contains matching
+GitHub data.
 
 If you want to test outbound group comments locally, also set `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and either `GITHUB_APP_PRIVATE_KEY_PEM` or `GITHUB_APP_PRIVATE_KEY_PATH`. In production, prefer the mounted private key path and keep the containing directory readable by the container user only.
 
@@ -328,17 +340,27 @@ This is the simplest local install path when you only need the client.
 
 If you want to run `PRtags` yourself, think of deployment as standing up a second service next to `ghreplica`, not as extending the `ghreplica` process directly.
 
+The deployment uses one shared Postgres database with separate
+schemas:
+
+- configured mirror schema for mirrored GitHub data
+- `prtags` schema for groups, annotations, projections, and jobs
+
+That shared-database topology is what allows normal SQL joins between `PRtags`
+groups and `ghreplica` mirror tables. It deprecates the separate `PRtags`
+database deployment shape, but not the `PRtags` tables or data model.
+
 At minimum you need:
 
-- a separate Postgres database for `PRtags`
-- network access to a running `ghreplica` instance
+- a shared Postgres database with `ghreplica` and `prtags` schemas
+- a running `ghreplica` service writing mirror data into that database
 - GitHub-authenticated requests for write operations if you want real permission enforcement
 - a decision about the embedding provider and model you want to use beyond local development defaults
 
 The basic shape is:
 
-1. create the `PRtags` database
-2. point `PRtags` at `ghreplica`
+1. create the shared database schemas
+2. point `PRtags` at the shared database
 3. run migrations
 4. start the API
 5. verify health, readiness, and a few repo-scoped operations
@@ -347,7 +369,7 @@ The clean deployment boundary is:
 
 - separate repo
 - separate service
-- separate database
+- separate schema in the shared database
 - same VM is fine at first
 - separate domain is preferred once you expose it publicly
 
