@@ -93,7 +93,7 @@ func (s *Server) requestMetricsMiddleware(next echo.HandlerFunc) echo.HandlerFun
 			slog.Info("http request",
 				"method", request.Method,
 				"route", requestMetricRoute(c, request),
-				"status", responseStatus(c),
+				"status", responseStatus(c, err),
 				"duration_ms", durationMillis(time.Since(start)),
 				"db_query_count", snapshot.QueryCount,
 				"db_duration_ms", durationMillis(snapshot.QueryDuration),
@@ -116,9 +116,16 @@ func requestMetricRoute(c echo.Context, request *http.Request) string {
 	return request.URL.Path
 }
 
-func responseStatus(c echo.Context) int {
+func responseStatus(c echo.Context, err error) int {
 	if c.Response().Status != 0 {
 		return c.Response().Status
+	}
+	if err != nil {
+		var httpError *echo.HTTPError
+		if errors.As(err, &httpError) {
+			return httpError.Code
+		}
+		return http.StatusInternalServerError
 	}
 	return http.StatusOK
 }

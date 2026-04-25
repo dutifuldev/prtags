@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -73,4 +74,17 @@ func TestDecodeJSONBodyAllowsEOF(t *testing.T) {
 		OK bool `json:"ok"`
 	}
 	require.NoError(t, decodeJSONBody(c, &payload))
+}
+
+func TestResponseStatusUsesWrittenOrReturnedErrorStatus(t *testing.T) {
+	e := echo.New()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	c := e.NewContext(req, httptest.NewRecorder())
+
+	require.Equal(t, http.StatusOK, responseStatus(c, nil))
+	require.Equal(t, http.StatusTeapot, responseStatus(c, echo.NewHTTPError(http.StatusTeapot, "tea")))
+	require.Equal(t, http.StatusInternalServerError, responseStatus(c, errors.New("boom")))
+
+	c.Response().Status = http.StatusCreated
+	require.Equal(t, http.StatusCreated, responseStatus(c, echo.NewHTTPError(http.StatusBadRequest, "bad")))
 }

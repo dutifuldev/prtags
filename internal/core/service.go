@@ -1555,45 +1555,64 @@ func annotationTargetsForFieldValues(values []database.FieldValue) []annotationT
 }
 
 func (s *Service) getAnnotationsForTargetKeys(ctx context.Context, repositoryID int64, targets []annotationTarget) (map[string]map[string]any, error) {
-	result := make(map[string]map[string]any, len(targets))
-	targetKeys := make([]string, 0, len(targets))
-	wanted := map[string]struct{}{}
-	seenKeys := map[string]struct{}{}
-	for _, target := range targets {
-		if target.targetType == "" || target.targetKey == "" {
-			continue
-		}
-		mapKey := annotationMapKey(target.targetType, target.targetKey)
-		result[mapKey] = map[string]any{}
-		wanted[mapKey] = struct{}{}
-		if _, ok := seenKeys[target.targetKey]; ok {
-			continue
-		}
-		seenKeys[target.targetKey] = struct{}{}
-		targetKeys = append(targetKeys, target.targetKey)
-	}
-	if len(targetKeys) == 0 {
-		return result, nil
+	filters := collectAnnotationTargetFilters(targets)
+	if len(filters.targetKeys) == 0 {
+		return filters.result, nil
 	}
 
 	var values []database.FieldValue
 	if err := s.db.WithContext(ctx).Preload("FieldDefinition").
-		Where("github_repository_id = ? AND target_key IN ?", repositoryID, targetKeys).
+		Where("github_repository_id = ? AND target_type IN ? AND target_key IN ?", repositoryID, filters.targetTypes, filters.targetKeys).
 		Order("target_key ASC, field_definition_id ASC").
 		Find(&values).Error; err != nil {
 		return nil, err
 	}
 	for _, value := range values {
 		mapKey := annotationMapKey(value.TargetType, value.TargetKey)
-		if _, ok := wanted[mapKey]; !ok {
+		if _, ok := filters.wanted[mapKey]; !ok {
 			continue
 		}
-		if result[mapKey] == nil {
-			result[mapKey] = map[string]any{}
+		if filters.result[mapKey] == nil {
+			filters.result[mapKey] = map[string]any{}
 		}
-		result[mapKey][value.FieldDefinition.Name] = fieldValueToAPI(value)
+		filters.result[mapKey][value.FieldDefinition.Name] = fieldValueToAPI(value)
 	}
-	return result, nil
+	return filters.result, nil
+}
+
+type annotationTargetFilters struct {
+	result      map[string]map[string]any
+	wanted      map[string]struct{}
+	targetKeys  []string
+	targetTypes []string
+}
+
+func collectAnnotationTargetFilters(targets []annotationTarget) annotationTargetFilters {
+	filters := annotationTargetFilters{
+		result:      make(map[string]map[string]any, len(targets)),
+		wanted:      map[string]struct{}{},
+		targetKeys:  make([]string, 0, len(targets)),
+		targetTypes: make([]string, 0, len(targets)),
+	}
+	seenKeys := map[string]struct{}{}
+	seenTypes := map[string]struct{}{}
+	for _, target := range targets {
+		if target.targetType == "" || target.targetKey == "" {
+			continue
+		}
+		mapKey := annotationMapKey(target.targetType, target.targetKey)
+		filters.result[mapKey] = map[string]any{}
+		filters.wanted[mapKey] = struct{}{}
+		if _, ok := seenTypes[target.targetType]; !ok {
+			seenTypes[target.targetType] = struct{}{}
+			filters.targetTypes = append(filters.targetTypes, target.targetType)
+		}
+		if _, ok := seenKeys[target.targetKey]; !ok {
+			seenKeys[target.targetKey] = struct{}{}
+			filters.targetKeys = append(filters.targetKeys, target.targetKey)
+		}
+	}
+	return filters
 }
 
 func annotationMapKey(targetType, targetKey string) string {
