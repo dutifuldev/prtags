@@ -243,15 +243,21 @@ type serveRuntime struct {
 	server     *httpapi.Server
 }
 
+type workerRuntime struct {
+	db         *gorm.DB
+	dispatcher *core.RiverDispatcher
+}
+
 func newWorkerRunCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "run",
 		Short: "Run background workers",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, runtime, err := openServeRuntime()
+			_, runtime, err := openWorkerRuntime()
 			if err != nil {
 				return err
 			}
+			defer func() { _ = closeGormDB(runtime.db) }()
 			if err := runtime.dispatcher.ImportLegacyIndexJobs(cmd.Context(), runtime.db); err != nil {
 				return err
 			}
@@ -259,10 +265,7 @@ func newWorkerRunCommand() *cobra.Command {
 				return err
 			}
 			<-cmd.Context().Done()
-			err = runtime.dispatcher.Stop(context.Background())
-			_ = closeGormDB(runtime.workerDB)
-			_ = closeGormDB(runtime.db)
-			return err
+			return runtime.dispatcher.Stop(context.Background())
 		},
 	}
 }
@@ -289,10 +292,7 @@ func openServeRuntime() (config.Config, serveRuntime, error) {
 	indexer := core.NewIndexer(db, mirrorReader, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
 	service := core.NewService(db, mirrorReader, checker, indexer)
 	commentSync := buildCommentSyncService(db, cfg, mirrorReader)
-	workerMirrorReader := mirrordb.NewSchemaReader(workerDB, cfg.GHReplicaSchema)
-	workerIndexer := core.NewIndexer(workerDB, workerMirrorReader, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
-	workerCommentSync := buildCommentSyncService(workerDB, cfg, workerMirrorReader)
-	dispatcher, err := newRiverDispatcherForDB(workerDB, workerIndexer, workerCommentSync)
+	dispatcher, workerCommentSync, err := buildWorkerDispatcher(workerDB, cfg)
 	if err != nil {
 		_ = closeGormDB(workerDB)
 		_ = closeGormDB(db)
@@ -314,6 +314,40 @@ func openServeRuntime() (config.Config, serveRuntime, error) {
 	}, nil
 }
 
+func openWorkerRuntime() (config.Config, workerRuntime, error) {
+	cfg := config.FromEnv()
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, workerRuntime{}, err
+	}
+	db, err := openConfiguredWorkerDatabaseWithMigrations(cfg)
+	if err != nil {
+		return config.Config{}, workerRuntime{}, err
+	}
+	dispatcher, commentSync, err := buildWorkerDispatcher(db, cfg)
+	if err != nil {
+		_ = closeGormDB(db)
+		return config.Config{}, workerRuntime{}, err
+	}
+	if commentSync != nil {
+		commentSync.SetDispatcher(dispatcher)
+	}
+	return cfg, workerRuntime{
+		db:         db,
+		dispatcher: dispatcher,
+	}, nil
+}
+
+func buildWorkerDispatcher(db *gorm.DB, cfg config.Config) (*core.RiverDispatcher, *core.CommentSyncService, error) {
+	mirrorReader := mirrordb.NewSchemaReader(db, cfg.GHReplicaSchema)
+	indexer := core.NewIndexer(db, mirrorReader, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+	commentSync := buildCommentSyncService(db, cfg, mirrorReader)
+	dispatcher, err := newRiverDispatcherForDB(db, cfg.PRTagsSchema, indexer, commentSync)
+	if err != nil {
+		return nil, nil, err
+	}
+	return dispatcher, commentSync, nil
+}
+
 func openConfiguredDatabase(cfg config.Config) (*gorm.DB, error) {
 	return openConfiguredDatabaseWithPool(cfg, database.PoolConfig{
 		MaxOpenConns:    cfg.DBMaxOpenConns,
@@ -330,6 +364,15 @@ func openConfiguredWorkerDatabase(cfg config.Config) (*gorm.DB, error) {
 		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
 		ConnMaxLifetime: cfg.DBConnMaxLifetime,
 	}, false)
+}
+
+func openConfiguredWorkerDatabaseWithMigrations(cfg config.Config) (*gorm.DB, error) {
+	return openConfiguredDatabaseWithPool(cfg, database.PoolConfig{
+		MaxOpenConns:    cfg.DBWorkerMaxOpenConns,
+		MaxIdleConns:    cfg.DBWorkerMaxIdleConns,
+		ConnMaxIdleTime: cfg.DBConnMaxIdleTime,
+		ConnMaxLifetime: cfg.DBConnMaxLifetime,
+	}, true)
 }
 
 func openConfiguredDatabaseWithPool(cfg config.Config, pool database.PoolConfig, runMigrations bool) (*gorm.DB, error) {
@@ -438,12 +481,12 @@ func buildCommentSyncService(db *gorm.DB, cfg config.Config, mirror *mirrordb.Re
 	}), nil)
 }
 
-func newRiverDispatcherForDB(db *gorm.DB, indexer *core.Indexer, commentSync *core.CommentSyncService) (*core.RiverDispatcher, error) {
+func newRiverDispatcherForDB(db *gorm.DB, schema string, indexer *core.Indexer, commentSync *core.CommentSyncService) (*core.RiverDispatcher, error) {
 	sqlDB, err := db.DB()
 	if err != nil {
 		return nil, err
 	}
-	return core.NewRiverDispatcher(sqlDB, indexer, commentSync)
+	return core.NewRiverDispatcher(sqlDB, schema, indexer, commentSync)
 }
 
 //nolint:cyclop,gocognit // Cobra command assembly is intentionally declarative and easier to maintain as one block.

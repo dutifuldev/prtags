@@ -282,7 +282,6 @@ go run ./cmd/prtags field create -R dutifuldev/ghreplica --name intent --scope p
 go run ./cmd/prtags group create -R dutifuldev/ghreplica --kind mixed --title "Rename hardening work"
 go run ./cmd/prtags annotation pr set -R dutifuldev/ghreplica 23 intent="harden rename handling"
 go run ./cmd/prtags search text -R dutifuldev/ghreplica "rename hardening"
-go run ./cmd/prtags worker run-once
 ```
 
 The CLI automatically reads `PRTAGS_GITHUB_TOKEN`, `GITHUB_TOKEN`, or `GH_TOKEN` for authenticated writes. In local development, if you run the server with `ALLOW_UNAUTH_WRITES=true`, it will also accept `X-Actor` and default to a `local-dev` actor when that header is missing.

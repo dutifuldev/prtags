@@ -169,7 +169,7 @@ func TestNewRiverDispatcherAndImportLegacyHelpers(t *testing.T) {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 
-	dispatcher, err := NewRiverDispatcher(sqlDB, nil, nil)
+	dispatcher, err := NewRiverDispatcher(sqlDB, "", nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, dispatcher)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -204,7 +204,7 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 
-	dispatcher, err := NewRiverDispatcher(sqlDB, nil, commentSync)
+	dispatcher, err := NewRiverDispatcher(sqlDB, "", nil, commentSync)
 	require.NoError(t, err)
 
 	repository := database.RepositoryProjection{GitHubRepositoryID: group.GitHubRepositoryID, Owner: group.RepositoryOwner, Name: group.RepositoryName}
@@ -235,7 +235,7 @@ func TestRiverDispatcherQueueMethods(t *testing.T) {
 	require.NoError(t, db.First(&legacy, legacy.ID).Error)
 	require.Equal(t, "succeeded", legacy.Status)
 
-	nilDispatcher, err := NewRiverDispatcher(sqlDB, nil, nil)
+	nilDispatcher, err := NewRiverDispatcher(sqlDB, "", nil, nil)
 	require.NoError(t, err)
 	require.NoError(t, nilDispatcher.EnqueueGroupCommentProjectTx(nil, 1))
 	require.NoError(t, nilDispatcher.EnqueueGroupCommentReconcileTx(nil, 1, 1, time.Now().UTC(), false))

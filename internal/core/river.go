@@ -146,7 +146,7 @@ func (w *groupCommentRepairWorker) Work(ctx context.Context, job *river.Job[Grou
 	return w.commentSync.Repair(ctx, job.Args.GroupID)
 }
 
-func NewRiverDispatcher(sqlDB *sql.DB, indexer *Indexer, commentSync *CommentSyncService) (*RiverDispatcher, error) {
+func NewRiverDispatcher(sqlDB *sql.DB, schema string, indexer *Indexer, commentSync *CommentSyncService) (*RiverDispatcher, error) {
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &searchDocumentRebuildWorker{indexer: indexer})
 	river.AddWorker(workers, &embeddingRebuildWorker{indexer: indexer})
@@ -182,6 +182,7 @@ func NewRiverDispatcher(sqlDB *sql.DB, indexer *Indexer, commentSync *CommentSyn
 		PeriodicJobs:      periodicJobs,
 		Queues:            queues,
 		RetryPolicy:       &cappedRetryPolicy{capDelay: defaultRetryCap},
+		Schema:            schema,
 		Workers:           workers,
 	})
 	if err != nil {

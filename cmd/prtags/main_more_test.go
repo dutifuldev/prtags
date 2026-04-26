@@ -162,7 +162,7 @@ func TestAuthAndRuntimeHelpers(t *testing.T) {
 		GitHubAppPrivateKeyPath: "",
 	}, mirror))
 
-	dispatcher, err := newRiverDispatcherForDB(db, nil, nil)
+	dispatcher, err := newRiverDispatcherForDB(db, "", nil, nil)
 	require.NoError(t, err)
 	require.NotNil(t, dispatcher)
 }
