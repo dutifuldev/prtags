@@ -18,9 +18,9 @@ import (
 	"github.com/dutifuldev/prtags/internal/core"
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/githubapi"
 	"github.com/dutifuldev/prtags/internal/httpapi"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/spf13/cobra"
 	"gopkg.in/yaml.v3"
@@ -274,10 +274,10 @@ func openServeRuntime() (config.Config, serveRuntime, error) {
 	if !cfg.AllowUnauthWrites {
 		checker = permissions.NewGitHubChecker(0)
 	}
-	ghClient := ghreplica.NewSchemaClient(db, cfg.GHReplicaSchema)
-	indexer := core.NewIndexer(db, ghClient, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
-	service := core.NewService(db, ghClient, checker, indexer)
-	commentSync := buildCommentSyncService(db, cfg, ghClient)
+	mirrorReader := mirrordb.NewSchemaReader(db, cfg.GHReplicaSchema)
+	indexer := core.NewIndexer(db, mirrorReader, embedding.NewLocalHashProvider(cfg.EmbeddingModel, database.EmbeddingDimensions))
+	service := core.NewService(db, mirrorReader, checker, indexer)
+	commentSync := buildCommentSyncService(db, cfg, mirrorReader)
 	dispatcher, err := newRiverDispatcherForDB(db, indexer, commentSync)
 	if err != nil {
 		return config.Config{}, serveRuntime{}, err
@@ -377,7 +377,7 @@ func postgresKeywordValue(value string) string {
 	return "'" + escaped + "'"
 }
 
-func buildCommentSyncService(db *gorm.DB, cfg config.Config, mirror *ghreplica.Client) *core.CommentSyncService {
+func buildCommentSyncService(db *gorm.DB, cfg config.Config, mirror *mirrordb.Reader) *core.CommentSyncService {
 	if !cfg.HasGitHubApp() {
 		return nil
 	}

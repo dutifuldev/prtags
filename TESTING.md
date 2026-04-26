@@ -125,7 +125,7 @@ Preferred long-term package targets:
 - `internal/core`: `90%+`
 - `internal/httpapi`: `85%+`
 - `internal/githubapi`: `80%+`
-- `internal/ghreplica`: `80%+`
+- `internal/mirrordb`: `80%+`
 - small utility packages: near `100%` when practical
 
 Coverage should be raised deliberately, package by package, with useful tests.
@@ -203,7 +203,7 @@ Use mocks or stubs at real boundaries.
 Typical valid boundaries in `prtags` include:
 
 - GitHub API access
-- `ghreplica` client behavior
+- direct mirror database reader behavior
 - time
 - database boundaries when a smaller isolated test is appropriate
 - background job dispatch or worker behavior

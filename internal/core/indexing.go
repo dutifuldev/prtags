@@ -13,14 +13,14 @@ import (
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	"github.com/dutifuldev/prtags/internal/ghreplica"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/pgvector/pgvector-go"
 	"gorm.io/gorm"
 )
 
 type Indexer struct {
 	db        *gorm.DB
-	ghreplica mirrorClient
+	mirror    mirrorReader
 	embedding embedding.Provider
 	owner     string
 	leaseTTL  time.Duration
@@ -35,10 +35,10 @@ type TextSearchResult struct {
 	Annotations   map[string]any            `json:"annotations,omitempty"`
 }
 
-func NewIndexer(db *gorm.DB, gh mirrorClient, provider embedding.Provider) *Indexer {
+func NewIndexer(db *gorm.DB, mirror mirrorReader, provider embedding.Provider) *Indexer {
 	return &Indexer{
 		db:        db,
-		ghreplica: gh,
+		mirror:    mirror,
 		embedding: provider,
 		owner:     fmt.Sprintf("worker-%d", time.Now().UnixNano()),
 		leaseTTL:  5 * time.Minute,
@@ -545,7 +545,7 @@ func (s *Service) resolveSearchResults(ctx context.Context, repositoryID int64, 
 }
 
 func (s *Service) searchObjectSummaries(ctx context.Context, repositoryID int64, rows []scoredSearchTarget) (map[string]GroupMemberObjectSummary, error) {
-	refs := make([]ghreplica.ObjectRef, 0, len(rows))
+	refs := make([]mirrordb.ObjectRef, 0, len(rows))
 	for _, row := range rows {
 		if row.TargetType != "pull_request" && row.TargetType != "issue" {
 			continue
@@ -554,7 +554,7 @@ func (s *Service) searchObjectSummaries(ctx context.Context, repositoryID int64,
 		if !ok {
 			continue
 		}
-		refs = append(refs, ghreplica.ObjectRef{Type: row.TargetType, Number: number})
+		refs = append(refs, mirrordb.ObjectRef{Type: row.TargetType, Number: number})
 	}
 	if len(refs) == 0 {
 		return map[string]GroupMemberObjectSummary{}, nil
@@ -567,7 +567,7 @@ func (s *Service) populateObjectSearchResult(ctx context.Context, repositoryID i
 	if !ok {
 		return result, nil
 	}
-	summaries, err := s.mirrorObjectSummaries(ctx, repositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: number}})
+	summaries, err := s.mirrorObjectSummaries(ctx, repositoryID, []mirrordb.ObjectRef{{Type: targetType, Number: number}})
 	if err != nil {
 		return TextSearchResult{}, err
 	}
@@ -651,7 +651,7 @@ func (i *Indexer) objectSearchParts(ctx context.Context, repositoryID int64, tar
 	if !ok {
 		return nil, time.Now().UTC(), nil
 	}
-	results, err := i.ghreplica.BatchGetObjects(ctx, repositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: number}})
+	results, err := i.mirror.BatchObjects(ctx, repositoryID, []mirrordb.ObjectRef{{Type: targetType, Number: number}})
 	if err != nil {
 		return nil, time.Now().UTC(), err
 	}

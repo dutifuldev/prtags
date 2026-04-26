@@ -10,7 +10,7 @@ Current public instance:
 
 - `https://prtags.dutiful.dev`
 
-`PRtags` runs as a separate service next to `ghreplica` and uses its own Postgres database.
+`PRtags` runs as a separate service next to `ghreplica` and uses the shared Postgres database with separate schemas.
 
 ## Core Product
 

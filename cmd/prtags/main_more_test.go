@@ -15,8 +15,8 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/dutifuldev/prtags/internal/auth"
 	"github.com/dutifuldev/prtags/internal/config"
-	"github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/jsend"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/postgres"
@@ -150,7 +150,7 @@ func TestAuthAndRuntimeHelpers(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	mirror := ghreplica.NewSchemaClient(db, "public")
+	mirror := mirrordb.NewSchemaReader(db, "public")
 	require.Nil(t, buildCommentSyncService(db, config.Config{}, mirror))
 	require.NotNil(t, buildCommentSyncService(db, config.Config{
 		GitHubBaseURL:           viewerServer.URL,

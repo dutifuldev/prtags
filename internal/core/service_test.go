@@ -16,7 +16,7 @@ import (
 
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/sqlite"
@@ -153,7 +153,7 @@ func TestFilterTargetsUsesMatchingScopeAndSupportsMultiEnum(t *testing.T) {
 func TestReadRepositoryProjectionResolvesRenamedRepositoryByGitHubID(t *testing.T) {
 	ctx := context.Background()
 	service, db, server := newTestServiceWithBatchOptions(t, batchBehavior{
-		repositoryAliases: map[string]ghreplica.Repository{
+		repositoryAliases: map[string]mirrordb.Repository{
 			"renamed/widgets-renamed": testRepository("renamed", "widgets-renamed", 101),
 		},
 	})
@@ -180,7 +180,7 @@ func TestReadRepositoryProjectionResolvesRenamedRepositoryByGitHubID(t *testing.
 
 func TestReadRepositoryProjectionRejectsReusedRepositoryPath(t *testing.T) {
 	ctx := context.Background()
-	aliases := map[string]ghreplica.Repository{}
+	aliases := map[string]mirrordb.Repository{}
 	service, _, server := newTestServiceWithBatchOptions(t, batchBehavior{repositoryAliases: aliases})
 	defer server.Close()
 
@@ -1320,30 +1320,29 @@ func newTestServiceWithBatchOptions(t *testing.T, behavior batchBehavior) (*Serv
 type batchBehavior struct {
 	fail              bool
 	delay             time.Duration
-	objectDelay       time.Duration
 	calls             *atomic.Int32
-	repositoryAliases map[string]ghreplica.Repository
+	repositoryAliases map[string]mirrordb.Repository
 }
 
 type testMirrorClient struct {
 	behavior batchBehavior
 }
 
-func (c testMirrorClient) GetRepository(_ context.Context, owner, repo string) (ghreplica.Repository, error) {
+func (c testMirrorClient) Repository(_ context.Context, owner, repo string) (mirrordb.Repository, error) {
 	if c.behavior.fail {
-		return ghreplica.Repository{}, errors.New("mirror unavailable")
+		return mirrordb.Repository{}, errors.New("mirror unavailable")
 	}
 	if repository, ok := c.behavior.repositoryAliases[owner+"/"+repo]; ok {
 		return repository, nil
 	}
 	if owner != "acme" || repo != "widgets" {
-		return ghreplica.Repository{}, gorm.ErrRecordNotFound
+		return mirrordb.Repository{}, gorm.ErrRecordNotFound
 	}
 	return testRepository(owner, repo, 101), nil
 }
 
-func testRepository(owner, repo string, id int64) ghreplica.Repository {
-	return ghreplica.Repository{
+func testRepository(owner, repo string, id int64) mirrordb.Repository {
+	return mirrordb.Repository{
 		ID:         id,
 		Name:       repo,
 		FullName:   owner + "/" + repo,
@@ -1356,43 +1355,7 @@ func testRepository(owner, repo string, id int64) ghreplica.Repository {
 	}
 }
 
-func (c testMirrorClient) GetIssue(context.Context, string, string, int) (ghreplica.Issue, error) {
-	if c.behavior.fail {
-		return ghreplica.Issue{}, errors.New("mirror unavailable")
-	}
-	if c.behavior.objectDelay > 0 {
-		time.Sleep(c.behavior.objectDelay)
-	}
-	return ghreplica.Issue{
-		ID:        1111,
-		Number:    11,
-		Title:     "Auth retries are flaky",
-		State:     "open",
-		HTMLURL:   "https://github.com/acme/widgets/issues/11",
-		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
-		User:      ghreplica.UserObject{Login: "alice"},
-	}, nil
-}
-
-func (c testMirrorClient) GetPullRequest(context.Context, string, string, int) (ghreplica.PullRequest, error) {
-	if c.behavior.fail {
-		return ghreplica.PullRequest{}, errors.New("mirror unavailable")
-	}
-	if c.behavior.objectDelay > 0 {
-		time.Sleep(c.behavior.objectDelay)
-	}
-	return ghreplica.PullRequest{
-		ID:        2022,
-		Number:    22,
-		Title:     "Retry ACP turns safely",
-		State:     "open",
-		HTMLURL:   "https://github.com/acme/widgets/pull/22",
-		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
-		User:      ghreplica.UserObject{Login: "bob"},
-	}, nil
-}
-
-func (c testMirrorClient) BatchGetObjects(_ context.Context, _ int64, objects []ghreplica.ObjectRef) ([]ghreplica.ObjectResult, error) {
+func (c testMirrorClient) BatchObjects(_ context.Context, _ int64, objects []mirrordb.ObjectRef) ([]mirrordb.ObjectResult, error) {
 	if c.behavior.fail {
 		return nil, errors.New("mirror unavailable")
 	}
@@ -1402,9 +1365,9 @@ func (c testMirrorClient) BatchGetObjects(_ context.Context, _ int64, objects []
 	if c.behavior.delay > 0 {
 		time.Sleep(c.behavior.delay)
 	}
-	results := make([]ghreplica.ObjectResult, 0, len(objects))
+	results := make([]mirrordb.ObjectResult, 0, len(objects))
 	for _, object := range objects {
-		result := ghreplica.ObjectResult{Type: object.Type, Number: object.Number}
+		result := mirrordb.ObjectResult{Type: object.Type, Number: object.Number}
 		if object.Number == 999 || object.Number <= 0 {
 			results = append(results, result)
 			continue
@@ -1417,7 +1380,7 @@ func (c testMirrorClient) BatchGetObjects(_ context.Context, _ int64, objects []
 	return results, nil
 }
 
-func testObjectSummary(objectType string, number int) ghreplica.ObjectSummary {
+func testObjectSummary(objectType string, number int) mirrordb.ObjectSummary {
 	title := fmt.Sprintf("%s %d", strings.ReplaceAll(objectType, "_", " "), number)
 	author := "alice"
 	if objectType == "pull_request" {
@@ -1429,7 +1392,7 @@ func testObjectSummary(objectType string, number int) ghreplica.ObjectSummary {
 	case objectType == "pull_request" && number == 22:
 		title = "Retry ACP turns safely"
 	}
-	return ghreplica.ObjectSummary{
+	return mirrordb.ObjectSummary{
 		Title:       title,
 		State:       "open",
 		HTMLURL:     testObjectURL(objectType, number),

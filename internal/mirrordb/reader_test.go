@@ -1,4 +1,4 @@
-package ghreplica
+package mirrordb
 
 import (
 	"context"
@@ -12,55 +12,18 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-func TestClientReadsMirrorObjects(t *testing.T) {
+func TestReaderReadsRepositoryAndBatchObjects(t *testing.T) {
 	db := openMirrorTestDB(t)
 	seedMirrorRows(t, db)
 
-	client := NewClient(mirror.NewReader(db))
-	repository, err := client.GetRepository(context.Background(), "openclaw", "openclaw")
+	reader := NewReader(mirror.NewReader(db))
+	repository, err := reader.Repository(context.Background(), "openclaw", "openclaw")
 	require.NoError(t, err)
 	require.EqualValues(t, 1103012935, repository.ID)
 	require.Equal(t, "openclaw/openclaw", repository.FullName)
 	require.Equal(t, "openclaw", repository.Owner.Login)
 
-	issue, err := client.GetIssue(context.Background(), "openclaw", "openclaw", 11)
-	require.NoError(t, err)
-	require.Equal(t, "Issue title", issue.Title)
-	require.Equal(t, "octocat", issue.User.Login)
-
-	pull, err := client.GetPullRequest(context.Background(), "openclaw", "openclaw", 22)
-	require.NoError(t, err)
-	require.Equal(t, "Pull title", pull.Title)
-	require.Equal(t, "open", pull.State)
-	require.Equal(t, "octocat", pull.User.Login)
-}
-
-func TestClientReturnsMissingMirrorErrors(t *testing.T) {
-	db := openMirrorTestDB(t)
-	client := NewClient(mirror.NewReader(db))
-
-	_, err := client.GetRepository(context.Background(), "missing", "repo")
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
-}
-
-func TestClientReturnsMissingIssueAndPullRequestErrors(t *testing.T) {
-	db := openMirrorTestDB(t)
-	seedMirrorRows(t, db)
-	client := NewClient(mirror.NewReader(db))
-
-	_, err := client.GetIssue(context.Background(), "openclaw", "openclaw", 999)
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
-
-	_, err = client.GetPullRequest(context.Background(), "openclaw", "openclaw", 999)
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
-}
-
-func TestClientBatchGetObjectsPreservesOrderAndMissingRows(t *testing.T) {
-	db := openMirrorTestDB(t)
-	seedMirrorRows(t, db)
-	client := NewClient(mirror.NewReader(db))
-
-	results, err := client.BatchGetObjects(context.Background(), 1103012935, []ObjectRef{
+	results, err := reader.BatchObjects(context.Background(), 1103012935, []ObjectRef{
 		{Type: "pull_request", Number: 22},
 		{Type: "issue", Number: 11},
 		{Type: "pull_request", Number: 999},
@@ -82,56 +45,46 @@ func TestClientBatchGetObjectsPreservesOrderAndMissingRows(t *testing.T) {
 	require.False(t, results[4].Found)
 	require.True(t, results[5].Found)
 
-	empty, err := client.BatchGetObjects(context.Background(), 1103012935, nil)
+	empty, err := reader.BatchObjects(context.Background(), 1103012935, nil)
 	require.NoError(t, err)
 	require.Empty(t, empty)
 }
 
-func TestClientBatchGetObjectsReturnsRepositoryLookupErrors(t *testing.T) {
+func TestReaderReturnsMissingMirrorErrors(t *testing.T) {
 	db := openMirrorTestDB(t)
-	client := NewClient(mirror.NewReader(db))
+	reader := NewReader(mirror.NewReader(db))
 
-	_, err := client.BatchGetObjects(context.Background(), 999, []ObjectRef{{Type: "issue", Number: 11}})
+	_, err := reader.Repository(context.Background(), "missing", "repo")
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+
+	_, err = reader.BatchObjects(context.Background(), 999, []ObjectRef{{Type: "issue", Number: 11}})
 	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
 }
 
-func TestNewSchemaClientReadsConfiguredSchema(t *testing.T) {
+func TestSchemaReaderReadsConfiguredSchemaAndCurrentMirrorRows(t *testing.T) {
 	db := openMirrorTestDB(t)
 	seedMirrorRows(t, db)
 
-	client := NewSchemaClient(db, "main")
-	repository, err := client.GetRepository(context.Background(), "openclaw", "openclaw")
+	reader := NewSchemaReader(db, "main")
+	repository, err := reader.Repository(context.Background(), "openclaw", "openclaw")
 	require.NoError(t, err)
 	require.Equal(t, "openclaw/openclaw", repository.FullName)
-}
 
-func TestNewSchemaClientBatchGetObjectsUsesJoinedSummaries(t *testing.T) {
-	db := openMirrorTestDB(t)
-	seedMirrorRows(t, db)
-
-	client := NewSchemaClient(db, "main")
-	results, err := client.BatchGetObjects(context.Background(), 1103012935, []ObjectRef{
+	results, err := reader.BatchObjects(context.Background(), 1103012935, []ObjectRef{
 		{Type: "pull_request", Number: 22},
 		{Type: "issue", Number: 11},
-		{Type: "pull_request", Number: 999},
 	})
 	require.NoError(t, err)
-	require.Len(t, results, 3)
-	require.True(t, results[0].Found)
+	require.Len(t, results, 2)
 	require.Equal(t, "Pull title", results[0].Summary.Title)
 	require.Equal(t, "octocat", results[0].Summary.AuthorLogin)
-	require.True(t, results[1].Found)
 	require.Equal(t, "Issue title", results[1].Summary.Title)
 	require.Equal(t, "octocat", results[1].Summary.AuthorLogin)
-	require.False(t, results[2].Found)
-}
 
-func TestNewSchemaClientBatchGetObjectsPreservesMissingRepositoryError(t *testing.T) {
-	db := openMirrorTestDB(t)
-	client := NewSchemaClient(db, "main")
-
-	_, err := client.BatchGetObjects(context.Background(), 999, []ObjectRef{{Type: "issue", Number: 11}})
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.NoError(t, db.Model(&mirror.Issue{}).Where("number = ?", 11).Update("title", "Updated issue title").Error)
+	results, err = reader.BatchObjects(context.Background(), 1103012935, []ObjectRef{{Type: "issue", Number: 11}})
+	require.NoError(t, err)
+	require.Equal(t, "Updated issue title", results[0].Summary.Title)
 }
 
 func openMirrorTestDB(t *testing.T) *gorm.DB {

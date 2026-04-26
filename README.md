@@ -177,7 +177,7 @@ Similarity search is for vectorized annotation text. Use `prtags search similar`
 
 `PRtags` depends on `ghreplica`.
 
-`ghreplica` remains the source of truth for mirrored repositories, pull requests, and issues. `PRtags` resolves repo and object identity through `ghreplica`, uses stable GitHub-backed identifiers so renames do not break object identity, and derives write permissions from GitHub repo access. That means `PRtags` is not trying to become a second GitHub mirror. It is a curation layer over a mirror that already exists.
+`ghreplica` remains the source of truth for mirrored repositories, pull requests, and issues. `PRtags` resolves repo and object identity through the shared `ghreplica` mirror tables, uses stable GitHub-backed identifiers so renames do not break object identity, and derives write permissions from GitHub repo access. That means `PRtags` is not trying to become a second GitHub mirror. It is a curation layer over a mirror that already exists.
 
 This split is important operationally too. `PRtags` owns its own schema, jobs, search documents, and embeddings. It shares a Postgres database with `ghreplica` so the two systems can join mirrored GitHub data with curation data. It should not copy PR or issue display metadata into a second local projection cache.
 

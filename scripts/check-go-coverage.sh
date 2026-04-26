@@ -7,7 +7,7 @@ declare -A package_minimums=(
   ["./internal/core"]="90.0"
   ["./internal/httpapi"]="85.0"
   ["./internal/githubapi"]="80.0"
-  ["./internal/ghreplica"]="80.0"
+  ["./internal/mirrordb"]="80.0"
 )
 tmpdir="$(mktemp -d)"
 coverfile="$(mktemp)"
