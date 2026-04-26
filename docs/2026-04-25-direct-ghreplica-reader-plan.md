@@ -235,9 +235,9 @@ The intended shape is:
 - keep search index writes in `search_documents` and `embeddings`
 - keep comment sync state in `group_comment_sync_targets`
 
-The existing `internal/ghreplica` package should shrink to aliases or be
-deleted once core code can use `ghreplica/mirror` directly without awkward
-coupling.
+The existing `internal/ghreplica` package should be replaced by a small
+`internal/mirrordb` adapter that exposes direct shared-database reads without
+looking like a ghreplica service API client.
 
 ### Mirror Metadata Helper
 

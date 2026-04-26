@@ -14,8 +14,8 @@ import (
 	"github.com/dutifuldev/prtags/internal/core"
 	"github.com/dutifuldev/prtags/internal/database"
 	"github.com/dutifuldev/prtags/internal/embedding"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/httpapi"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
@@ -28,11 +28,11 @@ type stubMirrorClient struct {
 	fail bool
 }
 
-func (c stubMirrorClient) GetRepository(context.Context, string, string) (ghreplica.Repository, error) {
+func (c stubMirrorClient) Repository(context.Context, string, string) (mirrordb.Repository, error) {
 	if c.fail {
-		return ghreplica.Repository{}, fmt.Errorf("mirror unavailable")
+		return mirrordb.Repository{}, fmt.Errorf("mirror unavailable")
 	}
-	return ghreplica.Repository{
+	return mirrordb.Repository{
 		ID:         101,
 		Name:       "widgets",
 		FullName:   "acme/widgets",
@@ -45,44 +45,14 @@ func (c stubMirrorClient) GetRepository(context.Context, string, string) (ghrepl
 	}, nil
 }
 
-func (c stubMirrorClient) GetIssue(context.Context, string, string, int) (ghreplica.Issue, error) {
-	if c.fail {
-		return ghreplica.Issue{}, fmt.Errorf("mirror unavailable")
-	}
-	return ghreplica.Issue{
-		ID:        1111,
-		Number:    11,
-		Title:     "Auth retries are flaky",
-		State:     "open",
-		HTMLURL:   "https://github.com/acme/widgets/issues/11",
-		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
-		User:      ghreplica.UserObject{Login: "alice"},
-	}, nil
-}
-
-func (c stubMirrorClient) GetPullRequest(context.Context, string, string, int) (ghreplica.PullRequest, error) {
-	if c.fail {
-		return ghreplica.PullRequest{}, fmt.Errorf("mirror unavailable")
-	}
-	return ghreplica.PullRequest{
-		ID:        2022,
-		Number:    22,
-		Title:     "Retry ACP turns safely",
-		State:     "open",
-		HTMLURL:   "https://github.com/acme/widgets/pull/22",
-		UpdatedAt: time.Date(2026, 4, 16, 12, 0, 0, 0, time.UTC),
-		User:      ghreplica.UserObject{Login: "bob"},
-	}, nil
-}
-
-func (c stubMirrorClient) BatchGetObjects(_ context.Context, _ int64, objects []ghreplica.ObjectRef) ([]ghreplica.ObjectResult, error) {
+func (c stubMirrorClient) BatchObjects(_ context.Context, _ int64, objects []mirrordb.ObjectRef) ([]mirrordb.ObjectResult, error) {
 	if c.fail {
 		return nil, fmt.Errorf("mirror unavailable")
 	}
-	results := make([]ghreplica.ObjectResult, 0, len(objects))
+	results := make([]mirrordb.ObjectResult, 0, len(objects))
 	for _, object := range objects {
-		result := ghreplica.ObjectResult{Type: object.Type, Number: object.Number}
-		summary := ghreplica.ObjectSummary{
+		result := mirrordb.ObjectResult{Type: object.Type, Number: object.Number}
+		summary := mirrordb.ObjectSummary{
 			Title:       fmt.Sprintf("%s %d", strings.ReplaceAll(object.Type, "_", " "), object.Number),
 			State:       "open",
 			AuthorLogin: "alice",

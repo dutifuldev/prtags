@@ -9,7 +9,7 @@ import (
 	"github.com/dutifuldev/prtags/internal/config"
 	"github.com/dutifuldev/prtags/internal/core"
 	"github.com/dutifuldev/prtags/internal/database"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/spf13/cobra"
 )
@@ -252,6 +252,6 @@ func openOpsService() (*core.Service, func(), error) {
 	cleanup := func() {
 		_ = sqlDB.Close()
 	}
-	service := core.NewService(db, ghreplica.NewSchemaClient(db, cfg.GHReplicaSchema), permissions.AllowAllChecker{}, nil)
+	service := core.NewService(db, mirrordb.NewSchemaReader(db, cfg.GHReplicaSchema), permissions.AllowAllChecker{}, nil)
 	return service, cleanup, nil
 }

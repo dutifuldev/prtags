@@ -1022,19 +1022,19 @@ func TestPermissionRepositoryAndGrantHelperBranches(t *testing.T) {
 	actor := permissionsActor()
 	repo := database.RepositoryProjection{GitHubRepositoryID: 101, Owner: "acme", Name: "widgets"}
 
-	plainService := NewService(db, service.ghreplica, checkerOnlyStub{}, service.indexer)
+	plainService := NewService(db, service.mirror, checkerOnlyStub{}, service.indexer)
 	require.ErrorIs(t, plainService.requireWrite(ctx, actor, repo), ErrForbidden)
 
-	errService := NewService(db, service.ghreplica, checkerErrorStub{canWriteErr: errors.New("perm backend down")}, service.indexer)
+	errService := NewService(db, service.mirror, checkerErrorStub{canWriteErr: errors.New("perm backend down")}, service.indexer)
 	require.ErrorContains(t, errService.requireWrite(ctx, actor, repo), "perm backend down")
 
-	resolveErrService := NewService(db, service.ghreplica, checkerErrorStub{resolveErr: errors.New("identity lookup failed")}, service.indexer)
+	resolveErrService := NewService(db, service.mirror, checkerErrorStub{resolveErr: errors.New("identity lookup failed")}, service.indexer)
 	require.ErrorContains(t, resolveErrService.requireWrite(ctx, actor, repo), "identity lookup failed")
 
-	zeroIdentityService := NewService(db, service.ghreplica, checkerErrorStub{identity: permissions.Identity{}}, service.indexer)
+	zeroIdentityService := NewService(db, service.mirror, checkerErrorStub{identity: permissions.Identity{}}, service.indexer)
 	require.ErrorIs(t, zeroIdentityService.requireWrite(ctx, actor, repo), ErrForbidden)
 
-	noGrantService := NewService(db, service.ghreplica, checkerErrorStub{identity: permissions.Identity{GitHubUserID: 55, GitHubLogin: "alice"}}, service.indexer)
+	noGrantService := NewService(db, service.mirror, checkerErrorStub{identity: permissions.Identity{GitHubUserID: 55, GitHubLogin: "alice"}}, service.indexer)
 	require.ErrorIs(t, noGrantService.requireWrite(ctx, actor, repo), ErrForbidden)
 
 	require.NoError(t, db.Create(&database.RepositoryAccessGrant{

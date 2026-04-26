@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/dutifuldev/prtags/internal/database"
-	ghreplica "github.com/dutifuldev/prtags/internal/ghreplica"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"github.com/dutifuldev/prtags/internal/permissions"
 	"github.com/dutifuldev/prtags/internal/publicid"
 	"gorm.io/datatypes"
@@ -36,18 +36,16 @@ func (e *FailError) Error() string {
 
 type Service struct {
 	db          *gorm.DB
-	ghreplica   mirrorClient
+	mirror      mirrorReader
 	permission  permissions.Checker
 	indexer     *Indexer
 	dispatcher  JobDispatcher
 	commentSync *CommentSyncService
 }
 
-type mirrorClient interface {
-	GetRepository(ctx context.Context, owner, repo string) (ghreplica.Repository, error)
-	GetIssue(ctx context.Context, owner, repo string, number int) (ghreplica.Issue, error)
-	GetPullRequest(ctx context.Context, owner, repo string, number int) (ghreplica.PullRequest, error)
-	BatchGetObjects(ctx context.Context, repositoryID int64, objects []ghreplica.ObjectRef) ([]ghreplica.ObjectResult, error)
+type mirrorReader interface {
+	Repository(ctx context.Context, owner, repo string) (mirrordb.Repository, error)
+	BatchObjects(ctx context.Context, repositoryID int64, objects []mirrordb.ObjectRef) ([]mirrordb.ObjectResult, error)
 }
 
 type groupMemberConflictDetails struct {
@@ -156,10 +154,10 @@ type GetGroupOptions struct {
 	IncludeMetadata bool
 }
 
-func NewService(db *gorm.DB, gh mirrorClient, checker permissions.Checker, indexer *Indexer) *Service {
+func NewService(db *gorm.DB, mirror mirrorReader, checker permissions.Checker, indexer *Indexer) *Service {
 	return &Service{
 		db:         db,
-		ghreplica:  gh,
+		mirror:     mirror,
 		permission: checker,
 		indexer:    indexer,
 	}
@@ -177,7 +175,7 @@ func (s *Service) EnsureRepository(ctx context.Context, owner, repo string) (dat
 	timer := database.StartQueryStep(ctx, "repo_ensure")
 	defer timer.Done()
 
-	repository, err := s.ghreplica.GetRepository(ctx, owner, repo)
+	repository, err := s.mirror.Repository(ctx, owner, repo)
 	if err != nil {
 		return database.RepositoryProjection{}, err
 	}
@@ -194,7 +192,7 @@ func (s *Service) readRepositoryProjection(ctx context.Context, owner, repo stri
 	timer := database.StartQueryStep(ctx, "repo_read")
 	defer timer.Done()
 
-	mirrorRepository, err := s.ghreplica.GetRepository(ctx, owner, repo)
+	mirrorRepository, err := s.mirror.Repository(ctx, owner, repo)
 	if err != nil {
 		return database.RepositoryProjection{}, translateDBError(err)
 	}
@@ -204,7 +202,7 @@ func (s *Service) readRepositoryProjection(ctx context.Context, owner, repo stri
 	return repositoryProjectionFromMirror(mirrorRepository, time.Now().UTC()), nil
 }
 
-func repositoryProjectionFromMirror(repository ghreplica.Repository, fetchedAt time.Time) database.RepositoryProjection {
+func repositoryProjectionFromMirror(repository mirrordb.Repository, fetchedAt time.Time) database.RepositoryProjection {
 	return database.RepositoryProjection{
 		GitHubRepositoryID: repository.ID,
 		Owner:              repository.Owner.Login,
@@ -1468,12 +1466,12 @@ func matchingFieldValues(fieldType, filterValue string, values []database.FieldV
 }
 
 func (s *Service) filteredTargetSummaries(ctx context.Context, repositoryID int64, values []database.FieldValue) (map[string]GroupMemberObjectSummary, error) {
-	refs := make([]ghreplica.ObjectRef, 0, len(values))
+	refs := make([]mirrordb.ObjectRef, 0, len(values))
 	for _, value := range values {
 		if value.TargetType == "group" || value.ObjectNumber == nil {
 			continue
 		}
-		refs = append(refs, ghreplica.ObjectRef{Type: value.TargetType, Number: *value.ObjectNumber})
+		refs = append(refs, mirrordb.ObjectRef{Type: value.TargetType, Number: *value.ObjectNumber})
 	}
 	if len(refs) == 0 {
 		return map[string]GroupMemberObjectSummary{}, nil
@@ -1702,7 +1700,7 @@ func annotationMapKey(targetType, targetKey string) string {
 func (s *Service) resolveTarget(ctx context.Context, repository database.RepositoryProjection, targetType string, objectNumber int, groupID *uint) (targetRef, error) {
 	switch targetType {
 	case "pull_request", "issue":
-		summaries, err := s.mirrorObjectSummaries(ctx, repository.GitHubRepositoryID, []ghreplica.ObjectRef{{Type: targetType, Number: objectNumber}})
+		summaries, err := s.mirrorObjectSummaries(ctx, repository.GitHubRepositoryID, []mirrordb.ObjectRef{{Type: targetType, Number: objectNumber}})
 		if err != nil {
 			return targetRef{}, err
 		}
@@ -1799,22 +1797,22 @@ func (s *Service) listGroupMemberCounts(ctx context.Context, groups []database.G
 	return counts, nil
 }
 
-func mirrorObjectRefsForMembers(members []database.GroupMember) []ghreplica.ObjectRef {
-	refs := make([]ghreplica.ObjectRef, 0, len(members))
+func mirrorObjectRefsForMembers(members []database.GroupMember) []mirrordb.ObjectRef {
+	refs := make([]mirrordb.ObjectRef, 0, len(members))
 	for _, member := range members {
 		if member.ObjectType != "pull_request" && member.ObjectType != "issue" {
 			continue
 		}
-		refs = append(refs, ghreplica.ObjectRef{Type: member.ObjectType, Number: member.ObjectNumber})
+		refs = append(refs, mirrordb.ObjectRef{Type: member.ObjectType, Number: member.ObjectNumber})
 	}
 	return refs
 }
 
-func (s *Service) mirrorObjectSummaries(ctx context.Context, repositoryID int64, refs []ghreplica.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
+func (s *Service) mirrorObjectSummaries(ctx context.Context, repositoryID int64, refs []mirrordb.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
 	timer := database.StartQueryStep(ctx, "mirror_batch_objects")
 	defer timer.Done()
 
-	results, err := s.ghreplica.BatchGetObjects(ctx, repositoryID, refs)
+	results, err := s.mirror.BatchObjects(ctx, repositoryID, refs)
 	if err != nil {
 		return nil, err
 	}
@@ -1828,7 +1826,7 @@ func (s *Service) mirrorObjectSummaries(ctx context.Context, repositoryID int64,
 	return summaries, nil
 }
 
-func objectSummaryFromMirror(summary ghreplica.ObjectSummary) GroupMemberObjectSummary {
+func objectSummaryFromMirror(summary mirrordb.ObjectSummary) GroupMemberObjectSummary {
 	return GroupMemberObjectSummary{
 		Title:       summary.Title,
 		State:       summary.State,

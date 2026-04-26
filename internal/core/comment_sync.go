@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/dutifuldev/prtags/internal/database"
-	"github.com/dutifuldev/prtags/internal/ghreplica"
 	"github.com/dutifuldev/prtags/internal/githubapi"
+	"github.com/dutifuldev/prtags/internal/mirrordb"
 	"gorm.io/gorm"
 )
 
@@ -30,7 +30,7 @@ type commentSyncDispatcher interface {
 
 type CommentSyncService struct {
 	db         *gorm.DB
-	mirror     mirrorClient
+	mirror     mirrorReader
 	github     *githubapi.Client
 	dispatcher commentSyncDispatcher
 }
@@ -41,7 +41,7 @@ type GroupCommentSyncResult struct {
 	CommentsScheduled int    `json:"comments_scheduled"`
 }
 
-func NewCommentSyncService(db *gorm.DB, mirror mirrorClient, githubClient *githubapi.Client, dispatcher commentSyncDispatcher) *CommentSyncService {
+func NewCommentSyncService(db *gorm.DB, mirror mirrorReader, githubClient *githubapi.Client, dispatcher commentSyncDispatcher) *CommentSyncService {
 	return &CommentSyncService{
 		db:         db,
 		mirror:     mirror,
@@ -493,9 +493,9 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 		return "", "", false, nil
 	}
 
-	refs := make([]ghreplica.ObjectRef, 0, len(members))
+	refs := make([]mirrordb.ObjectRef, 0, len(members))
 	for _, member := range members {
-		refs = append(refs, ghreplica.ObjectRef{Type: member.ObjectType, Number: member.ObjectNumber})
+		refs = append(refs, mirrordb.ObjectRef{Type: member.ObjectType, Number: member.ObjectNumber})
 	}
 
 	summaries, err := commentObjectSummaries(ctx, s.mirror, group.GitHubRepositoryID, refs)
@@ -526,8 +526,8 @@ func (s *CommentSyncService) renderCommentBody(ctx context.Context, group databa
 	return body, hex.EncodeToString(sum[:]), true, nil
 }
 
-func commentObjectSummaries(ctx context.Context, mirror mirrorClient, repositoryID int64, refs []ghreplica.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
-	results, err := mirror.BatchGetObjects(ctx, repositoryID, refs)
+func commentObjectSummaries(ctx context.Context, mirror mirrorReader, repositoryID int64, refs []mirrordb.ObjectRef) (map[string]GroupMemberObjectSummary, error) {
+	results, err := mirror.BatchObjects(ctx, repositoryID, refs)
 	if err != nil {
 		return nil, err
 	}
